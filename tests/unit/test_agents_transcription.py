@@ -54,6 +54,34 @@ class FakeResponse:
         return self._payload
 
 
+def _diarized_segment(**updates: object) -> dict[str, object]:
+    segment: dict[str, object] = {
+        "id": "seg_1",
+        "start": 0.0,
+        "end": 1.0,
+        "speaker": "A",
+        "text": "Ship it",
+    }
+    segment.update(updates)
+    return segment
+
+
+async def _assert_diarized_output_rejected(tmp_path: Path, segments: object) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe-diarize",
+        client=FakeClient({"text": "Ship it", "segments": segments}),
+    )
+
+    with pytest.raises(
+        OpenAITranscriptionOutputError,
+        match=r"^OpenAI transcription failed with invalid_output$",
+    ):
+        await transcriber.transcribe(audio_path)
+
+
 def test_transcriber_rejects_hidden_sdk_retries() -> None:
     with pytest.raises(OpenAITranscriptionConfigurationError):
         OpenAITranscriber(
@@ -154,6 +182,135 @@ async def test_diarized_transcription_maps_speaker_segments(tmp_path: Path) -> N
     assert result.segments[0].end_ms == round(end_seconds * 1000)
     assert result.segments[0].speaker == "A"
     assert result.usage.total_tokens == total_tokens
+
+
+@pytest.mark.asyncio
+async def test_diarized_transcription_accepts_ordered_zero_length_segments(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    client = FakeClient(
+        {
+            "text": "One Two",
+            "segments": [
+                _diarized_segment(start=0, end=0, speaker=" A ", text="One"),
+                _diarized_segment(id="seg_2", start=0, end=1.25, speaker="B", text="Two"),
+            ],
+        }
+    )
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe-diarize",
+        client=client,
+    )
+
+    result = await transcriber.transcribe(audio_path)
+
+    assert [(segment.start_ms, segment.end_ms) for segment in result.segments] == [
+        (0, 0),
+        (0, 1250),
+    ]
+    assert [segment.speaker for segment in result.segments] == ["A", "B"]
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param([], id="empty"),
+        pytest.param({}, id="mapping"),
+        pytest.param((), id="tuple"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_diarized_transcription_rejects_missing_or_non_list_segments(
+    tmp_path: Path,
+    segments: object,
+) -> None:
+    await _assert_diarized_output_rejected(tmp_path, segments)
+
+
+@pytest.mark.parametrize(
+    "speaker",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+        pytest.param(1, id="non_string"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_diarized_transcription_requires_a_speaker_on_every_segment(
+    tmp_path: Path,
+    speaker: object,
+) -> None:
+    segments = [
+        _diarized_segment(text="First"),
+        _diarized_segment(id="seg_2", start=1, end=2, speaker=speaker, text="Second"),
+    ]
+
+    await _assert_diarized_output_rejected(tmp_path, segments)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        pytest.param(None, 1, id="missing-start"),
+        pytest.param(0, None, id="missing-end"),
+        pytest.param("0", 1, id="string-start"),
+        pytest.param(0, "1", id="string-end"),
+        pytest.param(False, 1, id="boolean-start"),
+        pytest.param(0, True, id="boolean-end"),
+        pytest.param(float("nan"), 1, id="nan-start"),
+        pytest.param(0, float("nan"), id="nan-end"),
+        pytest.param(float("inf"), 1, id="infinite-start"),
+        pytest.param(0, float("inf"), id="infinite-end"),
+        pytest.param(float("-inf"), 1, id="negative-infinite-start"),
+        pytest.param(0, float("-inf"), id="negative-infinite-end"),
+        pytest.param(-0.001, 1, id="negative-start"),
+        pytest.param(2, 1, id="end-before-start"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_diarized_transcription_requires_finite_ordered_timestamps(
+    tmp_path: Path,
+    start: object,
+    end: object,
+) -> None:
+    await _assert_diarized_output_rejected(
+        tmp_path,
+        [_diarized_segment(start=start, end=end)],
+    )
+
+
+@pytest.mark.asyncio
+async def test_diarized_transcription_rejects_out_of_order_segments(tmp_path: Path) -> None:
+    segments = [
+        _diarized_segment(start=2, end=3, text="Later"),
+        _diarized_segment(id="seg_2", start=1, end=2, text="Earlier"),
+    ]
+
+    await _assert_diarized_output_rejected(tmp_path, segments)
+
+
+@pytest.mark.parametrize(
+    "invalid_segment",
+    [
+        pytest.param(None, id="non-mapping"),
+        pytest.param(_diarized_segment(text=""), id="empty-text"),
+        pytest.param(_diarized_segment(text="   "), id="blank-text"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_diarized_transcription_rejects_every_malformed_segment(
+    tmp_path: Path,
+    invalid_segment: object,
+) -> None:
+    await _assert_diarized_output_rejected(
+        tmp_path,
+        [_diarized_segment(text="Valid"), invalid_segment],
+    )
 
 
 @pytest.mark.asyncio

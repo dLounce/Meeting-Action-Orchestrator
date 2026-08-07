@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from importlib import import_module
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,12 @@ from meeting_action_orchestrator.application.errors import (
     ProviderOutputError,
     ProviderTransientError,
 )
+
+_DIARIZED_TRANSCRIPTION_MODELS = frozenset({"gpt-4o-transcribe-diarize"})
+
+
+def _requires_diarized_segments(model: str) -> bool:
+    return model in _DIARIZED_TRANSCRIPTION_MODELS
 
 
 class OpenAITranscriptionError(ProviderError):
@@ -93,6 +100,7 @@ class OpenAITranscriber:
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
+        self._diarization_required = _requires_diarized_segments(model)
         self._client = client
         self._openai: Any = None
         self._owns_client = False
@@ -119,7 +127,7 @@ class OpenAITranscriber:
             "response_format": "json",
             "temperature": 0,
         }
-        if "diarize" in self._model:
+        if self._diarization_required:
             arguments["response_format"] = "diarized_json"
             arguments["chunking_strategy"] = "auto"
         if language is not None:
@@ -174,6 +182,8 @@ class OpenAITranscriber:
         text: str,
         duration: float | None,
     ) -> tuple[TranscriptionSegment, ...]:
+        if self._diarization_required:
+            return self._map_diarized_segments(raw_segments)
         if not isinstance(raw_segments, list) or not raw_segments:
             end_ms = round(duration * 1000) if duration is not None else None
             return (
@@ -204,6 +214,42 @@ class OpenAITranscriber:
             )
         if not segments:
             raise OpenAITranscriptionOutputError
+        return tuple(segments)
+
+    def _map_diarized_segments(
+        self,
+        raw_segments: object,
+    ) -> tuple[TranscriptionSegment, ...]:
+        if not isinstance(raw_segments, list) or not raw_segments:
+            raise OpenAITranscriptionOutputError
+        segments: list[TranscriptionSegment] = []
+        previous_start: float | None = None
+        for index, raw_segment in enumerate(raw_segments, start=1):
+            segment = self._as_mapping(raw_segment)
+            segment_text = self._optional_string(segment.get("text"))
+            speaker = self._optional_string(segment.get("speaker"))
+            start = self._finite_float_value(segment.get("start"))
+            end = self._finite_float_value(segment.get("end"))
+            if (
+                segment_text is None
+                or speaker is None
+                or start is None
+                or end is None
+                or start < 0
+                or end < start
+                or (previous_start is not None and start < previous_start)
+            ):
+                raise OpenAITranscriptionOutputError
+            segments.append(
+                TranscriptionSegment(
+                    id=self._optional_string(segment.get("id")) or f"segment_{index:04d}",
+                    start_ms=round(start * 1000),
+                    end_ms=round(end * 1000),
+                    speaker=speaker,
+                    text=segment_text,
+                )
+            )
+            previous_start = start
         return tuple(segments)
 
     def _map_usage(self, raw_usage: object) -> TranscriptionUsage:
@@ -273,6 +319,13 @@ class OpenAITranscriber:
         if isinstance(value, (int, float)):
             return float(value)
         return None
+
+    @classmethod
+    def _finite_float_value(cls, value: object) -> float | None:
+        number = cls._float_value(value)
+        if number is None or not isfinite(number):
+            return None
+        return number
 
     @staticmethod
     def _provider_request_id(response: Any) -> str | None:
