@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -52,6 +52,7 @@ DetailedText = Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
 LongText = Annotated[str, StringConstraints(min_length=1, max_length=10_000)]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
+INGEST_REQUEST_FINGERPRINT_VERSION = 1
 
 
 def _validate_timezone(value: str) -> str:
@@ -338,6 +339,67 @@ class PersonRef(DomainModel):
         if value is not None and re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", value) is None:
             raise InvalidDomainValueError(DomainValueCode.EMAIL)
         return value
+
+
+class IngestAudioIdentity(DomainModel):
+    sha256: Sha256Digest = Field(repr=False)
+    size_bytes: int = Field(gt=0)
+
+
+class IngestRequestIdentity(DomainModel):
+    ingest_key: ShortText
+    title: ShortText
+    occurred_at: AwareDatetime
+    timezone: TimezoneName
+    participants: tuple[PersonRef, ...] = Field(default=(), max_length=100)
+
+    def fingerprint(self, audio: IngestAudioIdentity, version: int) -> str:
+        if version != INGEST_REQUEST_FINGERPRINT_VERSION:
+            raise InvalidDomainValueError(DomainValueCode.INGEST_FINGERPRINT_VERSION)
+        return self._fingerprint_v1(audio)
+
+    def _fingerprint_v1(self, audio: IngestAudioIdentity) -> str:
+        return canonical_sha256(
+            {
+                "schema": "meeting-ingest-request/v1",
+                "audio": {
+                    "sha256": audio.sha256,
+                    "size_bytes": audio.size_bytes,
+                },
+                "title": self.title,
+                "occurred_at": self.occurred_at,
+                "timezone": self.timezone,
+                "participants": [
+                    {
+                        "display_name": participant.display_name,
+                        "email": participant.email,
+                    }
+                    for participant in self.participants
+                ],
+            }
+        )
+
+
+class IngestRequestBinding(DomainModel):
+    ingest_key: ShortText
+    fingerprint_version: int = Field(gt=0)
+    request_fingerprint: Sha256Digest = Field(repr=False)
+    created_at: AwareDatetime
+
+    @classmethod
+    def create(
+        cls,
+        request: IngestRequestIdentity,
+        audio: IngestAudioIdentity,
+        created_at: datetime,
+        fingerprint_version: int = INGEST_REQUEST_FINGERPRINT_VERSION,
+    ) -> IngestRequestBinding:
+        return cls(
+            ingest_key=request.ingest_key,
+            fingerprint_version=fingerprint_version,
+            request_fingerprint=request.fingerprint(audio, fingerprint_version),
+            created_at=created_at,
+        )
 
 
 class Meeting(DomainModel):

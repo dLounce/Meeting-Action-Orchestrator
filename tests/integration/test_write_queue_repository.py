@@ -318,6 +318,10 @@ def test_version_six_migration_makes_existing_unknown_writes_due(tmp_path: Path)
         connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN lease_owner")
         connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN lease_expires_at")
         connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN status")
+        connection.execute("DROP TRIGGER audio_assets_reject_cleanup_insert")
+        connection.execute("DROP TRIGGER audio_assets_reject_cleanup_update")
+        connection.execute("DROP TABLE recording_cleanup_jobs")
+        connection.execute("DROP TABLE ingest_request_bindings")
         connection.execute(
             """
             INSERT INTO delivery_operation_bindings (
@@ -336,7 +340,7 @@ def test_version_six_migration_makes_existing_unknown_writes_due(tmp_path: Path)
         )
         connection.execute("PRAGMA user_version = 5")
 
-    assert database.migrate() == 7
+    assert database.migrate() == 8
     with SqliteUnitOfWork(database, immediate=False) as restarted:
         due = restarted.write_intents.list_unknown_ids(NOW, 1)
         loaded = restarted.write_intents.get(INTENT_ID)

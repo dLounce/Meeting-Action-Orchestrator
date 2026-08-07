@@ -17,6 +17,7 @@ class DomainValueCode(str, Enum):
     SEGMENT_IDS = "segment_ids must be unique"
     CANONICAL_DATETIME = "canonical datetime must include a UTC offset"
     CANONICAL_TYPE = "canonical JSON received an unsupported value type"
+    INGEST_FINGERPRINT_VERSION = "ingest request fingerprint version is unsupported"
 
 
 class InvariantCode(str, Enum):

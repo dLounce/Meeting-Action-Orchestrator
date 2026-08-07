@@ -218,7 +218,9 @@ def test_ingest_persists_transcription_job_with_meeting(tmp_path: Path) -> None:
             meeting_id,
             ProcessingStage.TRANSCRIPTION,
         )
+        binding = uow.ingest_requests.get("durable-upload")
     assert job is not None
+    assert binding is not None
     assert job.status is ProcessingJobStatus.READY
     assert job.attempt_count == 0
 

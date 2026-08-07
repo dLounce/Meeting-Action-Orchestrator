@@ -19,11 +19,12 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 7
+    assert version == 8
     assert {
         "approvals",
         "audio_assets",
         "delivery_operation_bindings",
+        "ingest_request_bindings",
         "meeting_operation_bindings",
         "meetings",
         "processing_jobs",
@@ -41,8 +42,8 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 7
-    assert database.migrate() == 7
+    assert database.migrate() == 8
+    assert database.migrate() == 8
     assert database.healthcheck()
 
 
@@ -254,14 +255,14 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
     database = Database(path)
 
-    assert database.migrate() == 7
+    assert database.migrate() == 8
     with database.connect() as connection:
         tables = connection.execute(
             """
             SELECT name FROM sqlite_master
             WHERE type = 'table' AND name IN (
                 'delivery_operation_bindings', 'meeting_operation_bindings',
-                'recording_cleanup_jobs'
+                'recording_cleanup_jobs', 'ingest_request_bindings'
             )
             """
         ).fetchall()
@@ -271,10 +272,69 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
         ).fetchone()["original_name"]
     assert {row["name"] for row in tables} == {
         "delivery_operation_bindings",
+        "ingest_request_bindings",
         "meeting_operation_bindings",
         "recording_cleanup_jobs",
     }
     assert original_name == "recording.wav"
+
+
+def test_v8_migration_leaves_legacy_meetings_unbound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(database_module, "MIGRATIONS", database_module.MIGRATIONS[:7])
+        assert database.migrate() == 7
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO audio_assets (
+                id, storage_key, original_name, media_type, size_bytes,
+                duration_ms, sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "20000000-0000-4000-8000-000000000001",
+                "00000000000000000000000000000001.wav",
+                "recording.wav",
+                "audio/wav",
+                128,
+                1_000,
+                "a" * 64,
+                "2026-08-07 08:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO meetings (
+                id, ingest_key, title, audio_asset_id, occurred_at, timezone,
+                participants_json, status, version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "10000000-0000-4000-8000-000000000001",
+                "legacy-upload",
+                "Legacy planning",
+                "20000000-0000-4000-8000-000000000001",
+                "2026-08-07 08:00:00+00:00",
+                "UTC",
+                "[]",
+                "ingested",
+                0,
+                "2026-08-07 08:00:00+00:00",
+                "2026-08-07 08:00:00+00:00",
+            ),
+        )
+
+    assert database.migrate() == 8
+    with database.connect() as connection:
+        binding_count = connection.execute(
+            "SELECT COUNT(*) FROM ingest_request_bindings"
+        ).fetchone()[0]
+
+    assert binding_count == 0
 
 
 def test_migrate_adds_meeting_keyset_indexes(tmp_path: Path) -> None:

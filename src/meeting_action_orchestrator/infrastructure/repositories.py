@@ -21,6 +21,7 @@ from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
     DeliveryOperationBinding,
+    IngestRequestBinding,
     Meeting,
     MeetingOperationBinding,
     ProcessingJob,
@@ -188,6 +189,35 @@ class SqliteMeetingRepository:
                 "updated_at": row["updated_at"],
             }
         )
+
+
+class SqliteIngestRequestBindingRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, binding: IngestRequestBinding) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO ingest_request_bindings (
+                ingest_key, fingerprint_version, request_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                binding.ingest_key,
+                binding.fingerprint_version,
+                binding.request_fingerprint,
+                str(binding.created_at),
+            ),
+        )
+
+    def get(self, ingest_key: str) -> IngestRequestBinding | None:
+        row = self._connection.execute(
+            "SELECT * FROM ingest_request_bindings WHERE ingest_key = ?",
+            (ingest_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return IngestRequestBinding.model_validate(dict(row))
 
 
 class SqliteAudioAssetRepository:
@@ -1359,6 +1389,7 @@ class SqliteUnitOfWork:
         self._connection: sqlite3.Connection | None = None
         self._committed = False
         self.meetings: SqliteMeetingRepository
+        self.ingest_requests: SqliteIngestRequestBindingRepository
         self.audio_assets: SqliteAudioAssetRepository
         self.recording_cleanups: SqliteRecordingCleanupRepository
         self.transcripts: SqliteTranscriptRepository
@@ -1377,6 +1408,7 @@ class SqliteUnitOfWork:
         self._connection = connection
         self._committed = False
         self.meetings = SqliteMeetingRepository(connection)
+        self.ingest_requests = SqliteIngestRequestBindingRepository(connection)
         self.audio_assets = SqliteAudioAssetRepository(connection)
         self.recording_cleanups = SqliteRecordingCleanupRepository(connection)
         self.transcripts = SqliteTranscriptRepository(connection)

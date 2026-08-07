@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier, Lock
 from typing import BinaryIO, ClassVar, TypeVar
@@ -27,7 +27,10 @@ from meeting_action_orchestrator.agents.contracts import (
     VerificationReport,
     VerificationRequest,
 )
-from meeting_action_orchestrator.application.errors import StaleWorkflowVersionError
+from meeting_action_orchestrator.application.errors import (
+    AudioAssetIdentityMismatchError,
+    StaleWorkflowVersionError,
+)
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
 from meeting_action_orchestrator.application.recording_cleanup import RecordingCleanupScheduler
 from meeting_action_orchestrator.application.reviewing import ActionEdit
@@ -41,6 +44,9 @@ from meeting_action_orchestrator.domain.enums import (
 from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
 from meeting_action_orchestrator.domain.models import (
     ConnectorTarget,
+    IngestAudioIdentity,
+    IngestRequestIdentity,
+    Meeting,
     PersonRef,
     RecordingCleanupJob,
 )
@@ -55,6 +61,10 @@ from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOf
 
 NOW = datetime(2026, 8, 7, 8, 0, tzinfo=timezone.utc)
 OutputT = TypeVar("OutputT", bound=StrictModel)
+PARTICIPANTS = (
+    PersonRef(display_name="Mira", email="Mira@example.com"),
+    PersonRef(display_name="Dev", email=None),
+)
 
 
 class FrozenClock:
@@ -270,6 +280,138 @@ def workflow(
     return service, database
 
 
+def test_exact_ingest_replay_uses_normalized_metadata_and_ignores_filename(
+    tmp_path: Path,
+) -> None:
+    recording_store = FakeRecordingStore(tmp_path / "audio")
+    service, database = workflow(tmp_path, recording_store=recording_store)
+    content = b"RIFF\x00\x00\x00\x00WAVEexact"
+    original = IngestMeeting(
+        title=" Planning ",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="private-first-name.wav",
+        ingest_key=" upload-one ",
+        participants=(
+            PersonRef(display_name=" Mira ", email=" Mira@example.com "),
+            PersonRef(display_name=" Dev ", email=None),
+        ),
+    )
+    replayed = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW.astimezone(timezone(timedelta(hours=5, minutes=30))),
+        timezone="UTC",
+        original_name="unrelated-second-name.wav",
+        ingest_key="upload-one",
+        participants=PARTICIPANTS,
+    )
+
+    first = service.ingest(original, io.BytesIO(content))
+    second = service.ingest(replayed, io.BytesIO(content))
+
+    assert second == first
+    assert first.ingest_key == "upload-one"
+    assert first.title == "Planning"
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        binding = uow.ingest_requests.get("upload-one")
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert binding is not None
+    assert binding.fingerprint_version == 1
+    assert cleanup is not None
+    assert cleanup.expected_sha256 == hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("title", "occurred_at", "timezone_name", "participants"),
+    [
+        ("Retrospective", NOW, "UTC", PARTICIPANTS),
+        ("Planning", NOW + timedelta(minutes=1), "UTC", PARTICIPANTS),
+        ("Planning", NOW, "Asia/Calcutta", PARTICIPANTS),
+        (
+            "Planning",
+            NOW,
+            "UTC",
+            (
+                PersonRef(display_name="Mira Patel", email="Mira@example.com"),
+                PARTICIPANTS[1],
+            ),
+        ),
+        (
+            "Planning",
+            NOW,
+            "UTC",
+            (
+                PersonRef(display_name="Mira", email="other@example.com"),
+                PARTICIPANTS[1],
+            ),
+        ),
+        ("Planning", NOW, "UTC", tuple(reversed(PARTICIPANTS))),
+        (
+            "Planning",
+            NOW,
+            "UTC",
+            (
+                PersonRef(display_name="Mira", email="mira@example.com"),
+                PARTICIPANTS[1],
+            ),
+        ),
+    ],
+)
+def test_changed_ingest_metadata_conflicts_and_schedules_the_staged_recording(
+    tmp_path: Path,
+    title: str,
+    occurred_at: datetime,
+    timezone_name: str,
+    participants: tuple[PersonRef, ...],
+) -> None:
+    service, database = workflow(tmp_path)
+    content = b"RIFF\x00\x00\x00\x00WAVEmetadata"
+    original = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+        participants=PARTICIPANTS,
+    )
+    changed = IngestMeeting(
+        title=title,
+        occurred_at=occurred_at,
+        timezone=timezone_name,
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+        participants=participants,
+    )
+    service.ingest(original, io.BytesIO(content))
+
+    with pytest.raises(IdempotencyConflictError):
+        service.ingest(changed, io.BytesIO(content))
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+    assert cleanup.expected_sha256 == hashlib.sha256(content).hexdigest()
+
+
+def test_invalid_direct_ingest_metadata_is_rejected_before_recording_storage(
+    tmp_path: Path,
+) -> None:
+    recording_store = FakeRecordingStore(tmp_path / "audio")
+    service, _ = workflow(tmp_path, recording_store=recording_store)
+    command = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW,
+        timezone="Mars/Olympus",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+    )
+
+    with pytest.raises(ValueError, match="IANA timezone"):
+        service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEinvalid"))
+
+    assert recording_store.published_keys == []
+
+
 def test_conflicting_ingest_schedules_the_unreferenced_recording(tmp_path: Path) -> None:
     service, database = workflow(tmp_path)
     command = IngestMeeting(
@@ -392,7 +534,20 @@ def test_ambiguous_committed_ingest_retains_its_referenced_recording(tmp_path: P
     assert recording_store.path(asset.storage_key).exists()
     assert tuple(recording_store.root.glob("*.wav")) == (recording_store.path(asset.storage_key),)
     with SqliteUnitOfWork(database, immediate=False) as uow:
+        binding = uow.ingest_requests.get(command.ingest_key)
         assert uow.recording_cleanups.find_by_storage_key(asset.storage_key) is None
+    assert binding is not None
+
+    recovered, _ = workflow(tmp_path, recording_store=recording_store)
+    replay = recovered.ingest(
+        command,
+        io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEpersisted"),
+    )
+
+    assert replay == meeting
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
 
 
 def test_ambiguous_cleanup_commit_replays_the_ingest_and_keeps_the_job(
@@ -453,6 +608,7 @@ def test_failed_precommit_ingest_schedules_its_unique_recording(tmp_path: Path) 
 
     with SqliteUnitOfWork(database, immediate=False) as uow:
         assert uow.meetings.find_by_ingest_key(command.ingest_key) is None
+        assert uow.ingest_requests.get(command.ingest_key) is None
         assert (
             uow.audio_assets.find_by_sha256(
                 hashlib.sha256(b"RIFF\x00\x00\x00\x00WAVErolled-back").hexdigest()
@@ -465,6 +621,133 @@ def test_failed_precommit_ingest_schedules_its_unique_recording(tmp_path: Path) 
     with SqliteUnitOfWork(database, immediate=False) as uow:
         cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000001.wav")
     assert cleanup is not None
+
+
+def test_legacy_meeting_without_binding_fails_closed_on_replay(tmp_path: Path) -> None:
+    recording_store = FakeRecordingStore(tmp_path / "audio")
+    service, database = workflow(tmp_path, recording_store=recording_store)
+    command = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+        participants=PARTICIPANTS,
+    )
+    content = b"RIFF\x00\x00\x00\x00WAVElegacy"
+    meeting = service.ingest(command, io.BytesIO(content))
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "DELETE FROM ingest_request_bindings WHERE ingest_key = ?",
+            (command.ingest_key,),
+        )
+
+    with pytest.raises(IdempotencyConflictError):
+        service.ingest(command, io.BytesIO(content))
+
+    assert service.get_meeting(meeting.id) == meeting
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.ingest_requests.get(command.ingest_key) is None
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+
+
+def test_unsupported_persisted_fingerprint_version_fails_closed(tmp_path: Path) -> None:
+    service, database = workflow(tmp_path)
+    command = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+    )
+    content = b"RIFF\x00\x00\x00\x00WAVEfuture"
+    service.ingest(command, io.BytesIO(content))
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "DELETE FROM ingest_request_bindings WHERE ingest_key = ?",
+            (command.ingest_key,),
+        )
+        connection.execute(
+            """
+            INSERT INTO ingest_request_bindings (
+                ingest_key, fingerprint_version, request_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (command.ingest_key, 2, "a" * 64, str(NOW)),
+        )
+
+    with pytest.raises(IdempotencyConflictError):
+        service.ingest(command, io.BytesIO(content))
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+
+
+def test_deduplicated_audio_size_mismatch_fails_without_binding_new_key(
+    tmp_path: Path,
+) -> None:
+    service, database = workflow(tmp_path)
+    content = b"RIFF\x00\x00\x00\x00WAVEidentity"
+    first = IngestMeeting(
+        title="First",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="first.wav",
+        ingest_key="upload-one",
+    )
+    second = IngestMeeting(
+        title="Second",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="second.wav",
+        ingest_key="upload-two",
+    )
+    retained = service.ingest(first, io.BytesIO(content))
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE audio_assets SET size_bytes = size_bytes + 1 WHERE id = ?",
+            (str(retained.audio_asset_id),),
+        )
+
+    with pytest.raises(AudioAssetIdentityMismatchError):
+        service.ingest(second, io.BytesIO(content))
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.meetings.find_by_ingest_key(second.ingest_key) is None
+        assert uow.ingest_requests.get(second.ingest_key) is None
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+    assert cleanup.expected_size_bytes == len(content)
+
+
+def test_exact_replay_rejects_tampered_persisted_audio_identity(tmp_path: Path) -> None:
+    service, database = workflow(tmp_path)
+    content = b"RIFF\x00\x00\x00\x00WAVEbound-identity"
+    command = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+    )
+    retained = service.ingest(command, io.BytesIO(content))
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE audio_assets SET size_bytes = size_bytes + 1 WHERE id = ?",
+            (str(retained.audio_asset_id),),
+        )
+
+    with pytest.raises(AudioAssetIdentityMismatchError):
+        service.ingest(command, io.BytesIO(content))
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.meetings.find_by_ingest_key(command.ingest_key) is not None
+        assert uow.ingest_requests.get(command.ingest_key) is not None
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+    assert cleanup.expected_size_bytes == len(content)
 
 
 def test_concurrent_same_content_ingests_assign_exact_storage_key_ownership(
@@ -510,6 +793,118 @@ def test_concurrent_same_content_ingests_assign_exact_storage_key_ownership(
     abandoned = tuple(job for job in cleanup_jobs if job is not None)
     assert len(abandoned) == 1
     assert abandoned[0].storage_key != asset.storage_key
+
+
+def test_concurrent_exact_replays_create_one_meeting_and_one_binding(tmp_path: Path) -> None:
+    recording_store = BarrierRecordingStore(tmp_path / "audio", Barrier(2))
+    service, database = workflow(tmp_path, recording_store=recording_store)
+    content = b"RIFF\x00\x00\x00\x00WAVEsame-key"
+    commands = (
+        IngestMeeting(
+            title="Planning",
+            occurred_at=NOW,
+            timezone="UTC",
+            original_name="first.wav",
+            ingest_key="concurrent-key",
+            participants=PARTICIPANTS,
+        ),
+        IngestMeeting(
+            title="Planning",
+            occurred_at=NOW,
+            timezone="UTC",
+            original_name="second.wav",
+            ingest_key="concurrent-key",
+            participants=PARTICIPANTS,
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(service.ingest, command, io.BytesIO(content)) for command in commands
+        ]
+        meetings = tuple(future.result(timeout=10) for future in futures)
+
+    assert meetings[0] == meetings[1]
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        binding = uow.ingest_requests.get("concurrent-key")
+        asset = uow.audio_assets.get(meetings[0].audio_asset_id)
+        cleanup_jobs = tuple(
+            uow.recording_cleanups.find_by_storage_key(key)
+            for key in recording_store.published_keys
+        )
+    assert binding is not None
+    assert asset is not None
+    assert len(tuple(job for job in cleanup_jobs if job is not None)) == 1
+    assert cleanup_jobs[recording_store.published_keys.index(asset.storage_key)] is None
+
+
+def test_concurrent_changed_request_binds_one_payload_and_rejects_the_other(
+    tmp_path: Path,
+) -> None:
+    recording_store = BarrierRecordingStore(tmp_path / "audio", Barrier(2))
+    service, database = workflow(tmp_path, recording_store=recording_store)
+    content = b"RIFF\x00\x00\x00\x00WAVEconflicting-key"
+    commands = (
+        IngestMeeting(
+            title="First request",
+            occurred_at=NOW,
+            timezone="UTC",
+            original_name="first.wav",
+            ingest_key="concurrent-key",
+        ),
+        IngestMeeting(
+            title="Second request",
+            occurred_at=NOW,
+            timezone="UTC",
+            original_name="second.wav",
+            ingest_key="concurrent-key",
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(service.ingest, command, io.BytesIO(content)) for command in commands
+        ]
+        errors = tuple(future.exception(timeout=10) for future in futures)
+        successes: list[Meeting] = [
+            futures[index].result(timeout=10) for index, error in enumerate(errors) if error is None
+        ]
+        conflicts = tuple(error for error in errors if isinstance(error, IdempotencyConflictError))
+
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert all(error is None or isinstance(error, IdempotencyConflictError) for error in errors)
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        persisted = uow.meetings.find_by_ingest_key("concurrent-key")
+        binding = uow.ingest_requests.get("concurrent-key")
+        asset = uow.audio_assets.get(successes[0].audio_asset_id)
+        cleanup_jobs = tuple(
+            uow.recording_cleanups.find_by_storage_key(key)
+            for key in recording_store.published_keys
+        )
+    assert persisted is not None
+    assert persisted == successes[0]
+    assert persisted.title in {"First request", "Second request"}
+    assert binding is not None
+    assert asset is not None
+    assert persisted.occurred_at is not None
+    expected_request = IngestRequestIdentity(
+        ingest_key=persisted.ingest_key,
+        title=persisted.title,
+        occurred_at=persisted.occurred_at,
+        timezone=persisted.timezone,
+        participants=persisted.participants,
+    )
+    expected_audio = IngestAudioIdentity(
+        sha256=asset.sha256,
+        size_bytes=asset.size_bytes,
+    )
+    assert binding.request_fingerprint == expected_request.fingerprint(
+        expected_audio,
+        binding.fingerprint_version,
+    )
+    assert len(tuple(job for job in cleanup_jobs if job is not None)) == 1
+    assert cleanup_jobs[recording_store.published_keys.index(asset.storage_key)] is None
 
 
 def test_cleanup_scheduling_failure_does_not_mask_ingest_outcomes(

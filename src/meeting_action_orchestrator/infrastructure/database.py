@@ -334,6 +334,29 @@ BEGIN
 END;
 """
 
+SCHEMA_V8 = """
+CREATE TABLE ingest_request_bindings (
+    ingest_key TEXT PRIMARY KEY
+        REFERENCES meetings (ingest_key) ON DELETE CASCADE
+        CHECK (
+            length(ingest_key) BETWEEN 1 AND 200
+            AND ingest_key = trim(ingest_key)
+        ),
+    fingerprint_version INTEGER NOT NULL CHECK (fingerprint_version > 0),
+    request_fingerprint TEXT NOT NULL
+        CHECK (
+            length(request_fingerprint) = 64
+            AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER ingest_request_bindings_reject_update
+BEFORE UPDATE ON ingest_request_bindings
+BEGIN
+    SELECT RAISE(ABORT, 'ingest request bindings are immutable');
+END;
+"""
+
 MIGRATIONS = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
@@ -342,6 +365,7 @@ MIGRATIONS = (
     (5, SCHEMA_V5),
     (6, SCHEMA_V6),
     (7, SCHEMA_V7),
+    (8, SCHEMA_V8),
 )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from meeting_action_orchestrator.agents.contracts import (
     VerificationRequest,
 )
 from meeting_action_orchestrator.application.errors import (
+    AudioAssetIdentityMismatchError,
     ProviderConfigurationError,
     ProviderInputError,
     ProviderOutputError,
@@ -69,10 +71,16 @@ from meeting_action_orchestrator.domain.enums import (
     RecordingCleanupReason,
     WriteKind,
 )
-from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
+from meeting_action_orchestrator.domain.errors import (
+    IdempotencyConflictError,
+    InvalidDomainValueError,
+)
 from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
+    IngestAudioIdentity,
+    IngestRequestBinding,
+    IngestRequestIdentity,
     Meeting,
     PersonRef,
     ProcessingJob,
@@ -168,20 +176,38 @@ class MeetingWorkflow:
         )
 
     def ingest(self, command: IngestMeeting, stream: BinaryIO) -> Meeting:
-        if command.occurred_at.tzinfo is None or command.occurred_at.utcoffset() is None:
-            raise ValueError("Meeting time must include a UTC offset")
+        request = IngestRequestIdentity(
+            ingest_key=command.ingest_key,
+            title=command.title,
+            occurred_at=command.occurred_at,
+            timezone=command.timezone,
+            participants=command.participants,
+        )
         stored = self._recording_store.put(stream, command.original_name)
         try:
+            audio = IngestAudioIdentity(
+                sha256=stored.sha256,
+                size_bytes=stored.size_bytes,
+            )
             now = self._clock.now()
             with self._unit_of_work() as uow:
-                existing = uow.meetings.find_by_ingest_key(command.ingest_key)
+                existing = uow.meetings.find_by_ingest_key(request.ingest_key)
                 if existing is not None:
+                    binding = uow.ingest_requests.get(request.ingest_key)
+                    if binding is None or not self._matches_ingest_request(
+                        binding,
+                        request,
+                        audio,
+                    ):
+                        raise IdempotencyConflictError(request.ingest_key)
                     asset = _required(uow.audio_assets.get(existing.audio_asset_id), "Audio asset")
-                    if asset.sha256 != stored.sha256:
-                        raise IdempotencyConflictError(command.ingest_key)
+                    if asset.sha256 != audio.sha256 or asset.size_bytes != audio.size_bytes:
+                        raise AudioAssetIdentityMismatchError
                     meeting = existing
                 else:
                     asset = uow.audio_assets.find_by_sha256(stored.sha256)
+                    if asset is not None and asset.size_bytes != stored.size_bytes:
+                        raise AudioAssetIdentityMismatchError
                     if asset is None:
                         media_type = AudioMediaType(stored.metadata.media_type)
                         asset = AudioAsset(
@@ -197,16 +223,23 @@ class MeetingWorkflow:
                         uow.audio_assets.add(asset)
                     meeting = Meeting(
                         id=uuid4(),
-                        ingest_key=command.ingest_key,
-                        title=command.title,
+                        ingest_key=request.ingest_key,
+                        title=request.title,
                         audio_asset_id=asset.id,
-                        occurred_at=command.occurred_at,
-                        timezone=command.timezone,
-                        participants=command.participants,
+                        occurred_at=request.occurred_at,
+                        timezone=request.timezone,
+                        participants=request.participants,
                         created_at=now,
                         updated_at=now,
                     )
                     uow.meetings.add(meeting)
+                    uow.ingest_requests.add(
+                        IngestRequestBinding.create(
+                            request=request,
+                            audio=audio,
+                            created_at=now,
+                        )
+                    )
                     self._processing_scheduler.enqueue_in(
                         uow,
                         meeting.id,
@@ -219,6 +252,18 @@ class MeetingWorkflow:
             raise
         self._schedule_abandoned_recording(stored)
         return meeting
+
+    @staticmethod
+    def _matches_ingest_request(
+        binding: IngestRequestBinding,
+        request: IngestRequestIdentity,
+        audio: IngestAudioIdentity,
+    ) -> bool:
+        try:
+            expected = request.fingerprint(audio, binding.fingerprint_version)
+        except InvalidDomainValueError:
+            return False
+        return hmac.compare_digest(binding.request_fingerprint, expected)
 
     def _schedule_abandoned_recording(self, stored: StoredAudio) -> None:
         try:

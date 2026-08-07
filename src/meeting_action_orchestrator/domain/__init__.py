@@ -29,6 +29,7 @@ from meeting_action_orchestrator.domain.errors import (
 )
 from meeting_action_orchestrator.domain.hashing import canonical_json, canonical_sha256, text_sha256
 from meeting_action_orchestrator.domain.models import (
+    INGEST_REQUEST_FINGERPRINT_VERSION,
     ActionItem,
     Approval,
     AudioAsset,
@@ -41,6 +42,9 @@ from meeting_action_orchestrator.domain.models import (
     DeliveryDirective,
     DeliveryOperationBinding,
     EvidenceRef,
+    IngestAudioIdentity,
+    IngestRequestBinding,
+    IngestRequestIdentity,
     Meeting,
     MeetingOperationBinding,
     OpenQuestion,
@@ -67,6 +71,7 @@ from meeting_action_orchestrator.domain.services import (
 )
 
 __all__ = [
+    "INGEST_REQUEST_FINGERPRINT_VERSION",
     "ActionItem",
     "Approval",
     "AudioAsset",
@@ -90,6 +95,9 @@ __all__ = [
     "FailureCode",
     "FailureDisposition",
     "IdempotencyConflictError",
+    "IngestAudioIdentity",
+    "IngestRequestBinding",
+    "IngestRequestIdentity",
     "InvalidDomainValueError",
     "InvalidMeetingTransitionError",
     "InvalidWriteTransitionError",

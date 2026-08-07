@@ -1,10 +1,12 @@
-from datetime import date, datetime, timezone
+import hashlib
+from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 import pytest
 from pydantic import ValidationError
 
 from meeting_action_orchestrator.domain import (
+    INGEST_REQUEST_FINGERPRINT_VERSION,
     ActionItem,
     AudioAsset,
     AudioMediaType,
@@ -15,8 +17,12 @@ from meeting_action_orchestrator.domain import (
     DeliveryDirective,
     DomainInvariantError,
     EvidenceRef,
+    IngestAudioIdentity,
+    IngestRequestBinding,
+    IngestRequestIdentity,
     InvalidDomainValueError,
     OpenQuestion,
+    PersonRef,
     Priority,
     ReviewOrigin,
     ReviewRevision,
@@ -121,6 +127,154 @@ def test_canonical_hash_is_order_independent_for_mappings() -> None:
 
     assert canonical_json(left) == canonical_json(right)
     assert canonical_sha256(left) == canonical_sha256(right)
+
+
+def test_ingest_request_fingerprint_uses_the_frozen_v1_projection() -> None:
+    request = IngestRequestIdentity(
+        ingest_key=" upload-one ",
+        title=" Planning ",
+        occurred_at=datetime(
+            2026,
+            8,
+            7,
+            13,
+            30,
+            tzinfo=timezone(timedelta(hours=5, minutes=30)),
+        ),
+        timezone="Asia/Calcutta",
+        participants=(
+            PersonRef(display_name=" Mira ", email="Mira@Example.com"),
+            PersonRef(display_name="Dev", email=None),
+        ),
+    )
+    audio = IngestAudioIdentity(sha256="a" * 64, size_bytes=128)
+    expected_json = (
+        '{"audio":{"sha256":"'
+        + "a" * 64
+        + '","size_bytes":128},"occurred_at":"2026-08-07T08:00:00.000000Z",'
+        '"participants":[{"display_name":"Mira","email":"Mira@Example.com"},'
+        '{"display_name":"Dev","email":null}],"schema":"meeting-ingest-request/v1",'
+        '"timezone":"Asia/Calcutta","title":"Planning"}'
+    )
+
+    assert request.ingest_key == "upload-one"
+    assert (
+        request.fingerprint(audio, INGEST_REQUEST_FINGERPRINT_VERSION)
+        == hashlib.sha256(expected_json.encode("utf-8")).hexdigest()
+    )
+
+
+def test_ingest_request_fingerprint_normalizes_equivalent_utc_instants() -> None:
+    first = IngestRequestIdentity(
+        ingest_key="first",
+        title="Planning",
+        occurred_at=datetime(2026, 8, 7, 8, 0, tzinfo=timezone.utc),
+        timezone="UTC",
+    )
+    second = first.model_copy(
+        update={
+            "ingest_key": "second",
+            "occurred_at": datetime(
+                2026,
+                8,
+                7,
+                13,
+                30,
+                tzinfo=timezone(timedelta(hours=5, minutes=30)),
+            ),
+        }
+    )
+    audio = IngestAudioIdentity(sha256="a" * 64, size_bytes=128)
+
+    assert first.fingerprint(audio, 1) == second.fingerprint(audio, 1)
+
+
+@pytest.mark.parametrize(
+    ("request_update", "audio"),
+    [
+        ({"title": "Retrospective"}, IngestAudioIdentity(sha256="a" * 64, size_bytes=128)),
+        (
+            {"occurred_at": datetime(2026, 8, 7, 8, 1, tzinfo=timezone.utc)},
+            IngestAudioIdentity(sha256="a" * 64, size_bytes=128),
+        ),
+        ({"timezone": "Asia/Calcutta"}, IngestAudioIdentity(sha256="a" * 64, size_bytes=128)),
+        (
+            {"participants": (PersonRef(display_name="Mira", email=None),)},
+            IngestAudioIdentity(sha256="a" * 64, size_bytes=128),
+        ),
+        ({}, IngestAudioIdentity(sha256="b" * 64, size_bytes=128)),
+        ({}, IngestAudioIdentity(sha256="a" * 64, size_bytes=129)),
+    ],
+)
+def test_ingest_request_fingerprint_binds_every_request_dimension(
+    request_update: dict[str, object],
+    audio: IngestAudioIdentity,
+) -> None:
+    request = IngestRequestIdentity(
+        ingest_key="upload-one",
+        title="Planning",
+        occurred_at=datetime(2026, 8, 7, 8, 0, tzinfo=timezone.utc),
+        timezone="UTC",
+    )
+    baseline_audio = IngestAudioIdentity(sha256="a" * 64, size_bytes=128)
+
+    assert request.fingerprint(baseline_audio, 1) != request.model_copy(
+        update=request_update
+    ).fingerprint(audio, 1)
+
+
+def test_ingest_request_fingerprint_preserves_participant_order_and_email_case() -> None:
+    participants = (
+        PersonRef(display_name="Mira", email="Mira@example.com"),
+        PersonRef(display_name="Dev", email=None),
+    )
+    request = IngestRequestIdentity(
+        ingest_key="upload-one",
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+        participants=participants,
+    )
+    audio = IngestAudioIdentity(sha256="a" * 64, size_bytes=128)
+    reordered = request.model_copy(update={"participants": tuple(reversed(participants))})
+    changed_case = request.model_copy(
+        update={
+            "participants": (
+                participants[0].model_copy(update={"email": "mira@example.com"}),
+                participants[1],
+            )
+        }
+    )
+
+    assert request.fingerprint(audio, 1) != reordered.fingerprint(audio, 1)
+    assert request.fingerprint(audio, 1) != changed_case.fingerprint(audio, 1)
+
+
+def test_ingest_request_binding_rejects_unsupported_fingerprint_versions() -> None:
+    request = IngestRequestIdentity(
+        ingest_key="upload-one",
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+    )
+    audio = IngestAudioIdentity(sha256="a" * 64, size_bytes=128)
+
+    with pytest.raises(InvalidDomainValueError, match="fingerprint version is unsupported"):
+        IngestRequestBinding.create(request, audio, NOW, fingerprint_version=2)
+
+
+def test_ingest_identity_digests_are_hidden_from_representations() -> None:
+    request = IngestRequestIdentity(
+        ingest_key="upload-one",
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+    )
+    audio = IngestAudioIdentity(sha256="a" * 64, size_bytes=128)
+    binding = IngestRequestBinding.create(request, audio, NOW)
+
+    assert "a" * 64 not in repr(audio)
+    assert binding.request_fingerprint not in repr(binding)
 
 
 def test_audio_asset_rejects_path_as_original_name() -> None:

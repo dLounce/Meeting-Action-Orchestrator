@@ -77,6 +77,11 @@ class PermanentRecordingCleanupError(RecordingCleanupError):
         super().__init__("Recording cleanup was rejected for safety")
 
 
+class AudioAssetIdentityMismatchError(ApplicationError):
+    def __init__(self) -> None:
+        super().__init__("Stored recording identity does not match persisted audio metadata")
+
+
 class DeliveryGatewayError(RuntimeError):
     def __init__(
         self,
