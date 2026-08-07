@@ -39,6 +39,19 @@ class ProcessingJobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class RecordingCleanupReason(str, Enum):
+    ABANDONED_INGEST = "abandoned_ingest"
+    ORPHAN_RECONCILIATION = "orphan_reconciliation"
+
+
+class RecordingCleanupStatus(str, Enum):
+    READY = "ready"
+    RUNNING = "running"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class DeliveryOperationKind(str, Enum):
     RETRY = "retry"
     RECONCILE = "reconcile"

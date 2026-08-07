@@ -13,6 +13,7 @@ from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
+    RecordingCleanupStatus,
     WriteStatus,
 )
 from meeting_action_orchestrator.domain.hashing import canonical_json
@@ -24,6 +25,7 @@ from meeting_action_orchestrator.domain.models import (
     MeetingOperationBinding,
     ProcessingJob,
     RecapArtifact,
+    RecordingCleanupJob,
     ReviewRevision,
     Transcript,
     WorkflowFailure,
@@ -224,6 +226,12 @@ class SqliteAudioAssetRepository:
         ).fetchone()
         return self._from_row(row) if row is not None else None
 
+    def find_by_storage_key(self, storage_key: str) -> AudioAsset | None:
+        row = self._connection.execute(
+            "SELECT * FROM audio_assets WHERE storage_key = ?", (storage_key,)
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
     @staticmethod
     def _from_row(row: sqlite3.Row) -> AudioAsset:
         return AudioAsset.model_validate(
@@ -236,6 +244,202 @@ class SqliteAudioAssetRepository:
                 "duration_ms": row["duration_ms"],
                 "sha256": row["sha256"],
                 "created_at": row["created_at"],
+            }
+        )
+
+
+class SqliteRecordingCleanupRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, job: RecordingCleanupJob) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO recording_cleanup_jobs (
+                id, storage_key, expected_sha256, expected_size_bytes, reason,
+                status, attempt_count, max_attempts, next_attempt_at, lease_owner,
+                lease_expires_at, last_failure_json, created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._values(job),
+        )
+
+    def get(self, job_id: UUID) -> RecordingCleanupJob | None:
+        row = self._connection.execute(
+            "SELECT * FROM recording_cleanup_jobs WHERE id = ?", (str(job_id),)
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def find_by_storage_key(self, storage_key: str) -> RecordingCleanupJob | None:
+        row = self._connection.execute(
+            "SELECT * FROM recording_cleanup_jobs WHERE storage_key = ?", (storage_key,)
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def claim_due(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[RecordingCleanupJob]:
+        normalized_worker_id = worker_id.strip()
+        if not normalized_worker_id:
+            raise ValueError("Worker ID cannot be empty")
+        if len(normalized_worker_id) > 200:
+            raise ValueError("Worker ID exceeds the supported length")
+        if lease_until <= now:
+            raise ValueError("Lease expiry must follow the claim time")
+        if limit <= 0:
+            return ()
+        rows = self._connection.execute(
+            """
+            SELECT id, status, lease_owner, lease_expires_at
+            FROM recording_cleanup_jobs
+            WHERE (
+                attempt_count < max_attempts AND (
+                    status = ?
+                    OR (status = ? AND next_attempt_at <= ?)
+                )
+                OR (status = ? AND lease_expires_at <= ?)
+            )
+            ORDER BY
+                CASE status
+                    WHEN 'ready' THEN created_at
+                    WHEN 'retry_wait' THEN next_attempt_at
+                    ELSE lease_expires_at
+                END,
+                created_at,
+                id
+            LIMIT ?
+            """,
+            (
+                RecordingCleanupStatus.READY.value,
+                RecordingCleanupStatus.RETRY_WAIT.value,
+                str(now),
+                RecordingCleanupStatus.RUNNING.value,
+                str(now),
+                limit,
+            ),
+        ).fetchall()
+        claimed: list[RecordingCleanupJob] = []
+        for row in rows:
+            cursor = self._connection.execute(
+                """
+                UPDATE recording_cleanup_jobs
+                SET status = ?,
+                    attempt_count = CASE
+                        WHEN status = 'running' THEN attempt_count
+                        ELSE attempt_count + 1
+                    END,
+                    next_attempt_at = NULL, lease_owner = ?, lease_expires_at = ?,
+                    last_failure_json = NULL, updated_at = ?, completed_at = NULL
+                WHERE id = ? AND status = ?
+                    AND lease_owner IS ? AND lease_expires_at IS ?
+                    AND (
+                        (status IN ('ready', 'retry_wait') AND attempt_count < max_attempts)
+                        OR status = 'running'
+                    )
+                """,
+                (
+                    RecordingCleanupStatus.RUNNING.value,
+                    normalized_worker_id,
+                    str(lease_until),
+                    str(now),
+                    row["id"],
+                    row["status"],
+                    row["lease_owner"],
+                    row["lease_expires_at"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            job = self.get(UUID(row["id"]))
+            if job is not None:
+                claimed.append(job)
+        return tuple(claimed)
+
+    def save(
+        self,
+        job: RecordingCleanupJob,
+        expected_status: RecordingCleanupStatus,
+        expected_lease_owner: str | None,
+        expected_lease_expires_at: datetime | None,
+    ) -> None:
+        cursor = self._connection.execute(
+            """
+            UPDATE recording_cleanup_jobs
+            SET status = ?, attempt_count = ?, next_attempt_at = ?,
+                lease_owner = ?, lease_expires_at = ?, last_failure_json = ?,
+                updated_at = ?, completed_at = ?
+            WHERE id = ? AND storage_key = ? AND expected_sha256 = ?
+                AND expected_size_bytes = ? AND reason = ? AND max_attempts = ?
+                AND created_at = ? AND status = ?
+                AND lease_owner IS ? AND lease_expires_at IS ?
+            """,
+            (
+                job.status.value,
+                job.attempt_count,
+                _as_text(job.next_attempt_at),
+                job.lease_owner,
+                _as_text(job.lease_expires_at),
+                _as_json(job.last_failure) if job.last_failure is not None else None,
+                str(job.updated_at),
+                _as_text(job.completed_at),
+                str(job.id),
+                job.storage_key,
+                job.expected_sha256,
+                job.expected_size_bytes,
+                job.reason.value,
+                job.max_attempts,
+                str(job.created_at),
+                expected_status.value,
+                expected_lease_owner,
+                _as_text(expected_lease_expires_at),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise PersistenceConflictError("The recording cleanup lease is no longer current")
+
+    @staticmethod
+    def _values(job: RecordingCleanupJob) -> tuple[object, ...]:
+        return (
+            str(job.id),
+            job.storage_key,
+            job.expected_sha256,
+            job.expected_size_bytes,
+            job.reason.value,
+            job.status.value,
+            job.attempt_count,
+            job.max_attempts,
+            _as_text(job.next_attempt_at),
+            job.lease_owner,
+            _as_text(job.lease_expires_at),
+            _as_json(job.last_failure) if job.last_failure is not None else None,
+            str(job.created_at),
+            str(job.updated_at),
+            _as_text(job.completed_at),
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> RecordingCleanupJob:
+        return RecordingCleanupJob.model_validate(
+            {
+                "id": row["id"],
+                "storage_key": row["storage_key"],
+                "expected_sha256": row["expected_sha256"],
+                "expected_size_bytes": row["expected_size_bytes"],
+                "reason": row["reason"],
+                "status": row["status"],
+                "attempt_count": row["attempt_count"],
+                "max_attempts": row["max_attempts"],
+                "next_attempt_at": row["next_attempt_at"],
+                "lease_owner": row["lease_owner"],
+                "lease_expires_at": row["lease_expires_at"],
+                "last_failure": _load_json(row["last_failure_json"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "completed_at": row["completed_at"],
             }
         )
 
@@ -1156,6 +1360,7 @@ class SqliteUnitOfWork:
         self._committed = False
         self.meetings: SqliteMeetingRepository
         self.audio_assets: SqliteAudioAssetRepository
+        self.recording_cleanups: SqliteRecordingCleanupRepository
         self.transcripts: SqliteTranscriptRepository
         self.reviews: SqliteReviewRepository
         self.approvals: SqliteApprovalRepository
@@ -1173,6 +1378,7 @@ class SqliteUnitOfWork:
         self._committed = False
         self.meetings = SqliteMeetingRepository(connection)
         self.audio_assets = SqliteAudioAssetRepository(connection)
+        self.recording_cleanups = SqliteRecordingCleanupRepository(connection)
         self.transcripts = SqliteTranscriptRepository(connection)
         self.reviews = SqliteReviewRepository(connection)
         self.approvals = SqliteApprovalRepository(connection)

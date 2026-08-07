@@ -19,7 +19,7 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 6
+    assert version == 7
     assert {
         "approvals",
         "audio_assets",
@@ -27,6 +27,7 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
         "meeting_operation_bindings",
         "meetings",
         "processing_jobs",
+        "recording_cleanup_jobs",
         "recap_artifacts",
         "review_revisions",
         "transcripts",
@@ -40,8 +41,8 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 6
-    assert database.migrate() == 6
+    assert database.migrate() == 7
+    assert database.migrate() == 7
     assert database.healthcheck()
 
 
@@ -253,13 +254,14 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
     database = Database(path)
 
-    assert database.migrate() == 6
+    assert database.migrate() == 7
     with database.connect() as connection:
         tables = connection.execute(
             """
             SELECT name FROM sqlite_master
             WHERE type = 'table' AND name IN (
-                'delivery_operation_bindings', 'meeting_operation_bindings'
+                'delivery_operation_bindings', 'meeting_operation_bindings',
+                'recording_cleanup_jobs'
             )
             """
         ).fetchall()
@@ -270,6 +272,7 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
     assert {row["name"] for row in tables} == {
         "delivery_operation_bindings",
         "meeting_operation_bindings",
+        "recording_cleanup_jobs",
     }
     assert original_name == "recording.wav"
 

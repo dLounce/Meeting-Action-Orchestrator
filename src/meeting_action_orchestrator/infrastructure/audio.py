@@ -152,9 +152,6 @@ class LocalAudioStore:
             raise AudioValidationError("The storage key is invalid")
         return self._root / storage_key
 
-    def delete(self, storage_key: str) -> None:
-        self.path(storage_key).unlink(missing_ok=True)
-
 
 def detect_audio_type(header: bytes) -> str:
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE":

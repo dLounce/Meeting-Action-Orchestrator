@@ -242,6 +242,98 @@ UPDATE delivery_operation_bindings
 SET completed_at = created_at, updated_at = created_at;
 """
 
+SCHEMA_V7 = """
+CREATE TABLE recording_cleanup_jobs (
+    id TEXT PRIMARY KEY,
+    storage_key TEXT NOT NULL UNIQUE
+        CHECK (
+            (
+                length(storage_key) = 36
+                AND substr(storage_key, 1, 32) NOT GLOB '*[^0-9a-f]*'
+                AND substr(storage_key, 33, 4) IN ('.wav', '.mp3', '.m4a')
+            )
+            OR (
+                length(storage_key) = 38
+                AND substr(storage_key, 1, 1) = '.'
+                AND substr(storage_key, 2, 32) NOT GLOB '*[^0-9a-f]*'
+                AND substr(storage_key, 34, 5) = '.part'
+            )
+        ),
+    expected_sha256 TEXT NOT NULL
+        CHECK (
+            length(expected_sha256) = 64
+            AND expected_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+    expected_size_bytes INTEGER NOT NULL CHECK (expected_size_bytes >= 0),
+    reason TEXT NOT NULL
+        CHECK (reason IN ('abandoned_ingest', 'orphan_reconciliation')),
+    status TEXT NOT NULL
+        CHECK (status IN ('ready', 'running', 'retry_wait', 'succeeded', 'failed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    next_attempt_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_failure_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    CHECK (attempt_count <= max_attempts),
+    CHECK (
+        (status = 'running' AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (status <> 'running' AND lease_owner IS NULL AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        (status = 'retry_wait' AND next_attempt_at IS NOT NULL)
+        OR (status <> 'retry_wait' AND next_attempt_at IS NULL)
+    ),
+    CHECK (
+        (status IN ('retry_wait', 'failed') AND last_failure_json IS NOT NULL)
+        OR (status NOT IN ('retry_wait', 'failed') AND last_failure_json IS NULL)
+    ),
+    CHECK (
+        (status IN ('succeeded', 'failed') AND completed_at IS NOT NULL)
+        OR (status NOT IN ('succeeded', 'failed') AND completed_at IS NULL)
+    )
+);
+CREATE INDEX idx_recording_cleanup_jobs_claim
+ON recording_cleanup_jobs (
+    status, next_attempt_at, lease_expires_at, created_at, id
+);
+CREATE TRIGGER recording_cleanup_jobs_reject_owned_insert
+BEFORE INSERT ON recording_cleanup_jobs
+WHEN EXISTS (
+    SELECT 1 FROM audio_assets WHERE storage_key = NEW.storage_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'recording storage key is owned by an audio asset');
+END;
+CREATE TRIGGER recording_cleanup_jobs_reject_owned_update
+BEFORE UPDATE OF storage_key ON recording_cleanup_jobs
+WHEN EXISTS (
+    SELECT 1 FROM audio_assets WHERE storage_key = NEW.storage_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'recording storage key is owned by an audio asset');
+END;
+CREATE TRIGGER audio_assets_reject_cleanup_insert
+BEFORE INSERT ON audio_assets
+WHEN EXISTS (
+    SELECT 1 FROM recording_cleanup_jobs WHERE storage_key = NEW.storage_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'recording storage key is reserved for cleanup');
+END;
+CREATE TRIGGER audio_assets_reject_cleanup_update
+BEFORE UPDATE OF storage_key ON audio_assets
+WHEN EXISTS (
+    SELECT 1 FROM recording_cleanup_jobs WHERE storage_key = NEW.storage_key
+)
+BEGIN
+    SELECT RAISE(ABORT, 'recording storage key is reserved for cleanup');
+END;
+"""
+
 MIGRATIONS = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
@@ -249,6 +341,7 @@ MIGRATIONS = (
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
     (6, SCHEMA_V6),
+    (7, SCHEMA_V7),
 )
 
 

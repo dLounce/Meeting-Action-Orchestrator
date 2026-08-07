@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 from threading import Barrier, Lock
-from typing import BinaryIO, TypeVar
+from typing import BinaryIO, ClassVar, TypeVar
 from uuid import UUID
 
 import pytest
@@ -29,11 +29,21 @@ from meeting_action_orchestrator.agents.contracts import (
 )
 from meeting_action_orchestrator.application.errors import StaleWorkflowVersionError
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
+from meeting_action_orchestrator.application.recording_cleanup import RecordingCleanupScheduler
 from meeting_action_orchestrator.application.reviewing import ActionEdit
 from meeting_action_orchestrator.application.workflow import IngestMeeting, MeetingWorkflow
-from meeting_action_orchestrator.domain.enums import MeetingStatus, ReviewOrigin, WriteKind
+from meeting_action_orchestrator.domain.enums import (
+    MeetingStatus,
+    RecordingCleanupReason,
+    ReviewOrigin,
+    WriteKind,
+)
 from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
-from meeting_action_orchestrator.domain.models import ConnectorTarget, PersonRef
+from meeting_action_orchestrator.domain.models import (
+    ConnectorTarget,
+    PersonRef,
+    RecordingCleanupJob,
+)
 from meeting_action_orchestrator.infrastructure.audio import AudioMetadata, StoredAudio
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
@@ -62,7 +72,7 @@ class FakeRecordingStore:
         content = stream.read()
         digest = hashlib.sha256(content).hexdigest()
         with self._lock:
-            storage_key = f"recording-{len(self.published_keys) + 1}.wav"
+            storage_key = f"{len(self.published_keys) + 1:032x}.wav"
             self.published_keys.append(storage_key)
         path = self.root / storage_key
         self.root.mkdir(parents=True, exist_ok=True)
@@ -78,9 +88,6 @@ class FakeRecordingStore:
 
     def path(self, storage_key: str) -> Path:
         return self.root / storage_key
-
-    def delete(self, storage_key: str) -> None:
-        self.path(storage_key).unlink(missing_ok=True)
 
 
 class BarrierRecordingStore(FakeRecordingStore):
@@ -101,8 +108,26 @@ class CommitThenRaiseUnitOfWork(SqliteUnitOfWork):
 
 
 class FailBeforeCommitUnitOfWork(SqliteUnitOfWork):
+    failed_paths: ClassVar[set[Path]] = set()
+
     def commit(self) -> None:
-        raise RuntimeError("commit did not persist")
+        if self._database.path not in self.failed_paths:
+            self.failed_paths.add(self._database.path)
+            raise RuntimeError("commit did not persist")
+        super().commit()
+
+
+class FailingCleanupScheduler(RecordingCleanupScheduler):
+    def schedule_if_unreferenced(
+        self,
+        *,
+        storage_key: str,
+        expected_sha256: str,
+        expected_size_bytes: int,
+        reason: RecordingCleanupReason,
+    ) -> RecordingCleanupJob | None:
+        del storage_key, expected_sha256, expected_size_bytes, reason
+        raise RuntimeError("cleanup scheduling unavailable")
 
 
 class FakeTranscriber:
@@ -221,6 +246,7 @@ def workflow(
     recording_store: FakeRecordingStore | None = None,
     specialists: FakeSpecialists | None = None,
     unit_of_work_type: type[SqliteUnitOfWork] = SqliteUnitOfWork,
+    cleanup_scheduler_type: type[RecordingCleanupScheduler] = RecordingCleanupScheduler,
 ) -> tuple[MeetingWorkflow, Database]:
     database = Database(tmp_path / "workflow.sqlite3")
     database.migrate()
@@ -236,12 +262,16 @@ def workflow(
         ),
         max_agent_requests=5,
         max_agent_output_tokens=12_000,
+        recording_cleanup_scheduler=cleanup_scheduler_type(
+            unit_of_work=lambda: unit_of_work_type(database),
+            clock=FrozenClock(),
+        ),
     )
     return service, database
 
 
-def test_conflicting_ingest_removes_the_unreferenced_recording(tmp_path: Path) -> None:
-    service, _ = workflow(tmp_path)
+def test_conflicting_ingest_schedules_the_unreferenced_recording(tmp_path: Path) -> None:
+    service, database = workflow(tmp_path)
     command = IngestMeeting(
         title="Raw meeting",
         occurred_at=NOW,
@@ -255,11 +285,15 @@ def test_conflicting_ingest_removes_the_unreferenced_recording(tmp_path: Path) -
         service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEsecond"))
 
     recordings = tuple((tmp_path / "audio").glob("*.wav"))
-    assert len(recordings) == 1
+    assert len(recordings) == 2
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+    assert cleanup.expected_sha256 == hashlib.sha256(b"RIFF\x00\x00\x00\x00WAVEsecond").hexdigest()
 
 
-def test_duplicate_content_keeps_the_shared_recording(tmp_path: Path) -> None:
-    service, _ = workflow(tmp_path)
+def test_duplicate_content_schedules_only_the_unowned_recording(tmp_path: Path) -> None:
+    service, database = workflow(tmp_path)
     content = b"RIFF\x00\x00\x00\x00WAVEshared"
     first = IngestMeeting(
         title="First meeting",
@@ -281,15 +315,19 @@ def test_duplicate_content_keeps_the_shared_recording(tmp_path: Path) -> None:
 
     recordings = tuple((tmp_path / "audio").glob("*.wav"))
     assert first_meeting.audio_asset_id == second_meeting.audio_asset_id
-    assert len(recordings) == 1
+    assert len(recordings) == 2
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
+    assert cleanup.expected_sha256 == hashlib.sha256(content).hexdigest()
 
 
-def test_failed_duplicate_ingest_only_removes_its_staged_recording(
+def test_failed_duplicate_ingest_schedules_its_staged_recording(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recording_store = FakeRecordingStore(tmp_path / "audio")
-    service, _ = workflow(tmp_path, recording_store=recording_store)
+    service, database = workflow(tmp_path, recording_store=recording_store)
     content = b"RIFF\x00\x00\x00\x00WAVEshared"
     first = IngestMeeting(
         title="First meeting",
@@ -316,9 +354,15 @@ def test_failed_duplicate_ingest_only_removes_its_staged_recording(
     with pytest.raises(RuntimeError, match="queue unavailable"):
         service.ingest(second, io.BytesIO(content))
 
-    assert recording_store.published_keys == ["recording-1.wav", "recording-2.wav"]
-    assert recording_store.path("recording-1.wav").exists()
-    assert not recording_store.path("recording-2.wav").exists()
+    assert recording_store.published_keys == [
+        "00000000000000000000000000000001.wav",
+        "00000000000000000000000000000002.wav",
+    ]
+    assert recording_store.path("00000000000000000000000000000001.wav").exists()
+    assert recording_store.path("00000000000000000000000000000002.wav").exists()
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000002.wav")
+    assert cleanup is not None
     assert service.get_meeting(retained.id) == retained
 
 
@@ -347,9 +391,49 @@ def test_ambiguous_committed_ingest_retains_its_referenced_recording(tmp_path: P
     assert asset is not None
     assert recording_store.path(asset.storage_key).exists()
     assert tuple(recording_store.root.glob("*.wav")) == (recording_store.path(asset.storage_key),)
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.recording_cleanups.find_by_storage_key(asset.storage_key) is None
 
 
-def test_failed_precommit_ingest_removes_its_unique_recording(tmp_path: Path) -> None:
+def test_ambiguous_cleanup_commit_replays_the_ingest_and_keeps_the_job(
+    tmp_path: Path,
+) -> None:
+    recording_store = FakeRecordingStore(tmp_path / "audio")
+    service, database = workflow(tmp_path, recording_store=recording_store)
+    command = IngestMeeting(
+        title="Persisted meeting",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+    )
+    content = b"RIFF\x00\x00\x00\x00WAVEpersisted"
+    original = service.ingest(command, io.BytesIO(content))
+    ambiguous = MeetingWorkflow(
+        unit_of_work=lambda: CommitThenRaiseUnitOfWork(database),
+        recording_store=recording_store,
+        transcriber=FakeTranscriber(),
+        specialists=FakeSpecialists(),
+        clock=FrozenClock(),
+        delivery_targets=DeliveryTargets(
+            task=ConnectorTarget(connector_id="tasks", resource_id="inbox"),
+            calendar=ConnectorTarget(connector_id="calendar", resource_id="primary"),
+        ),
+        max_agent_requests=5,
+        max_agent_output_tokens=12_000,
+    )
+
+    replay = ambiguous.ingest(command, io.BytesIO(content))
+
+    assert replay == original
+    abandoned_key = "00000000000000000000000000000002.wav"
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key(abandoned_key)
+    assert cleanup is not None
+    assert cleanup.expected_sha256 == hashlib.sha256(content).hexdigest()
+
+
+def test_failed_precommit_ingest_schedules_its_unique_recording(tmp_path: Path) -> None:
     recording_store = FakeRecordingStore(tmp_path / "audio")
     service, database = workflow(
         tmp_path,
@@ -375,10 +459,15 @@ def test_failed_precommit_ingest_removes_its_unique_recording(tmp_path: Path) ->
             )
             is None
         )
-    assert tuple(recording_store.root.glob("*.wav")) == ()
+    assert tuple(recording_store.root.glob("*.wav")) == (
+        recording_store.path("00000000000000000000000000000001.wav"),
+    )
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        cleanup = uow.recording_cleanups.find_by_storage_key("00000000000000000000000000000001.wav")
+    assert cleanup is not None
 
 
-def test_concurrent_same_content_ingests_keep_only_the_winning_storage_key(
+def test_concurrent_same_content_ingests_assign_exact_storage_key_ownership(
     tmp_path: Path,
 ) -> None:
     recording_store = BarrierRecordingStore(tmp_path / "audio", Barrier(2))
@@ -410,9 +499,55 @@ def test_concurrent_same_content_ingests_keep_only_the_winning_storage_key(
     assert meetings[0].audio_asset_id == meetings[1].audio_asset_id
     with SqliteUnitOfWork(database, immediate=False) as uow:
         asset = uow.audio_assets.get(meetings[0].audio_asset_id)
+        cleanup_jobs = tuple(
+            uow.recording_cleanups.find_by_storage_key(key)
+            for key in recording_store.published_keys
+        )
     assert asset is not None
     assert len(recording_store.published_keys) == 2
-    assert tuple(recording_store.root.glob("*.wav")) == (recording_store.path(asset.storage_key),)
+    assert len(tuple(recording_store.root.glob("*.wav"))) == 2
+    assert cleanup_jobs[recording_store.published_keys.index(asset.storage_key)] is None
+    abandoned = tuple(job for job in cleanup_jobs if job is not None)
+    assert len(abandoned) == 1
+    assert abandoned[0].storage_key != asset.storage_key
+
+
+def test_cleanup_scheduling_failure_does_not_mask_ingest_outcomes(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, _ = workflow(
+        tmp_path,
+        cleanup_scheduler_type=FailingCleanupScheduler,
+    )
+    command = IngestMeeting(
+        title="Planning",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+    )
+
+    meeting = service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEfirst"))
+    with pytest.raises(IdempotencyConflictError):
+        service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEsecond"))
+
+    assert service.get_meeting(meeting.id) == meeting
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "recording cleanup scheduling failed"
+    ]
+    assert len(records) == 2
+    assert all(
+        getattr(record, "fields", None)
+        == {
+            "event": "recording_cleanup_schedule_failed",
+            "reason": "abandoned_ingest",
+            "exception_type": "RuntimeError",
+        }
+        for record in records
+    )
 
 
 def test_ingest_persists_a_neutral_audio_name(tmp_path: Path) -> None:

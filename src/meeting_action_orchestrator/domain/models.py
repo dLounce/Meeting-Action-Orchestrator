@@ -32,6 +32,8 @@ from meeting_action_orchestrator.domain.enums import (
     Priority,
     ProcessingJobStatus,
     ProcessingStage,
+    RecordingCleanupReason,
+    RecordingCleanupStatus,
     ReviewOrigin,
     WriteKind,
     WriteStatus,
@@ -217,6 +219,94 @@ class ProcessingJob(DomainModel):
         }
         if self.status in failure_forbidden and self.last_failure is not None:
             raise DomainInvariantError(InvariantCode.JOB_FAILURE_FORBIDDEN)
+        return self
+
+
+class RecordingCleanupJob(DomainModel):
+    id: UUID
+    storage_key: MediumText
+    expected_sha256: Sha256Digest
+    expected_size_bytes: int = Field(ge=0)
+    reason: RecordingCleanupReason
+    status: RecordingCleanupStatus = RecordingCleanupStatus.READY
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(gt=0)
+    next_attempt_at: AwareDatetime | None = None
+    lease_owner: ShortText | None = None
+    lease_expires_at: AwareDatetime | None = None
+    last_failure: WorkflowFailure | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    completed_at: AwareDatetime | None = None
+
+    @field_validator("storage_key")
+    @classmethod
+    def validate_storage_key(cls, value: str) -> str:
+        pattern = r"(?:[0-9a-f]{32}\.(?:wav|mp3|m4a)|\.[0-9a-f]{32}\.part)"
+        if re.fullmatch(pattern, value) is None:
+            raise InvalidDomainValueError(DomainValueCode.RECORDING_STORAGE_KEY)
+        return value
+
+    @model_validator(mode="after")
+    def validate_limits(self) -> RecordingCleanupJob:
+        if self.updated_at < self.created_at:
+            raise DomainInvariantError(InvariantCode.CLEANUP_TIMESTAMPS)
+        if self.attempt_count > self.max_attempts:
+            raise DomainInvariantError(InvariantCode.CLEANUP_ATTEMPTS)
+        return self
+
+    @model_validator(mode="after")
+    def validate_lease(self) -> RecordingCleanupJob:
+        if self.status is RecordingCleanupStatus.RUNNING:
+            if self.lease_owner is None or self.lease_expires_at is None:
+                raise DomainInvariantError(InvariantCode.CLEANUP_LEASE_REQUIRED)
+            if self.lease_expires_at <= self.updated_at:
+                raise DomainInvariantError(InvariantCode.CLEANUP_LEASE_EXPIRY)
+        elif self.lease_owner is not None or self.lease_expires_at is not None:
+            raise DomainInvariantError(InvariantCode.CLEANUP_LEASE_FORBIDDEN)
+        return self
+
+    @model_validator(mode="after")
+    def validate_retry(self) -> RecordingCleanupJob:
+        if self.status is RecordingCleanupStatus.RETRY_WAIT:
+            if self.next_attempt_at is None:
+                raise DomainInvariantError(InvariantCode.CLEANUP_RETRY_REQUIRED)
+            if self.next_attempt_at < self.updated_at:
+                raise DomainInvariantError(InvariantCode.CLEANUP_RETRY_EXPIRY)
+            if (
+                self.last_failure is not None
+                and self.last_failure.disposition is not FailureDisposition.RETRYABLE
+            ):
+                raise DomainInvariantError(InvariantCode.CLEANUP_RETRY_DISPOSITION)
+        elif self.next_attempt_at is not None:
+            raise DomainInvariantError(InvariantCode.CLEANUP_RETRY_FORBIDDEN)
+        return self
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> RecordingCleanupJob:
+        failed = {
+            RecordingCleanupStatus.RETRY_WAIT,
+            RecordingCleanupStatus.FAILED,
+        }
+        if self.status in failed and self.last_failure is None:
+            raise DomainInvariantError(InvariantCode.CLEANUP_FAILURE_REQUIRED)
+        if self.status not in failed and self.last_failure is not None:
+            raise DomainInvariantError(InvariantCode.CLEANUP_FAILURE_FORBIDDEN)
+        return self
+
+    @model_validator(mode="after")
+    def validate_completion(self) -> RecordingCleanupJob:
+        terminal = {
+            RecordingCleanupStatus.SUCCEEDED,
+            RecordingCleanupStatus.FAILED,
+        }
+        if self.status in terminal:
+            if self.completed_at is None:
+                raise DomainInvariantError(InvariantCode.CLEANUP_COMPLETION_REQUIRED)
+            if self.completed_at < self.updated_at:
+                raise DomainInvariantError(InvariantCode.CLEANUP_TIMESTAMPS)
+        elif self.completed_at is not None:
+            raise DomainInvariantError(InvariantCode.CLEANUP_COMPLETION_FORBIDDEN)
         return self
 
 

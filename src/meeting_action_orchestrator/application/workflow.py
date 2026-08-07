@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import BinaryIO, Protocol, TypeVar
@@ -44,6 +44,7 @@ from meeting_action_orchestrator.application.processing import (
     ProcessingHandler,
     ProcessingScheduler,
 )
+from meeting_action_orchestrator.application.recording_cleanup import RecordingCleanupScheduler
 from meeting_action_orchestrator.application.reviewing import (
     ActionEdit,
     IssueResolutionEdit,
@@ -65,6 +66,7 @@ from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
+    RecordingCleanupReason,
     WriteKind,
 )
 from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
@@ -94,6 +96,7 @@ _NEUTRAL_AUDIO_NAMES = {
     AudioMediaType.WAV: "recording.wav",
     AudioMediaType.X_WAV: "recording.wav",
 }
+logger = logging.getLogger(__name__)
 
 
 class Clock(Protocol):
@@ -142,6 +145,7 @@ class MeetingWorkflow:
         max_agent_requests: int,
         max_agent_output_tokens: int,
         processing_scheduler: ProcessingScheduler | None = None,
+        recording_cleanup_scheduler: RecordingCleanupScheduler | None = None,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._recording_store = recording_store
@@ -155,20 +159,24 @@ class MeetingWorkflow:
             unit_of_work=unit_of_work,
             clock=clock,
         )
+        self._recording_cleanup_scheduler = (
+            recording_cleanup_scheduler
+            or RecordingCleanupScheduler(
+                unit_of_work=unit_of_work,
+                clock=clock,
+            )
+        )
 
     def ingest(self, command: IngestMeeting, stream: BinaryIO) -> Meeting:
         if command.occurred_at.tzinfo is None or command.occurred_at.utcoffset() is None:
             raise ValueError("Meeting time must include a UTC offset")
         stored = self._recording_store.put(stream, command.original_name)
-        committed_storage_key: str | None = None
-        staged_commit_attempted = False
         try:
             now = self._clock.now()
             with self._unit_of_work() as uow:
                 existing = uow.meetings.find_by_ingest_key(command.ingest_key)
                 if existing is not None:
                     asset = _required(uow.audio_assets.get(existing.audio_asset_id), "Audio asset")
-                    committed_storage_key = asset.storage_key
                     if asset.sha256 != stored.sha256:
                         raise IdempotencyConflictError(command.ingest_key)
                     meeting = existing
@@ -187,8 +195,6 @@ class MeetingWorkflow:
                             created_at=now,
                         )
                         uow.audio_assets.add(asset)
-                    else:
-                        committed_storage_key = asset.storage_key
                     meeting = Meeting(
                         id=uuid4(),
                         ingest_key=command.ingest_key,
@@ -207,45 +213,32 @@ class MeetingWorkflow:
                         ProcessingStage.TRANSCRIPTION,
                         scheduled_at=now,
                     )
-                    staged_commit_attempted = asset.storage_key == stored.storage_key
                     uow.commit()
-                    committed_storage_key = asset.storage_key
         except BaseException:
-            self._discard_failed_recording(
-                stored,
-                committed_storage_key,
-                staged_commit_attempted,
-            )
+            self._schedule_abandoned_recording(stored)
             raise
-        self._discard_staged_recording(stored, committed_storage_key)
+        self._schedule_abandoned_recording(stored)
         return meeting
 
-    def _discard_staged_recording(
-        self,
-        stored: StoredAudio,
-        committed_storage_key: str | None,
-    ) -> None:
-        if stored.storage_key == committed_storage_key:
-            return
-        with suppress(Exception):
-            self._recording_store.delete(stored.storage_key)
-
-    def _discard_failed_recording(
-        self,
-        stored: StoredAudio,
-        committed_storage_key: str | None,
-        staged_commit_attempted: bool,
-    ) -> None:
-        if stored.storage_key == committed_storage_key:
-            return
-        if not staged_commit_attempted:
-            self._discard_staged_recording(stored, committed_storage_key)
-            return
-        with suppress(Exception):
-            with self._unit_of_work() as uow:
-                referenced = uow.audio_assets.find_by_sha256(stored.sha256)
-            if referenced is None or referenced.storage_key != stored.storage_key:
-                self._recording_store.delete(stored.storage_key)
+    def _schedule_abandoned_recording(self, stored: StoredAudio) -> None:
+        try:
+            self._recording_cleanup_scheduler.schedule_if_unreferenced(
+                storage_key=stored.storage_key,
+                expected_sha256=stored.sha256,
+                expected_size_bytes=stored.size_bytes,
+                reason=RecordingCleanupReason.ABANDONED_INGEST,
+            )
+        except Exception as error:
+            logger.warning(
+                "recording cleanup scheduling failed",
+                extra={
+                    "fields": {
+                        "event": "recording_cleanup_schedule_failed",
+                        "reason": RecordingCleanupReason.ABANDONED_INGEST.value,
+                        "exception_type": type(error).__name__,
+                    }
+                },
+            )
 
     async def process(self, meeting_id: UUID) -> Meeting:
         meeting = await asyncio.to_thread(self.get_meeting, meeting_id)

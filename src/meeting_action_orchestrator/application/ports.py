@@ -22,6 +22,7 @@ from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
+    RecordingCleanupStatus,
 )
 from meeting_action_orchestrator.domain.models import (
     Approval,
@@ -31,6 +32,7 @@ from meeting_action_orchestrator.domain.models import (
     MeetingOperationBinding,
     ProcessingJob,
     RecapArtifact,
+    RecordingCleanupJob,
     ReviewRevision,
     Transcript,
     WorkflowFailure,
@@ -79,8 +81,6 @@ class RecordingStore(Protocol):
     def put(self, stream: BinaryIO, original_name: str) -> StoredAudio: ...
 
     def path(self, storage_key: str) -> Path: ...
-
-    def delete(self, storage_key: str) -> None: ...
 
 
 class TranscriptionProvider(Protocol):
@@ -145,6 +145,32 @@ class AudioAssetRepository(Protocol):
     def get(self, asset_id: UUID) -> AudioAsset | None: ...
 
     def find_by_sha256(self, digest: str) -> AudioAsset | None: ...
+
+    def find_by_storage_key(self, storage_key: str) -> AudioAsset | None: ...
+
+
+class RecordingCleanupRepository(Protocol):
+    def add(self, job: RecordingCleanupJob) -> None: ...
+
+    def get(self, job_id: UUID) -> RecordingCleanupJob | None: ...
+
+    def find_by_storage_key(self, storage_key: str) -> RecordingCleanupJob | None: ...
+
+    def claim_due(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[RecordingCleanupJob]: ...
+
+    def save(
+        self,
+        job: RecordingCleanupJob,
+        expected_status: RecordingCleanupStatus,
+        expected_lease_owner: str | None,
+        expected_lease_expires_at: datetime | None,
+    ) -> None: ...
 
 
 class TranscriptRepository(Protocol):
@@ -328,6 +354,7 @@ class WriteReceiptRepository(Protocol):
 class UnitOfWork(Protocol):
     meetings: MeetingRepository
     audio_assets: AudioAssetRepository
+    recording_cleanups: RecordingCleanupRepository
     transcripts: TranscriptRepository
     reviews: ReviewRepository
     approvals: ApprovalRepository

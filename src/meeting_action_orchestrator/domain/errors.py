@@ -12,6 +12,7 @@ class DomainError(ValueError):
 class DomainValueCode(str, Enum):
     TIMEZONE = "timezone must be an IANA timezone"
     ORIGINAL_NAME = "original_name must be a base file name"
+    RECORDING_STORAGE_KEY = "storage_key must be a generated recording key"
     EMAIL = "email must be a valid address"
     SEGMENT_IDS = "segment_ids must be unique"
     CANONICAL_DATETIME = "canonical datetime must include a UTC offset"
@@ -103,6 +104,19 @@ class InvariantCode(str, Enum):
     JOB_FAILURE_REQUIRED = "failed processing job status requires a failure"
     JOB_FAILURE_FORBIDDEN = "active or successful processing job cannot retain a failure"
     JOB_RETRY_DISPOSITION = "processing job retry requires a retryable failure"
+    CLEANUP_TIMESTAMPS = "recording cleanup timestamps are inconsistent"
+    CLEANUP_ATTEMPTS = "recording cleanup attempt count exceeds its limit"
+    CLEANUP_LEASE_REQUIRED = "running recording cleanup requires a lease"
+    CLEANUP_LEASE_EXPIRY = "recording cleanup lease must expire after its last update"
+    CLEANUP_LEASE_FORBIDDEN = "only a running recording cleanup can hold a lease"
+    CLEANUP_RETRY_REQUIRED = "retrying recording cleanup requires a schedule"
+    CLEANUP_RETRY_EXPIRY = "recording cleanup retry cannot precede its last update"
+    CLEANUP_RETRY_FORBIDDEN = "only retrying recording cleanup can have a schedule"
+    CLEANUP_FAILURE_REQUIRED = "failed recording cleanup status requires a failure"
+    CLEANUP_FAILURE_FORBIDDEN = "active or successful recording cleanup cannot retain a failure"
+    CLEANUP_RETRY_DISPOSITION = "recording cleanup retry requires a retryable failure"
+    CLEANUP_COMPLETION_REQUIRED = "terminal recording cleanup requires a completion time"
+    CLEANUP_COMPLETION_FORBIDDEN = "unfinished recording cleanup cannot be completed"
     MEETING_OPERATION_STAGE = "meeting operation stage does not match its operation"
     MEETING_OPERATION_FINGERPRINT = "meeting operation fingerprint does not match its request"
 
@@ -131,3 +145,8 @@ class InvalidWriteTransitionError(DomainError):
 class IdempotencyConflictError(DomainError):
     def __init__(self, key: str) -> None:
         super().__init__(f"idempotency key {key} is already bound to another payload")
+
+
+class RecordingCleanupConflictError(DomainError):
+    def __init__(self, storage_key: str) -> None:
+        super().__init__(f"storage key {storage_key} is bound to different recording metadata")
