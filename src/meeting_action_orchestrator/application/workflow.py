@@ -35,6 +35,10 @@ from meeting_action_orchestrator.application.mapping import (
     transcript_input,
 )
 from meeting_action_orchestrator.application.ports import UnitOfWork
+from meeting_action_orchestrator.application.processing import (
+    ProcessingHandler,
+    ProcessingScheduler,
+)
 from meeting_action_orchestrator.application.reviewing import (
     ActionEdit,
     IssueResolutionEdit,
@@ -54,6 +58,8 @@ from meeting_action_orchestrator.domain.enums import (
     FailureCode,
     FailureDisposition,
     MeetingStatus,
+    ProcessingJobStatus,
+    ProcessingStage,
     WriteKind,
 )
 from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
@@ -62,6 +68,7 @@ from meeting_action_orchestrator.domain.models import (
     AudioAsset,
     Meeting,
     PersonRef,
+    ProcessingJob,
     RecapArtifact,
     ReviewRevision,
     WorkflowFailure,
@@ -165,6 +172,7 @@ class MeetingWorkflow:
         delivery_targets: DeliveryTargets,
         max_agent_requests: int,
         max_agent_output_tokens: int,
+        processing_scheduler: ProcessingScheduler | None = None,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._recording_store = recording_store
@@ -174,6 +182,10 @@ class MeetingWorkflow:
         self._delivery_targets = delivery_targets
         self._max_agent_requests = max_agent_requests
         self._max_agent_output_tokens = max_agent_output_tokens
+        self._processing_scheduler = processing_scheduler or ProcessingScheduler(
+            unit_of_work=unit_of_work,
+            clock=clock,
+        )
 
     def ingest(self, command: IngestMeeting, stream: BinaryIO) -> Meeting:
         if command.occurred_at.tzinfo is None or command.occurred_at.utcoffset() is None:
@@ -212,6 +224,12 @@ class MeetingWorkflow:
                 updated_at=now,
             )
             uow.meetings.add(meeting)
+            self._processing_scheduler.enqueue_in(
+                uow,
+                meeting.id,
+                ProcessingStage.TRANSCRIPTION,
+                scheduled_at=now,
+            )
             uow.commit()
         return meeting
 
@@ -229,6 +247,58 @@ class MeetingWorkflow:
         with self._unit_of_work() as uow:
             meeting = uow.meetings.get(meeting_id)
         return _required(meeting, "Meeting")
+
+    def processing_handlers(self) -> dict[ProcessingStage, ProcessingHandler]:
+        return {
+            ProcessingStage.TRANSCRIPTION: self.execute_transcription_job,
+            ProcessingStage.EXTRACTION: self.execute_extraction_job,
+        }
+
+    async def execute_transcription_job(
+        self,
+        job: ProcessingJob,
+    ) -> WorkflowFailure | None:
+        invalid = self._validate_job(job, ProcessingStage.TRANSCRIPTION)
+        if invalid is not None:
+            return invalid
+        meeting = self.get_meeting(job.meeting_id)
+        if meeting.current_transcript_id is not None:
+            return None
+        allowed = {
+            MeetingStatus.INGESTED,
+            MeetingStatus.TRANSCRIBING,
+            MeetingStatus.TRANSCRIPTION_FAILED,
+        }
+        if meeting.status not in allowed:
+            return _invalid_job_failure(self._clock.now())
+        try:
+            await self._transcribe(meeting, job=job)
+        except Exception as error:
+            return _transcription_failure(error, self._clock.now())
+        return None
+
+    async def execute_extraction_job(
+        self,
+        job: ProcessingJob,
+    ) -> WorkflowFailure | None:
+        invalid = self._validate_job(job, ProcessingStage.EXTRACTION)
+        if invalid is not None:
+            return invalid
+        meeting = self.get_meeting(job.meeting_id)
+        if meeting.current_review_id is not None:
+            return None
+        allowed = {
+            MeetingStatus.TRANSCRIBED,
+            MeetingStatus.EXTRACTING,
+            MeetingStatus.EXTRACTION_FAILED,
+        }
+        if meeting.status not in allowed:
+            return _invalid_job_failure(self._clock.now())
+        try:
+            await self._extract(meeting, job=job)
+        except Exception as error:
+            return _extraction_failure(error, self._clock.now())
+        return None
 
     def approve(
         self,
@@ -404,8 +474,17 @@ class MeetingWorkflow:
             uow.commit()
         return ReviewUpdateResult(updated, revised)
 
-    async def _transcribe(self, meeting: Meeting) -> Meeting:
-        meeting = self._start_stage(meeting, MeetingStatus.TRANSCRIBING)
+    async def _transcribe(
+        self,
+        meeting: Meeting,
+        *,
+        job: ProcessingJob | None = None,
+    ) -> Meeting:
+        meeting = self._start_stage(
+            meeting,
+            MeetingStatus.TRANSCRIBING,
+            job=job,
+        )
         with self._unit_of_work() as uow:
             asset = _required(uow.audio_assets.get(meeting.audio_asset_id), "Audio asset")
         try:
@@ -418,10 +497,12 @@ class MeetingWorkflow:
                 meeting.id,
                 MeetingStatus.TRANSCRIPTION_FAILED,
                 _transcription_failure(error, self._clock.now()),
+                job=job,
             )
             raise
         now = self._clock.now()
         with self._unit_of_work() as uow:
+            self._require_active_job(uow, job, ProcessingStage.TRANSCRIPTION, now)
             current = _required(uow.meetings.get(meeting.id), "Meeting")
             completed = transition_meeting(
                 current,
@@ -431,11 +512,26 @@ class MeetingWorkflow:
             )
             uow.transcripts.add(transcript)
             uow.meetings.save(completed, current.version)
+            self._processing_scheduler.enqueue_in(
+                uow,
+                meeting.id,
+                ProcessingStage.EXTRACTION,
+                scheduled_at=now,
+            )
             uow.commit()
         return completed
 
-    async def _extract(self, meeting: Meeting) -> Meeting:
-        meeting = self._start_stage(meeting, MeetingStatus.EXTRACTING)
+    async def _extract(
+        self,
+        meeting: Meeting,
+        *,
+        job: ProcessingJob | None = None,
+    ) -> Meeting:
+        meeting = self._start_stage(
+            meeting,
+            MeetingStatus.EXTRACTING,
+            job=job,
+        )
         with self._unit_of_work() as uow:
             transcript = _required(uow.transcripts.latest_for_meeting(meeting.id), "Transcript")
             latest_review = uow.reviews.latest_for_meeting(meeting.id)
@@ -476,10 +572,12 @@ class MeetingWorkflow:
                 meeting.id,
                 MeetingStatus.EXTRACTION_FAILED,
                 _extraction_failure(error, self._clock.now()),
+                job=job,
             )
             raise
         now = self._clock.now()
         with self._unit_of_work() as uow:
+            self._require_active_job(uow, job, ProcessingStage.EXTRACTION, now)
             current = _required(uow.meetings.get(meeting.id), "Meeting")
             updated_payload = current.model_dump(mode="python") | {
                 "participants": package.participants or current.participants,
@@ -497,10 +595,20 @@ class MeetingWorkflow:
             uow.commit()
         return completed
 
-    def _start_stage(self, meeting: Meeting, target: MeetingStatus) -> Meeting:
+    def _start_stage(
+        self,
+        meeting: Meeting,
+        target: MeetingStatus,
+        *,
+        job: ProcessingJob | None = None,
+    ) -> Meeting:
         now = self._clock.now()
         with self._unit_of_work() as uow:
+            stage = _processing_stage_for(target)
+            self._require_active_job(uow, job, stage, now)
             current = _required(uow.meetings.get(meeting.id), "Meeting")
+            if current.status is target:
+                return current
             started = transition_meeting(current, target, now)
             uow.meetings.save(started, current.version)
             uow.commit()
@@ -527,13 +635,59 @@ class MeetingWorkflow:
         meeting_id: UUID,
         target: MeetingStatus,
         failure: WorkflowFailure,
+        *,
+        job: ProcessingJob | None = None,
     ) -> None:
         now = self._clock.now()
         with self._unit_of_work() as uow:
+            self._require_active_job(
+                uow,
+                job,
+                _processing_stage_for(target),
+                now,
+            )
             current = _required(uow.meetings.get(meeting_id), "Meeting")
             failed = transition_meeting(current, target, now, failure=failure)
             uow.meetings.save(failed, current.version)
             uow.commit()
+
+    def _validate_job(
+        self,
+        job: ProcessingJob,
+        stage: ProcessingStage,
+    ) -> WorkflowFailure | None:
+        now = self._clock.now()
+        try:
+            with self._unit_of_work() as uow:
+                self._require_active_job(uow, job, stage, now)
+        except WorkflowBusyError:
+            return _invalid_job_failure(now)
+        return None
+
+    @staticmethod
+    def _require_active_job(
+        uow: UnitOfWork,
+        job: ProcessingJob | None,
+        stage: ProcessingStage,
+        now: datetime,
+    ) -> None:
+        if job is None:
+            return
+        persisted = uow.processing_jobs.get(job.id)
+        active = (
+            job.stage is stage
+            and job.status is ProcessingJobStatus.RUNNING
+            and persisted is not None
+            and persisted.meeting_id == job.meeting_id
+            and persisted.stage is stage
+            and persisted.status is ProcessingJobStatus.RUNNING
+            and persisted.attempt_count == job.attempt_count
+            and persisted.lease_owner == job.lease_owner
+            and persisted.lease_expires_at is not None
+            and persisted.lease_expires_at > now
+        )
+        if not active:
+            raise WorkflowBusyError
 
 
 ModelT = TypeVar("ModelT")
@@ -543,6 +697,31 @@ def _required(value: ModelT | None, resource: str) -> ModelT:
     if value is None:
         raise ResourceNotFoundError(resource)
     return value
+
+
+def _processing_stage_for(status: MeetingStatus) -> ProcessingStage:
+    transcription_statuses = {
+        MeetingStatus.TRANSCRIBING,
+        MeetingStatus.TRANSCRIPTION_FAILED,
+    }
+    if status in transcription_statuses:
+        return ProcessingStage.TRANSCRIPTION
+    extraction_statuses = {
+        MeetingStatus.EXTRACTING,
+        MeetingStatus.EXTRACTION_FAILED,
+    }
+    if status in extraction_statuses:
+        return ProcessingStage.EXTRACTION
+    raise ValueError(f"{status.value} is not a processing stage status")
+
+
+def _invalid_job_failure(occurred_at: datetime) -> WorkflowFailure:
+    return WorkflowFailure(
+        code=FailureCode.INVALID_INPUT,
+        disposition=FailureDisposition.PERMANENT,
+        safe_message="The processing job is not active for this stage",
+        occurred_at=occurred_at,
+    )
 
 
 def _request_id(error: Exception) -> str | None:
