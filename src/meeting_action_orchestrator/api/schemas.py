@@ -19,6 +19,7 @@ from meeting_action_orchestrator.api.contracts import (
     ProcessingResult,
     ReadinessResult,
 )
+from meeting_action_orchestrator.application.processing_control import ProcessingControlResult
 from meeting_action_orchestrator.application.workflow import ApprovalResult
 from meeting_action_orchestrator.domain.enums import (
     FailureCode,
@@ -256,6 +257,20 @@ class ProcessingResponse(ApiModel):
         return cls(
             meeting_id=result.meeting_id,
             jobs=tuple(ProcessingJobResponse.from_domain(job) for job in result.jobs),
+        )
+
+
+class ProcessingControlResponse(ApiModel):
+    meeting: MeetingResponse
+    jobs: tuple[ProcessingJobResponse, ...]
+    replayed: bool
+
+    @classmethod
+    def from_result(cls, result: ProcessingControlResult) -> ProcessingControlResponse:
+        return cls(
+            meeting=MeetingResponse.from_domain(result.meeting),
+            jobs=tuple(ProcessingJobResponse.from_domain(job) for job in result.jobs),
+            replayed=result.replayed,
         )
 
 

@@ -28,6 +28,7 @@ from meeting_action_orchestrator.domain.models import (
     AudioAsset,
     DeliveryOperationBinding,
     Meeting,
+    MeetingOperationBinding,
     ProcessingJob,
     RecapArtifact,
     ReviewRevision,
@@ -186,6 +187,12 @@ class DeliveryOperationRepository(Protocol):
     def get(self, request_key: str) -> DeliveryOperationBinding | None: ...
 
 
+class MeetingOperationRepository(Protocol):
+    def add(self, binding: MeetingOperationBinding) -> None: ...
+
+    def get(self, request_key: str) -> MeetingOperationBinding | None: ...
+
+
 class ProcessingJobRepository(Protocol):
     def add(self, job: ProcessingJob) -> None: ...
 
@@ -269,6 +276,7 @@ class UnitOfWork(Protocol):
     approvals: ApprovalRepository
     recaps: RecapRepository
     delivery_operations: DeliveryOperationRepository
+    meeting_operations: MeetingOperationRepository
     processing_jobs: ProcessingJobRepository
     write_intents: WriteIntentRepository
     write_receipts: WriteReceiptRepository

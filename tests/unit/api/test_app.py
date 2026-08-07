@@ -18,6 +18,7 @@ from meeting_action_orchestrator.api.contracts import (
 )
 from meeting_action_orchestrator.application.errors import ResourceNotFoundError
 from meeting_action_orchestrator.application.ports import MeetingListCursor
+from meeting_action_orchestrator.application.processing_control import ProcessingControlResult
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
@@ -343,6 +344,45 @@ class FakeDeliveries:
         return DeliveryResult(meeting(), ())
 
 
+class FakeProcessingControls:
+    def __init__(self, *, replayed: bool = False) -> None:
+        self.replayed = replayed
+        self.retry_request: tuple[UUID, int, str, str] | None = None
+        self.cancel_request: tuple[UUID, int, str, str] | None = None
+
+    async def retry(
+        self,
+        meeting_id: UUID,
+        *,
+        expected_version: int,
+        request_key: str,
+        actor_id: str,
+    ) -> ProcessingControlResult:
+        self.retry_request = (meeting_id, expected_version, request_key, actor_id)
+        updated = meeting().model_copy(update={"version": 1})
+        queued = processing_job().model_copy(
+            update={
+                "status": ProcessingJobStatus.READY,
+                "attempt_count": 0,
+                "lease_owner": None,
+                "lease_expires_at": None,
+            }
+        )
+        return ProcessingControlResult(updated, (queued,), self.replayed)
+
+    async def cancel(
+        self,
+        meeting_id: UUID,
+        *,
+        expected_version: int,
+        request_key: str,
+        actor_id: str,
+    ) -> ProcessingControlResult:
+        self.cancel_request = (meeting_id, expected_version, request_key, actor_id)
+        cancelled = meeting().model_copy(update={"status": MeetingStatus.CANCELLED, "version": 1})
+        return ProcessingControlResult(cancelled, (), self.replayed)
+
+
 class ChunkedBody(httpx.AsyncByteStream):
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield b"x" * (512 * 1024)
@@ -355,10 +395,12 @@ def dependencies(
     ready: bool = True,
     max_upload_bytes: int = 1024,
     queries: FakeQueries | None = None,
+    processing_controls: FakeProcessingControls | None = None,
 ) -> ApiDependencies:
     return ApiDependencies(
         workflow=FakeWorkflow(),
         queries=queries or FakeQueries(),
+        processing_controls=processing_controls or FakeProcessingControls(),
         reviews=FakeReviews(),
         deliveries=FakeDeliveries(),
         authenticator=FakeAuthenticator(),
@@ -558,6 +600,90 @@ async def test_processing_read_excludes_worker_and_lease_state() -> None:
     assert removed_mutation.status_code == 405
 
 
+async def test_processing_retry_requires_concurrency_and_idempotency_headers() -> None:
+    controls = FakeProcessingControls()
+    services = dependencies(processing_controls=controls)
+    response = await request(
+        f"/v1/meetings/{MEETING_ID}/processing/retry",
+        method="POST",
+        services=services,
+        headers=authorization(
+            **{
+                "If-Match": '"meeting-0"',
+                "Idempotency-Key": "processing-retry-one",
+            }
+        ),
+    )
+
+    assert response.status_code == 202
+    assert response.headers["location"] == f"/v1/meetings/{MEETING_ID}/processing"
+    assert len(response.headers["etag"].strip('"')) == 64
+    assert response.json()["replayed"] is False
+    assert response.json()["jobs"][0]["status"] == "ready"
+    assert controls.retry_request == (
+        MEETING_ID,
+        0,
+        "processing-retry-one",
+        "portfolio-owner",
+    )
+
+    missing = await request(
+        f"/v1/meetings/{MEETING_ID}/processing/retry",
+        method="POST",
+        headers=authorization(**{"Idempotency-Key": "processing-retry-one"}),
+    )
+    assert missing.status_code == 428
+
+    missing_key = await request(
+        f"/v1/meetings/{MEETING_ID}/processing/retry",
+        method="POST",
+        headers=authorization(**{"If-Match": '"meeting-0"'}),
+    )
+    assert missing_key.status_code == 400
+
+
+async def test_processing_retry_replay_returns_ok() -> None:
+    response = await request(
+        f"/v1/meetings/{MEETING_ID}/processing/retry",
+        method="POST",
+        services=dependencies(processing_controls=FakeProcessingControls(replayed=True)),
+        headers=authorization(
+            **{
+                "If-Match": '"meeting-0"',
+                "Idempotency-Key": "processing-retry-one",
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["replayed"] is True
+
+
+async def test_cancellation_returns_the_new_meeting_version() -> None:
+    controls = FakeProcessingControls()
+    response = await request(
+        f"/v1/meetings/{MEETING_ID}/cancellation",
+        method="PUT",
+        services=dependencies(processing_controls=controls),
+        headers=authorization(
+            **{
+                "If-Match": '"meeting-0"',
+                "Idempotency-Key": "cancellation-one",
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["etag"] == '"meeting-1"'
+    assert response.json()["status"] == "cancelled"
+    assert controls.cancel_request == (
+        MEETING_ID,
+        0,
+        "cancellation-one",
+        "portfolio-owner",
+    )
+
+
 async def test_recap_read_returns_the_canonical_artifact_etag() -> None:
     response = await request(
         f"/v1/meetings/{MEETING_ID}/recap",
@@ -746,3 +872,19 @@ def test_openapi_secures_all_data_routes_and_describes_problem_media() -> None:
     approval = schema["paths"]["/v1/meetings/{meeting_id}/approval"]["post"]
     assert "200" in approval["responses"]
     assert "201" in approval["responses"]
+    processing_retry = schema["paths"]["/v1/meetings/{meeting_id}/processing/retry"]["post"]
+    assert "200" in processing_retry["responses"]
+    assert "202" in processing_retry["responses"]
+    assert {
+        parameter["name"]: parameter["required"]
+        for parameter in processing_retry["parameters"]
+        if parameter["in"] == "header"
+    } == {"If-Match": True, "Idempotency-Key": True}
+    assert set(processing_retry["responses"]["202"]["headers"]) == {"ETag", "Location"}
+    cancellation = schema["paths"]["/v1/meetings/{meeting_id}/cancellation"]["put"]
+    assert {
+        parameter["name"]: parameter["required"]
+        for parameter in cancellation["parameters"]
+        if parameter["in"] == "header"
+    } == {"If-Match": True, "Idempotency-Key": True}
+    assert "ETag" in cancellation["responses"]["200"]["headers"]

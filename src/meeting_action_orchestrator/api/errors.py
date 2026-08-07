@@ -13,6 +13,7 @@ from meeting_action_orchestrator.application.errors import (
     PermanentWriteError,
     ResourceNotFoundError,
     ReviewDigestMismatchError,
+    StaleWorkflowVersionError,
     TransientWriteError,
     UnknownWriteOutcomeError,
 )
@@ -76,6 +77,13 @@ def _application_problem(
             412,
             "urn:meeting-action-orchestrator:problem:stale-review",
             "The review changed before the operation completed.",
+            {},
+        )
+    if isinstance(exc, StaleWorkflowVersionError):
+        return (
+            412,
+            "urn:meeting-action-orchestrator:problem:stale-meeting",
+            "The meeting changed before the operation completed.",
             {},
         )
     if isinstance(exc, TransientWriteError):

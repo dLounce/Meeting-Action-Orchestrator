@@ -91,6 +91,8 @@ class InvariantCode(str, Enum):
     JOB_FAILURE_REQUIRED = "failed processing job status requires a failure"
     JOB_FAILURE_FORBIDDEN = "active or successful processing job cannot retain a failure"
     JOB_RETRY_DISPOSITION = "processing job retry requires a retryable failure"
+    MEETING_OPERATION_STAGE = "meeting operation stage does not match its operation"
+    MEETING_OPERATION_FINGERPRINT = "meeting operation fingerprint does not match its request"
 
 
 class InvalidDomainValueError(DomainError):

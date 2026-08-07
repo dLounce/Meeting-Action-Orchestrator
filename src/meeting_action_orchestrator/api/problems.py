@@ -123,6 +123,34 @@ async def validation_exception_handler(
     request: Request,
     exc: RequestValidationError,
 ) -> JSONResponse:
+    missing_headers = {
+        str(location[1]).casefold()
+        for error in exc.errors()
+        if error.get("type") == "missing"
+        and isinstance((location := error.get("loc")), tuple)
+        and len(location) == 2
+        and location[0] == "header"
+    }
+    if "if-match" in missing_headers:
+        return problem_response(
+            create_problem(
+                428,
+                detail="If-Match must identify the meeting version being changed.",
+                type_uri="urn:meeting-action-orchestrator:problem:precondition-required",
+                instance=request.url.path,
+                request_id=_request_id(request),
+            )
+        )
+    if "idempotency-key" in missing_headers:
+        return problem_response(
+            create_problem(
+                400,
+                detail="Idempotency-Key is required for this operation.",
+                type_uri="urn:meeting-action-orchestrator:problem:idempotency-key-required",
+                instance=request.url.path,
+                request_id=_request_id(request),
+            )
+        )
     violations = tuple(_field_violation(error) for error in exc.errors())
     problem = create_problem(
         422,

@@ -15,6 +15,7 @@ from meeting_action_orchestrator.api.dependencies import (
     format_meeting_cursor,
     parse_idempotency_key,
     parse_meeting_cursor,
+    parse_meeting_precondition,
     parse_review_precondition,
 )
 from meeting_action_orchestrator.api.problems import (
@@ -35,6 +36,7 @@ from meeting_action_orchestrator.api.schemas import (
     IssueResolutionRequest,
     MeetingListResponse,
     MeetingResponse,
+    ProcessingControlResponse,
     ProcessingResponse,
     ReadinessResponse,
     RecapResponse,
@@ -45,6 +47,7 @@ from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueR
 from meeting_action_orchestrator.application.workflow import IngestMeeting
 from meeting_action_orchestrator.domain.enums import IssueStatus, MeetingStatus, WriteKind
 from meeting_action_orchestrator.domain.errors import DomainError
+from meeting_action_orchestrator.domain.hashing import canonical_sha256
 
 PROBLEM_SCHEMA = ProblemDetail.model_json_schema(by_alias=True)
 
@@ -59,6 +62,18 @@ def _problem_response_spec(status: int) -> dict[str, Any]:
 PROBLEM_RESPONSES: dict[int | str, dict[str, Any]] = {
     status: _problem_response_spec(status)
     for status in (400, 401, 404, 409, 412, 413, 422, 428, 500, 502, 503)
+}
+ETAG_HEADER = {
+    "description": "Strong validator for the returned representation.",
+    "schema": {"type": "string"},
+}
+LOCATION_HEADER = {
+    "description": "Canonical resource for the processing state.",
+    "schema": {"type": "string"},
+}
+PROCESSING_CONTROL_HEADERS = {
+    "ETag": ETAG_HEADER,
+    "Location": LOCATION_HEADER,
 }
 SUPPORTED_DECLARED_MEDIA_TYPES = frozenset(
     {
@@ -195,6 +210,64 @@ async def get_processing(
 ) -> ProcessingResponse:
     result = await dependencies.queries.get_processing(meeting_id)
     return ProcessingResponse.from_result(result)
+
+
+@meeting_router.post(
+    "/{meeting_id}/processing/retry",
+    status_code=HTTPStatus.ACCEPTED,
+    response_model=ProcessingControlResponse,
+    responses={
+        HTTPStatus.OK: {
+            "model": ProcessingControlResponse,
+            "headers": PROCESSING_CONTROL_HEADERS,
+        },
+        HTTPStatus.ACCEPTED: {"headers": PROCESSING_CONTROL_HEADERS},
+    },
+    operation_id="retryMeetingProcessing",
+)
+async def retry_processing(
+    meeting_id: UUID,
+    response: Response,
+    dependencies: ApiDependenciesValue,
+    principal: PrincipalValue,
+    if_match: Annotated[str, Header(alias="If-Match")],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+) -> ProcessingControlResponse:
+    result = await dependencies.processing_controls.retry(
+        meeting_id,
+        expected_version=parse_meeting_precondition(if_match),
+        request_key=parse_idempotency_key(idempotency_key),
+        actor_id=principal.subject,
+    )
+    payload = ProcessingControlResponse.from_result(result)
+    response.status_code = HTTPStatus.OK if result.replayed else HTTPStatus.ACCEPTED
+    response.headers["Location"] = f"/v1/meetings/{meeting_id}/processing"
+    response.headers["ETag"] = format_etag(canonical_sha256(payload))
+    return payload
+
+
+@meeting_router.put(
+    "/{meeting_id}/cancellation",
+    response_model=MeetingResponse,
+    responses={HTTPStatus.OK: {"headers": {"ETag": ETAG_HEADER}}},
+    operation_id="cancelMeeting",
+)
+async def cancel_meeting(
+    meeting_id: UUID,
+    response: Response,
+    dependencies: ApiDependenciesValue,
+    principal: PrincipalValue,
+    if_match: Annotated[str, Header(alias="If-Match")],
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+) -> MeetingResponse:
+    result = await dependencies.processing_controls.cancel(
+        meeting_id,
+        expected_version=parse_meeting_precondition(if_match),
+        request_key=parse_idempotency_key(idempotency_key),
+        actor_id=principal.subject,
+    )
+    response.headers["ETag"] = format_etag(f"meeting-{result.meeting.version}")
+    return MeetingResponse.from_domain(result.meeting)
 
 
 @meeting_router.get(

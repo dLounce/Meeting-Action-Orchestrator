@@ -21,6 +21,7 @@ from meeting_action_orchestrator.domain.models import (
     AudioAsset,
     DeliveryOperationBinding,
     Meeting,
+    MeetingOperationBinding,
     ProcessingJob,
     RecapArtifact,
     ReviewRevision,
@@ -478,6 +479,40 @@ class SqliteDeliveryOperationRepository:
         return DeliveryOperationBinding.model_validate(dict(row))
 
 
+class SqliteMeetingOperationRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, binding: MeetingOperationBinding) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO meeting_operation_bindings (
+                request_key, meeting_id, operation, actor_id, stage,
+                expected_version, request_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                binding.request_key,
+                str(binding.meeting_id),
+                binding.operation.value,
+                binding.actor_id,
+                binding.stage.value if binding.stage is not None else None,
+                binding.expected_version,
+                binding.request_fingerprint,
+                str(binding.created_at),
+            ),
+        )
+
+    def get(self, request_key: str) -> MeetingOperationBinding | None:
+        row = self._connection.execute(
+            "SELECT * FROM meeting_operation_bindings WHERE request_key = ?",
+            (request_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MeetingOperationBinding.model_validate(dict(row))
+
+
 class SqliteProcessingJobRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
@@ -919,6 +954,7 @@ class SqliteUnitOfWork:
         self.approvals: SqliteApprovalRepository
         self.recaps: SqliteRecapRepository
         self.delivery_operations: SqliteDeliveryOperationRepository
+        self.meeting_operations: SqliteMeetingOperationRepository
         self.processing_jobs: SqliteProcessingJobRepository
         self.write_intents: SqliteWriteIntentRepository
         self.write_receipts: SqliteWriteReceiptRepository
@@ -935,6 +971,7 @@ class SqliteUnitOfWork:
         self.approvals = SqliteApprovalRepository(connection)
         self.recaps = SqliteRecapRepository(connection)
         self.delivery_operations = SqliteDeliveryOperationRepository(connection)
+        self.meeting_operations = SqliteMeetingOperationRepository(connection)
         self.processing_jobs = SqliteProcessingJobRepository(connection)
         self.write_intents = SqliteWriteIntentRepository(connection)
         self.write_receipts = SqliteWriteReceiptRepository(connection)

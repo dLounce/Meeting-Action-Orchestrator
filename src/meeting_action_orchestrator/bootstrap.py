@@ -45,6 +45,7 @@ from meeting_action_orchestrator.application.processing import (
 from meeting_action_orchestrator.application.processing import (
     ProcessingWorker,
 )
+from meeting_action_orchestrator.application.processing_control import ProcessingControlService
 from meeting_action_orchestrator.application.workflow import MeetingWorkflow, SystemClock
 from meeting_action_orchestrator.config import Settings, get_settings
 from meeting_action_orchestrator.domain.enums import ProcessingStage
@@ -415,6 +416,10 @@ def create_application(settings: Settings | None = None) -> FastAPI:
     dependencies = ApiDependencies(
         workflow=workflow_facade,
         queries=UnitOfWorkQueryFacade(read_unit_of_work),
+        processing_controls=ProcessingControlService(
+            unit_of_work=write_unit_of_work,
+            clock=clock,
+        ),
         reviews=workflow_facade,
         deliveries=delivery_service,
         authenticator=StaticBearerAuthenticator(

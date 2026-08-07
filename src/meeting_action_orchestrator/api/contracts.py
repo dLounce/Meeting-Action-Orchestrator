@@ -5,6 +5,7 @@ from typing import BinaryIO, Protocol
 from uuid import UUID
 
 from meeting_action_orchestrator.application.ports import MeetingListCursor
+from meeting_action_orchestrator.application.processing_control import ProcessingControlResult
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
@@ -105,6 +106,26 @@ class MeetingQueryService(Protocol):
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult: ...
 
 
+class ProcessingController(Protocol):
+    async def retry(
+        self,
+        meeting_id: UUID,
+        *,
+        expected_version: int,
+        request_key: str,
+        actor_id: str,
+    ) -> ProcessingControlResult: ...
+
+    async def cancel(
+        self,
+        meeting_id: UUID,
+        *,
+        expected_version: int,
+        request_key: str,
+        actor_id: str,
+    ) -> ProcessingControlResult: ...
+
+
 class ReviewEditor(Protocol):
     async def revise_action(
         self,
@@ -160,6 +181,7 @@ class DeliveryService(Protocol):
 class ApiDependencies:
     workflow: MeetingWorkflowService
     queries: MeetingQueryService
+    processing_controls: ProcessingController
     reviews: ReviewEditor
     deliveries: DeliveryService
     authenticator: Authenticator

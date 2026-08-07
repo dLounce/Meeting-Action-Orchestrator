@@ -44,6 +44,11 @@ class DeliveryOperationKind(str, Enum):
     RECONCILE = "reconcile"
 
 
+class MeetingOperationKind(str, Enum):
+    PROCESSING_RETRY = "processing_retry"
+    CANCELLATION = "cancellation"
+
+
 class ReviewOrigin(str, Enum):
     MODEL = "model"
     HUMAN = "human"

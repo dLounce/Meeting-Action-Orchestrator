@@ -182,7 +182,32 @@ CREATE INDEX idx_meetings_status_created_id
 ON meetings (status, created_at DESC, id DESC);
 """
 
-MIGRATIONS = ((1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3))
+SCHEMA_V4 = """
+CREATE TABLE meeting_operation_bindings (
+    request_key TEXT PRIMARY KEY
+        CHECK (length(request_key) BETWEEN 1 AND 200 AND request_key = trim(request_key)),
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    operation TEXT NOT NULL CHECK (operation IN ('processing_retry', 'cancellation')),
+    actor_id TEXT NOT NULL
+        CHECK (length(actor_id) BETWEEN 1 AND 200 AND actor_id = trim(actor_id)),
+    stage TEXT CHECK (stage IN ('transcription', 'extraction')),
+    expected_version INTEGER NOT NULL CHECK (expected_version >= 0),
+    request_fingerprint TEXT NOT NULL
+        CHECK (
+            length(request_fingerprint) = 64
+            AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+        ),
+    created_at TEXT NOT NULL,
+    CHECK (
+        (operation = 'processing_retry' AND stage IS NOT NULL)
+        OR (operation = 'cancellation' AND stage IS NULL)
+    )
+);
+CREATE INDEX idx_meeting_operation_bindings_meeting
+ON meeting_operation_bindings (meeting_id, created_at);
+"""
+
+MIGRATIONS = ((1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4))
 
 
 class Database:

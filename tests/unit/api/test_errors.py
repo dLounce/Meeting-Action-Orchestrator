@@ -8,7 +8,10 @@ from meeting_action_orchestrator.api.errors import (
     application_error_handler,
     domain_error_handler,
 )
-from meeting_action_orchestrator.application.errors import ApplicationError
+from meeting_action_orchestrator.application.errors import (
+    ApplicationError,
+    StaleWorkflowVersionError,
+)
 from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
 
 SENSITIVE_DETAIL = "private-provider-diagnostic"
@@ -49,3 +52,11 @@ async def test_idempotency_conflict_does_not_reflect_the_request_key() -> None:
     assert response.status_code == 409
     assert payload["type"].endswith("idempotency-conflict")
     assert SENSITIVE_KEY not in response.body.decode()
+
+
+async def test_stale_meeting_version_is_a_precondition_failure() -> None:
+    response = await application_error_handler(request(), StaleWorkflowVersionError())
+    payload = json.loads(response.body)
+
+    assert response.status_code == 412
+    assert payload["type"].endswith("stale-meeting")

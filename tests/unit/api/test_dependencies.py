@@ -10,6 +10,7 @@ from meeting_action_orchestrator.api.dependencies import (
     format_meeting_cursor,
     parse_idempotency_key,
     parse_meeting_cursor,
+    parse_meeting_precondition,
     parse_review_precondition,
 )
 from meeting_action_orchestrator.api.problems import ProblemError
@@ -22,6 +23,28 @@ DIGEST = "a" * 64
 def test_review_precondition_accepts_one_strong_digest_etag() -> None:
     assert parse_review_precondition(f'"{DIGEST}"') == DIGEST
     assert format_etag(DIGEST) == f'"{DIGEST}"'
+
+
+def test_meeting_precondition_accepts_one_strong_version_etag() -> None:
+    assert parse_meeting_precondition('"meeting-0"') == 0
+    assert parse_meeting_precondition('"meeting-42"') == 42
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "meeting-1",
+        'W/"meeting-1"',
+        "*",
+        '"meeting-01"',
+        '"meeting-1", "meeting-2"',
+        '"meeting-9999999999999999999"',
+    ],
+)
+def test_meeting_precondition_rejects_missing_or_ambiguous_values(value: str | None) -> None:
+    with pytest.raises(ProblemError):
+        parse_meeting_precondition(value)
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ from meeting_action_orchestrator.domain.enums import (
     FailureDisposition,
     IssueSeverity,
     IssueStatus,
+    MeetingOperationKind,
     MeetingStatus,
     Priority,
     ProcessingJobStatus,
@@ -84,6 +85,40 @@ class DeliveryOperationBinding(DomainModel):
     actor_id: ShortText
     selection_fingerprint: Sha256Digest
     created_at: AwareDatetime
+
+
+class MeetingOperationBinding(DomainModel):
+    request_key: ShortText
+    meeting_id: UUID
+    operation: MeetingOperationKind
+    actor_id: ShortText
+    stage: ProcessingStage | None = None
+    expected_version: int = Field(ge=0)
+    request_fingerprint: Sha256Digest
+    created_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_stage(self) -> MeetingOperationBinding:
+        retry = self.operation is MeetingOperationKind.PROCESSING_RETRY
+        if retry != (self.stage is not None):
+            raise DomainInvariantError(InvariantCode.MEETING_OPERATION_STAGE)
+        return self
+
+    @model_validator(mode="after")
+    def validate_fingerprint(self) -> MeetingOperationBinding:
+        expected = canonical_sha256(
+            {
+                "actor_id": self.actor_id,
+                "expected_version": self.expected_version,
+                "meeting_id": self.meeting_id,
+                "operation": self.operation,
+                "request_key": self.request_key,
+                "stage": self.stage,
+            }
+        )
+        if self.request_fingerprint != expected:
+            raise DomainInvariantError(InvariantCode.MEETING_OPERATION_FINGERPRINT)
+        return self
 
 
 PROCESSING_MAX_ATTEMPTS = {
