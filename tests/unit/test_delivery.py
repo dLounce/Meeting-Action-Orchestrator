@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
 from threading import get_ident
@@ -13,6 +14,7 @@ from meeting_action_orchestrator.application.delivery import (
     FullJitterRetryScheduler,
     PersistedApprovalAuthorizer,
 )
+from meeting_action_orchestrator.application.errors import OperationConflictError
 from meeting_action_orchestrator.application.state_machine import transition_write_intent
 from meeting_action_orchestrator.domain.enums import (
     DeadlineResolution,
@@ -124,6 +126,7 @@ def make_intent(
     lease_owner = None
     lease_expires_at = None
     next_attempt_at = None
+    next_reconcile_at = None
     last_failure = None
     if status is WriteStatus.IN_FLIGHT:
         lease_owner = "worker-one"
@@ -132,6 +135,7 @@ def make_intent(
         next_attempt_at = NOW - timedelta(seconds=1)
         last_failure = failure(FailureDisposition.RETRYABLE)
     elif status is WriteStatus.UNKNOWN:
+        next_reconcile_at = updated_at
         last_failure = failure(
             FailureDisposition.UNKNOWN_OUTCOME,
             code=FailureCode.UNKNOWN_REMOTE_OUTCOME,
@@ -147,6 +151,7 @@ def make_intent(
         status=status,
         attempt_count=attempt_count,
         next_attempt_at=next_attempt_at,
+        next_reconcile_at=next_reconcile_at,
         lease_owner=lease_owner,
         lease_expires_at=lease_expires_at,
         last_failure=last_failure,
@@ -310,12 +315,77 @@ class FakeIntentRepository:
             recovered.append(intent.id)
         return tuple(recovered)
 
-    def list_unknown_ids(self, limit: int) -> Sequence[UUID]:
+    def list_unknown_ids(self, now: datetime, limit: int) -> Sequence[UUID]:
         return tuple(
             intent.id
             for intent in sorted(self.database.intents.values(), key=lambda item: str(item.id))
             if intent.status is WriteStatus.UNKNOWN
+            and intent.next_reconcile_at is not None
+            and intent.next_reconcile_at <= now
+            and (
+                intent.reconcile_lease_owner is None
+                or (
+                    intent.reconcile_lease_expires_at is not None
+                    and intent.reconcile_lease_expires_at <= now
+                )
+            )
         )[:limit]
+
+    def claim_due_unknown_ids(
+        self,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[UUID]:
+        claimed: list[UUID] = []
+        for intent_id in self.list_unknown_ids(now, limit):
+            intent = self.database.intents[intent_id]
+            updated = WriteIntent.model_validate(
+                intent.model_dump(mode="python")
+                | {
+                    "next_reconcile_at": now,
+                    "reconcile_lease_owner": owner,
+                    "reconcile_lease_expires_at": lease_until,
+                    "version": intent.version + 1,
+                    "updated_at": now,
+                }
+            )
+            self.database.intents[intent_id] = updated
+            claimed.append(intent_id)
+        return tuple(claimed)
+
+    def claim_unknown(
+        self,
+        intent_id: UUID,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        *,
+        force: bool,
+    ) -> WriteIntent | None:
+        intent = self.database.intents.get(intent_id)
+        if intent is None or intent.status is not WriteStatus.UNKNOWN:
+            return None
+        available = intent.reconcile_lease_owner is None or (
+            intent.reconcile_lease_expires_at is not None
+            and intent.reconcile_lease_expires_at <= now
+        )
+        due = intent.next_reconcile_at is not None and intent.next_reconcile_at <= now
+        if not available or (not force and not due):
+            return None
+        updated = WriteIntent.model_validate(
+            intent.model_dump(mode="python")
+            | {
+                "next_reconcile_at": now,
+                "reconcile_lease_owner": owner,
+                "reconcile_lease_expires_at": lease_until,
+                "version": intent.version + 1,
+                "updated_at": now,
+            }
+        )
+        self.database.intents[intent_id] = updated
+        return updated
 
     def save(self, intent: WriteIntent, expected_version: int) -> None:
         current = self.database.intents[intent.id]
@@ -421,6 +491,20 @@ class AdvancingGateway(FakeGateway):
         self.lease_expirations.append(intent.lease_expires_at)
         self.clock.current += timedelta(seconds=25)
         return make_receipt(intent)
+
+
+class BlockingLookupGateway(FakeGateway):
+    def __init__(self, database: FakeDatabase) -> None:
+        super().__init__(database)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def find_task(self, _idempotency_key: str) -> WriteReceipt | None:
+        assert self.database.transaction_depth == 0
+        self.calls.append("find_task")
+        self.entered.set()
+        await self.release.wait()
+        return None
 
 
 def executor(
@@ -590,6 +674,7 @@ async def test_unknown_outcome_is_reconciled_before_another_create() -> None:
 
     assert gateway.calls == ["find_task"]
     assert first.results[0].status is WriteStatus.RETRY_WAIT
+    assert database.intents[unknown.id].next_attempt_at == NOW + timedelta(seconds=37)
     clock.current = NOW + timedelta(seconds=38)
 
     await service.run_once()
@@ -618,6 +703,123 @@ async def test_lookup_failure_keeps_an_unknown_intent_out_of_create_path() -> No
     assert updated.last_failure.safe_message == (
         "The connector outcome is unknown and requires reconciliation"
     )
+    assert updated.reconcile_attempt_count == 1
+    assert updated.next_reconcile_at == NOW + timedelta(seconds=37)
+
+
+@pytest.mark.asyncio
+async def test_deferred_unknown_does_not_starve_pending_delivery() -> None:
+    unknown = make_intent(status=WriteStatus.UNKNOWN, attempt_count=1)
+    pending = make_intent(11)
+    database = FakeDatabase(unknown, pending)
+    lookup_error = RetryableMcpError(
+        FailureCode.PROVIDER_UNAVAILABLE,
+        FailureDisposition.RETRYABLE,
+        "temporary",
+    )
+    gateway = FakeGateway(
+        database,
+        writes=(make_receipt(pending),),
+        lookups=(lookup_error,),
+    )
+    service = executor(database, gateway)
+
+    first = await service.run_once(1)
+    second = await service.run_once(1)
+
+    assert [result.status for result in first.results] == [WriteStatus.UNKNOWN]
+    assert [result.status for result in second.results] == [WriteStatus.SUCCEEDED]
+    assert gateway.calls == ["find_task", "ensure_task"]
+    assert database.intents[unknown.id].next_reconcile_at == NOW + timedelta(seconds=37)
+
+
+@pytest.mark.asyncio
+async def test_unknown_lookup_is_not_repeated_before_its_durable_schedule() -> None:
+    unknown = make_intent(status=WriteStatus.UNKNOWN, attempt_count=1)
+    database = FakeDatabase(unknown)
+    clock = MutableClock()
+    errors = tuple(
+        RetryableMcpError(
+            FailureCode.PROVIDER_UNAVAILABLE,
+            FailureDisposition.RETRYABLE,
+            "temporary",
+        )
+        for _ in range(2)
+    )
+    gateway = FakeGateway(database, lookups=errors)
+    scheduler = FixedScheduler()
+    service = executor(database, gateway, clock=clock, scheduler=scheduler)
+
+    await service.run_once(1)
+    await service.run_once(1)
+
+    assert gateway.calls == ["find_task"]
+    assert database.intents[unknown.id].reconcile_attempt_count == 1
+    clock.current = NOW + timedelta(seconds=38)
+
+    await service.run_once(1)
+
+    assert gateway.calls == ["find_task", "find_task"]
+    assert database.intents[unknown.id].reconcile_attempt_count == 2
+    assert scheduler.attempts == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_background_and_manual_reconciliation_cannot_share_a_lookup() -> None:
+    unknown = make_intent(status=WriteStatus.UNKNOWN, attempt_count=1)
+    database = FakeDatabase(unknown)
+    gateway = BlockingLookupGateway(database)
+    background = executor(database, gateway)
+    manual = executor(database, gateway)
+    running = asyncio.create_task(background.run_once(1))
+    await gateway.entered.wait()
+
+    with pytest.raises(OperationConflictError, match="already being reconciled"):
+        await manual.reconcile_intent(unknown.id)
+
+    gateway.release.set()
+    batch = await running
+    assert gateway.calls == ["find_task"]
+    assert batch.results[0].status is WriteStatus.RETRY_WAIT
+    assert database.intents[unknown.id].reconcile_lease_owner is None
+
+
+@pytest.mark.asyncio
+async def test_manual_reconciliation_force_claims_a_future_unknown_schedule() -> None:
+    unknown = WriteIntent.model_validate(
+        make_intent(status=WriteStatus.UNKNOWN, attempt_count=1).model_dump(mode="python")
+        | {"next_reconcile_at": NOW + timedelta(minutes=5)}
+    )
+    database = FakeDatabase(unknown)
+    gateway = FakeGateway(database, lookups=(None,))
+
+    result = await executor(database, gateway).reconcile_intent(unknown.id)
+
+    assert result.status is WriteStatus.RETRY_WAIT
+    assert gateway.calls == ["find_task"]
+    assert database.intents[unknown.id].next_attempt_at == NOW + timedelta(seconds=37)
+    assert database.intents[unknown.id].reconcile_lease_owner is None
+
+
+@pytest.mark.asyncio
+async def test_mismatched_lookup_receipt_remains_unknown_and_is_deferred() -> None:
+    unknown = make_intent(status=WriteStatus.UNKNOWN, attempt_count=1)
+    database = FakeDatabase(unknown)
+    mismatched = make_receipt(unknown, reconciled=True).model_copy(
+        update={"payload_digest": "f" * 64}
+    )
+    gateway = FakeGateway(database, lookups=(mismatched,))
+
+    await executor(database, gateway).run_once(1)
+
+    updated = database.intents[unknown.id]
+    assert gateway.calls == ["find_task"]
+    assert updated.status is WriteStatus.UNKNOWN
+    assert updated.last_failure is not None
+    assert updated.last_failure.code is FailureCode.IDEMPOTENCY_CONFLICT
+    assert updated.last_failure.disposition is FailureDisposition.UNKNOWN_OUTCOME
+    assert updated.reconcile_attempt_count == 1
+    assert updated.next_reconcile_at == NOW + timedelta(seconds=37)
 
 
 @pytest.mark.asyncio
@@ -639,17 +841,31 @@ async def test_expired_in_flight_write_is_recovered_through_lookup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_receipt_binding_is_a_permanent_failure() -> None:
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("intent_id", uid(999)),
+        ("idempotency_key", f"mao_v1_{999:064x}"),
+        ("payload_digest", "f" * 64),
+    ],
+)
+async def test_invalid_receipt_binding_is_an_unknown_outcome(
+    field: str,
+    value: UUID | str,
+) -> None:
     pending = make_intent()
     database = FakeDatabase(pending)
-    gateway = FakeGateway(database, writes=(make_receipt(pending, payload_digest="f" * 64),))
+    invalid = make_receipt(pending).model_copy(update={field: value})
+    gateway = FakeGateway(database, writes=(invalid,))
 
     await executor(database, gateway).run_once()
 
     updated = database.intents[pending.id]
-    assert updated.status is WriteStatus.PERMANENT_FAILED
+    assert updated.status is WriteStatus.UNKNOWN
     assert updated.last_failure is not None
     assert updated.last_failure.code is FailureCode.IDEMPOTENCY_CONFLICT
+    assert updated.last_failure.disposition is FailureDisposition.UNKNOWN_OUTCOME
+    assert updated.next_reconcile_at == NOW
 
 
 @pytest.mark.asyncio

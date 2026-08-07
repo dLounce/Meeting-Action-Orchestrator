@@ -22,6 +22,7 @@ from meeting_action_orchestrator.domain.enums import (
     DeadlineKind,
     DeadlineResolution,
     DeliveryOperationKind,
+    DeliveryOperationStatus,
     FailureCode,
     FailureDisposition,
     IssueSeverity,
@@ -84,7 +85,33 @@ class DeliveryOperationBinding(DomainModel):
     operation: DeliveryOperationKind
     actor_id: ShortText
     selection_fingerprint: Sha256Digest
+    status: DeliveryOperationStatus = DeliveryOperationStatus.PENDING
+    lease_owner: ShortText | None = None
+    lease_expires_at: AwareDatetime | None = None
+    completed_at: AwareDatetime | None = None
+    version: int = Field(default=0, ge=0)
     created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_execution(self) -> DeliveryOperationBinding:
+        if self.updated_at < self.created_at:
+            raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_TIMESTAMPS)
+        if self.status is DeliveryOperationStatus.RUNNING:
+            if self.lease_owner is None or self.lease_expires_at is None:
+                raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_LEASE_REQUIRED)
+            if self.lease_expires_at <= self.updated_at:
+                raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_LEASE_EXPIRY)
+        elif self.lease_owner is not None or self.lease_expires_at is not None:
+            raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_LEASE_FORBIDDEN)
+        if self.status is DeliveryOperationStatus.COMPLETED:
+            if self.completed_at is None:
+                raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_COMPLETION_REQUIRED)
+            if self.completed_at < self.updated_at:
+                raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_TIMESTAMPS)
+        elif self.completed_at is not None:
+            raise DomainInvariantError(InvariantCode.DELIVERY_OPERATION_COMPLETION_FORBIDDEN)
+        return self
 
 
 class MeetingOperationBinding(DomainModel):
@@ -608,6 +635,10 @@ class WriteIntent(DomainModel):
     status: WriteStatus = WriteStatus.PENDING
     attempt_count: int = Field(default=0, ge=0)
     next_attempt_at: AwareDatetime | None = None
+    next_reconcile_at: AwareDatetime | None = None
+    reconcile_attempt_count: int = Field(default=0, ge=0)
+    reconcile_lease_owner: ShortText | None = None
+    reconcile_lease_expires_at: AwareDatetime | None = None
     lease_owner: ShortText | None = None
     lease_expires_at: AwareDatetime | None = None
     last_failure: WorkflowFailure | None = None
@@ -643,6 +674,35 @@ class WriteIntent(DomainModel):
         }
         if self.status in failed_statuses and self.last_failure is None:
             raise DomainInvariantError(InvariantCode.WRITE_FAILURE)
+        return self
+
+    @model_validator(mode="after")
+    def validate_reconciliation(self) -> WriteIntent:
+        if self.status is not WriteStatus.UNKNOWN:
+            if (
+                self.reconcile_lease_owner is not None
+                or self.reconcile_lease_expires_at is not None
+            ):
+                raise DomainInvariantError(InvariantCode.WRITE_RECONCILE_LEASE_FORBIDDEN)
+            if self.next_reconcile_at is not None or self.reconcile_attempt_count != 0:
+                raise DomainInvariantError(InvariantCode.WRITE_RECONCILE_FORBIDDEN)
+            return self
+        if self.next_reconcile_at is None:
+            raise DomainInvariantError(InvariantCode.WRITE_RECONCILE_REQUIRED)
+        if self.next_reconcile_at < self.updated_at:
+            raise DomainInvariantError(InvariantCode.WRITE_RECONCILE_EXPIRY)
+        if (self.reconcile_lease_owner is None) != (self.reconcile_lease_expires_at is None):
+            raise DomainInvariantError(InvariantCode.WRITE_RECONCILE_LEASE_REQUIRED)
+        if (
+            self.reconcile_lease_expires_at is not None
+            and self.reconcile_lease_expires_at <= self.updated_at
+        ):
+            raise DomainInvariantError(InvariantCode.WRITE_RECONCILE_LEASE_EXPIRY)
+        if (
+            self.last_failure is not None
+            and self.last_failure.disposition is not FailureDisposition.UNKNOWN_OUTCOME
+        ):
+            raise DomainInvariantError(InvariantCode.UNKNOWN_DISPOSITION)
         return self
 
 

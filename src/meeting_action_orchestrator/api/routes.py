@@ -459,6 +459,7 @@ async def approve_review(
     "/{meeting_id}/delivery",
     response_model=DeliveryResponse,
     operation_id="getMeetingDelivery",
+    responses={HTTPStatus.OK: {"headers": {"ETag": ETAG_HEADER}}},
 )
 async def get_delivery(
     meeting_id: UUID,
@@ -467,21 +468,24 @@ async def get_delivery(
     _principal: PrincipalValue,
 ) -> DeliveryResponse:
     result = await dependencies.queries.get_delivery(meeting_id)
-    response.headers["ETag"] = format_etag(f"meeting-{result.meeting.version}")
-    return DeliveryResponse.from_result(result)
+    payload = DeliveryResponse.from_result(result)
+    response.headers["ETag"] = format_etag(canonical_sha256(payload))
+    return payload
 
 
 @meeting_router.post(
     "/{meeting_id}/delivery/retry",
     response_model=DeliveryResponse,
     operation_id="retryMeetingDelivery",
+    responses={HTTPStatus.OK: {"headers": {"ETag": ETAG_HEADER}}},
 )
 async def retry_delivery(
     meeting_id: UUID,
     request: DeliveryOperationRequest,
+    response: Response,
     dependencies: ApiDependenciesValue,
     principal: PrincipalValue,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> DeliveryResponse:
     result = await dependencies.deliveries.retry(
         meeting_id,
@@ -489,20 +493,24 @@ async def retry_delivery(
         request_key=parse_idempotency_key(idempotency_key),
         actor_id=principal.subject,
     )
-    return DeliveryResponse.from_result(result)
+    payload = DeliveryResponse.from_result(result)
+    response.headers["ETag"] = format_etag(canonical_sha256(payload))
+    return payload
 
 
 @meeting_router.post(
     "/{meeting_id}/delivery/reconcile",
     response_model=DeliveryResponse,
     operation_id="reconcileMeetingDelivery",
+    responses={HTTPStatus.OK: {"headers": {"ETag": ETAG_HEADER}}},
 )
 async def reconcile_delivery(
     meeting_id: UUID,
     request: DeliveryOperationRequest,
+    response: Response,
     dependencies: ApiDependenciesValue,
     principal: PrincipalValue,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
 ) -> DeliveryResponse:
     result = await dependencies.deliveries.reconcile(
         meeting_id,
@@ -510,7 +518,9 @@ async def reconcile_delivery(
         request_key=parse_idempotency_key(idempotency_key),
         actor_id=principal.subject,
     )
-    return DeliveryResponse.from_result(result)
+    payload = DeliveryResponse.from_result(result)
+    response.headers["ETag"] = format_etag(canonical_sha256(payload))
+    return payload
 
 
 def _parse_create_request(metadata: str) -> CreateMeetingRequest:

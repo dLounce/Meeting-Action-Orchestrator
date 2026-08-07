@@ -217,12 +217,38 @@ SET original_name = CASE media_type
 END;
 """
 
+SCHEMA_V6 = """
+ALTER TABLE write_intents ADD COLUMN next_reconcile_at TEXT;
+ALTER TABLE write_intents ADD COLUMN reconcile_attempt_count INTEGER NOT NULL DEFAULT 0
+    CHECK (reconcile_attempt_count >= 0);
+ALTER TABLE write_intents ADD COLUMN reconcile_lease_owner TEXT;
+ALTER TABLE write_intents ADD COLUMN reconcile_lease_expires_at TEXT;
+UPDATE write_intents
+SET next_reconcile_at = updated_at
+WHERE status = 'unknown';
+CREATE INDEX idx_write_intents_reconcile
+ON write_intents (
+    status, next_reconcile_at, reconcile_lease_expires_at, created_at, id
+);
+ALTER TABLE delivery_operation_bindings ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'
+    CHECK (status IN ('pending', 'running', 'completed'));
+ALTER TABLE delivery_operation_bindings ADD COLUMN lease_owner TEXT;
+ALTER TABLE delivery_operation_bindings ADD COLUMN lease_expires_at TEXT;
+ALTER TABLE delivery_operation_bindings ADD COLUMN completed_at TEXT;
+ALTER TABLE delivery_operation_bindings ADD COLUMN version INTEGER NOT NULL DEFAULT 0
+    CHECK (version >= 0);
+ALTER TABLE delivery_operation_bindings ADD COLUMN updated_at TEXT;
+UPDATE delivery_operation_bindings
+SET completed_at = created_at, updated_at = created_at;
+"""
+
 MIGRATIONS = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
     (5, SCHEMA_V5),
+    (6, SCHEMA_V6),
 )
 
 

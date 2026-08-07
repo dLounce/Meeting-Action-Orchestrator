@@ -12,6 +12,9 @@ from meeting_action_orchestrator.application.state_machine import (
 )
 from meeting_action_orchestrator.domain import (
     ConnectorTarget,
+    DeliveryOperationBinding,
+    DeliveryOperationKind,
+    DeliveryOperationStatus,
     FailureCode,
     FailureDisposition,
     InvalidMeetingTransitionError,
@@ -104,6 +107,7 @@ def make_meeting(status: MeetingStatus = MeetingStatus.INGESTED) -> Meeting:
 
 def make_intent(status: WriteStatus = WriteStatus.PENDING) -> WriteIntent:
     retry_at = NOW + timedelta(seconds=30) if status is WriteStatus.RETRY_WAIT else None
+    reconcile_at = NOW if status is WriteStatus.UNKNOWN else None
     lease_owner = "worker-1" if status is WriteStatus.IN_FLIGHT else None
     lease_until = NOW + timedelta(minutes=1) if status is WriteStatus.IN_FLIGHT else None
     last_failure = None
@@ -125,6 +129,7 @@ def make_intent(status: WriteStatus = WriteStatus.PENDING) -> WriteIntent:
         ),
         status=status,
         next_attempt_at=retry_at,
+        next_reconcile_at=reconcile_at,
         lease_owner=lease_owner,
         lease_expires_at=lease_until,
         last_failure=last_failure,
@@ -192,6 +197,8 @@ def test_unknown_write_requires_reconciliation_before_retry() -> None:
     )
 
     assert uncertain.status is WriteStatus.UNKNOWN
+    assert uncertain.next_reconcile_at == NOW + timedelta(seconds=1)
+    assert uncertain.reconcile_attempt_count == 0
     with pytest.raises(InvalidWriteTransitionError):
         transition_write_intent(
             uncertain,
@@ -200,6 +207,124 @@ def test_unknown_write_requires_reconciliation_before_retry() -> None:
             lease_owner="worker-2",
             lease_expires_at=NOW + timedelta(minutes=2),
         )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"next_reconcile_at": None},
+        {"next_reconcile_at": NOW - timedelta(microseconds=1)},
+    ],
+)
+def test_unknown_write_requires_a_current_reconciliation_schedule(
+    updates: dict[str, object],
+) -> None:
+    unknown = make_intent(WriteStatus.UNKNOWN)
+
+    with pytest.raises(ValidationError, match="reconciliation"):
+        WriteIntent.model_validate(unknown.model_dump(mode="python") | updates)
+
+
+def test_reconciliation_state_is_forbidden_outside_unknown_status() -> None:
+    pending = make_intent()
+
+    with pytest.raises(ValidationError, match="only an unknown write"):
+        WriteIntent.model_validate(
+            pending.model_dump(mode="python")
+            | {
+                "next_reconcile_at": NOW + timedelta(seconds=1),
+                "reconcile_attempt_count": 1,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"reconcile_lease_owner": "reconciler"},
+        {"reconcile_lease_expires_at": NOW + timedelta(minutes=1)},
+        {
+            "reconcile_lease_owner": "reconciler",
+            "reconcile_lease_expires_at": NOW,
+        },
+    ],
+)
+def test_unknown_reconciliation_lease_requires_paired_live_fields(
+    updates: dict[str, object],
+) -> None:
+    unknown = make_intent(WriteStatus.UNKNOWN)
+
+    with pytest.raises(ValidationError, match="reconciliation lease"):
+        WriteIntent.model_validate(unknown.model_dump(mode="python") | updates)
+
+
+def test_leaving_unknown_clears_reconciliation_lease() -> None:
+    unknown = WriteIntent.model_validate(
+        make_intent(WriteStatus.UNKNOWN).model_dump(mode="python")
+        | {
+            "reconcile_lease_owner": "reconciler",
+            "reconcile_lease_expires_at": NOW + timedelta(minutes=1),
+        }
+    )
+
+    retrying = transition_write_intent(
+        unknown,
+        WriteStatus.RETRY_WAIT,
+        NOW + timedelta(seconds=1),
+        failure=failure(FailureDisposition.RETRYABLE),
+        next_attempt_at=NOW + timedelta(seconds=31),
+    )
+
+    assert retrying.reconcile_lease_owner is None
+    assert retrying.reconcile_lease_expires_at is None
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"status": DeliveryOperationStatus.RUNNING},
+        {
+            "lease_owner": "operation-worker",
+            "lease_expires_at": NOW + timedelta(minutes=1),
+        },
+        {
+            "status": DeliveryOperationStatus.COMPLETED,
+            "completed_at": None,
+        },
+    ],
+)
+def test_delivery_operation_lifecycle_fields_are_consistent(
+    updates: dict[str, object],
+) -> None:
+    completed = DeliveryOperationBinding(
+        request_key="delivery-operation",
+        meeting_id=uid(1),
+        operation=DeliveryOperationKind.RECONCILE,
+        actor_id="owner",
+        selection_fingerprint="a" * 64,
+        status=DeliveryOperationStatus.COMPLETED,
+        completed_at=NOW,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+    with pytest.raises(ValidationError, match="delivery operation"):
+        DeliveryOperationBinding.model_validate(completed.model_dump(mode="python") | updates)
+
+
+def test_leaving_unknown_clears_reconciliation_state() -> None:
+    unknown = make_intent(WriteStatus.UNKNOWN).model_copy(update={"reconcile_attempt_count": 3})
+
+    retrying = transition_write_intent(
+        unknown,
+        WriteStatus.RETRY_WAIT,
+        NOW + timedelta(seconds=1),
+        failure=failure(FailureDisposition.RETRYABLE),
+        next_attempt_at=NOW + timedelta(seconds=31),
+    )
+
+    assert retrying.next_reconcile_at is None
+    assert retrying.reconcile_attempt_count == 0
 
 
 @pytest.mark.parametrize(

@@ -186,6 +186,39 @@ class DeliveryOperationRepository(Protocol):
 
     def get(self, request_key: str) -> DeliveryOperationBinding | None: ...
 
+    def claim(
+        self,
+        request_key: str,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None: ...
+
+    def release(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool: ...
+
+    def renew(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None: ...
+
+    def complete(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool: ...
+
 
 class MeetingOperationRepository(Protocol):
     def add(self, binding: MeetingOperationBinding) -> None: ...
@@ -255,7 +288,25 @@ class WriteIntentRepository(Protocol):
         limit: int,
     ) -> Sequence[UUID]: ...
 
-    def list_unknown_ids(self, limit: int) -> Sequence[UUID]: ...
+    def list_unknown_ids(self, now: datetime, limit: int) -> Sequence[UUID]: ...
+
+    def claim_due_unknown_ids(
+        self,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[UUID]: ...
+
+    def claim_unknown(
+        self,
+        intent_id: UUID,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        *,
+        force: bool,
+    ) -> WriteIntent | None: ...
 
     def save(self, intent: WriteIntent, expected_version: int) -> None: ...
 

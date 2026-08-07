@@ -452,10 +452,11 @@ async def test_write_receipt_must_echo_the_exact_intent_binding(
     intent = task_intent()
     adapter, _ = gateway(intent, success(intent, overrides={field: value}))
 
-    with pytest.raises(PermanentMcpError) as captured:
+    with pytest.raises(UnknownMcpOutcomeError) as captured:
         await adapter.ensure_task(intent)
 
     assert captured.value.code is FailureCode.IDEMPOTENCY_CONFLICT
+    assert captured.value.disposition is FailureDisposition.UNKNOWN_OUTCOME
 
 
 @pytest.mark.asyncio

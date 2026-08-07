@@ -11,6 +11,7 @@ from meeting_action_orchestrator.application.delivery import DeliveryBatch, Deli
 from meeting_action_orchestrator.bootstrap import (
     RuntimeReadinessProbe,
     RuntimeSupervisor,
+    _delivery_lease_duration,
     _delivery_targets,
     create_application,
 )
@@ -135,6 +136,14 @@ def settings(root: Path, **updates: object) -> Settings:
         "worker_poll_interval_seconds": 0.01,
     }
     return Settings(**(values | updates))
+
+
+def test_delivery_lease_covers_connector_timeout_and_session_cleanup(tmp_path: Path) -> None:
+    configured = settings(tmp_path, mcp_call_timeout_seconds=300)
+
+    lease = _delivery_lease_duration(configured)
+
+    assert lease.total_seconds() == 630
 
 
 async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:

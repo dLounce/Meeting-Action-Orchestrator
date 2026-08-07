@@ -7,10 +7,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from meeting_action_orchestrator.application.errors import (
     DeliveryGatewayError,
+    OperationConflictError,
     PermanentDeliveryError,
     RetryableDeliveryError,
     UnknownDeliveryOutcomeError,
@@ -102,7 +103,25 @@ class DeliveryIntentRepository(Protocol):
         limit: int,
     ) -> Sequence[UUID]: ...
 
-    def list_unknown_ids(self, limit: int) -> Sequence[UUID]: ...
+    def list_unknown_ids(self, now: datetime, limit: int) -> Sequence[UUID]: ...
+
+    def claim_due_unknown_ids(
+        self,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[UUID]: ...
+
+    def claim_unknown(
+        self,
+        intent_id: UUID,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        *,
+        force: bool,
+    ) -> WriteIntent | None: ...
 
     def save(self, intent: WriteIntent, expected_version: int) -> None: ...
 
@@ -143,6 +162,12 @@ class DeliveryResult:
 class DeliveryBatch:
     recovered: tuple[UUID, ...]
     results: tuple[DeliveryResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconciliationClaim:
+    intent_id: UUID
+    owner: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,12 +231,15 @@ class ApprovedOutboxExecutor:
         retry_scheduler: RetryScheduler,
         worker_id: str,
         lease_duration: timedelta = timedelta(minutes=2),
+        reconciliation_lease_duration: timedelta = timedelta(minutes=2),
         max_attempts: int = 5,
     ) -> None:
         if not worker_id or len(worker_id) > 200 or worker_id != worker_id.strip():
             raise ValueError("worker_id must be between 1 and 200 characters")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
+        if reconciliation_lease_duration <= timedelta(0):
+            raise ValueError("reconciliation_lease_duration must be positive")
         if not 1 <= max_attempts <= 5:
             raise ValueError("max_attempts must be between one and five")
         self._unit_of_work = unit_of_work
@@ -220,16 +248,20 @@ class ApprovedOutboxExecutor:
         self._retry_scheduler = retry_scheduler
         self._worker_id = worker_id
         self._lease_duration = lease_duration
+        self._reconciliation_lease_duration = reconciliation_lease_duration
         self._max_attempts = max_attempts
 
     async def run_once(self, limit: int = 20) -> DeliveryBatch:
         if limit <= 0:
             return DeliveryBatch(recovered=(), results=())
         recovered = await asyncio.to_thread(self._recover_expired, limit)
-        unknown_ids = await asyncio.to_thread(self._unknown_ids, limit)
-        reconciliation_ids = tuple(dict.fromkeys((*recovered, *unknown_ids)))[:limit]
-        results = [await self.reconcile_intent(intent_id) for intent_id in reconciliation_ids]
-        remaining = limit - len(reconciliation_ids)
+        results: list[DeliveryResult] = []
+        for _ in range(limit):
+            claim = await asyncio.to_thread(self._claim_due_unknown)
+            if claim is None:
+                break
+            results.append(await self._reconcile_claimed(claim))
+        remaining = limit - len(results)
         for _ in range(remaining):
             claimed = await asyncio.to_thread(self._claim_due, 1)
             if not claimed:
@@ -268,7 +300,7 @@ class ApprovedOutboxExecutor:
                 self._record_failure,
                 snapshot,
                 FailureCode.IDEMPOTENCY_CONFLICT,
-                FailureDisposition.PERMANENT,
+                FailureDisposition.UNKNOWN_OUTCOME,
                 _INVALID_RECEIPT_MESSAGE,
             )
         except Exception:
@@ -282,9 +314,19 @@ class ApprovedOutboxExecutor:
         return await asyncio.to_thread(self._record_success, snapshot, created)
 
     async def reconcile_intent(self, intent_id: UUID) -> DeliveryResult:
+        claim = await asyncio.to_thread(self._claim_unknown, intent_id, True)
+        if claim is None:
+            snapshot = await asyncio.to_thread(self._load_intent, intent_id)
+            if snapshot.status is WriteStatus.UNKNOWN:
+                raise OperationConflictError("The write intent is already being reconciled")
+            return DeliveryResult(snapshot.id, snapshot.status)
+        return await self._reconcile_claimed(claim)
+
+    async def _reconcile_claimed(self, claim: _ReconciliationClaim) -> DeliveryResult:
         snapshot, receipt = await asyncio.to_thread(
             self._load_reconciliation_snapshot,
-            intent_id,
+            claim.intent_id,
+            claim.owner,
         )
         if receipt is not None:
             return await asyncio.to_thread(
@@ -292,6 +334,7 @@ class ApprovedOutboxExecutor:
                 snapshot,
                 receipt,
                 replayed=True,
+                reconciliation_owner=claim.owner,
             )
         if snapshot.status is not WriteStatus.UNKNOWN:
             return DeliveryResult(snapshot.id, snapshot.status)
@@ -301,23 +344,39 @@ class ApprovedOutboxExecutor:
             else:
                 found = await self._gateway.find_event(snapshot.idempotency_key)
             if found is None:
-                return await asyncio.to_thread(self._record_confirmed_absence, snapshot)
+                return await asyncio.to_thread(
+                    self._record_confirmed_absence,
+                    snapshot,
+                    claim.owner,
+                )
             validate_write_receipt(snapshot, found)
-        except PermanentDeliveryError as error:
-            return await asyncio.to_thread(self._record_gateway_failure, snapshot, error)
-        except (RetryableDeliveryError, UnknownDeliveryOutcomeError):
-            return await asyncio.to_thread(self._refresh_unknown, snapshot)
+        except (
+            PermanentDeliveryError,
+            RetryableDeliveryError,
+            UnknownDeliveryOutcomeError,
+        ) as error:
+            return await asyncio.to_thread(
+                self._refresh_unknown,
+                snapshot,
+                claim.owner,
+                error.code,
+                _safe_request_id(error.provider_request_id),
+            )
         except (DomainInvariantError, IdempotencyConflictError):
             return await asyncio.to_thread(
-                self._record_failure,
+                self._refresh_unknown,
                 snapshot,
+                claim.owner,
                 FailureCode.IDEMPOTENCY_CONFLICT,
-                FailureDisposition.PERMANENT,
-                _INVALID_RECEIPT_MESSAGE,
             )
         except Exception:
-            return await asyncio.to_thread(self._refresh_unknown, snapshot)
-        return await asyncio.to_thread(self._record_success, snapshot, found)
+            return await asyncio.to_thread(self._refresh_unknown, snapshot, claim.owner)
+        return await asyncio.to_thread(
+            self._record_success,
+            snapshot,
+            found,
+            reconciliation_owner=claim.owner,
+        )
 
     def _recover_expired(self, limit: int) -> tuple[UUID, ...]:
         now = self._now()
@@ -332,9 +391,40 @@ class ApprovedOutboxExecutor:
             uow.commit()
         return recovered
 
-    def _unknown_ids(self, limit: int) -> tuple[UUID, ...]:
+    def _claim_due_unknown(self) -> _ReconciliationClaim | None:
+        now = self._now()
+        owner = f"reconcile:{uuid4().hex}"
         with self._unit_of_work() as uow:
-            return tuple(uow.write_intents.list_unknown_ids(limit))
+            claimed = tuple(
+                uow.write_intents.claim_due_unknown_ids(
+                    owner,
+                    now,
+                    now + self._reconciliation_lease_duration,
+                    1,
+                )
+            )
+            uow.commit()
+        if not claimed:
+            return None
+        return _ReconciliationClaim(claimed[0], owner)
+
+    def _claim_unknown(
+        self,
+        intent_id: UUID,
+        force: bool,
+    ) -> _ReconciliationClaim | None:
+        now = self._now()
+        owner = f"reconcile:{uuid4().hex}"
+        with self._unit_of_work() as uow:
+            claimed = uow.write_intents.claim_unknown(
+                intent_id,
+                owner,
+                now,
+                now + self._reconciliation_lease_duration,
+                force=force,
+            )
+            uow.commit()
+        return _ReconciliationClaim(intent_id, owner) if claimed is not None else None
 
     def _claim_due(self, limit: int) -> tuple[UUID, ...]:
         now = self._now()
@@ -366,9 +456,13 @@ class ApprovedOutboxExecutor:
     def _load_reconciliation_snapshot(
         self,
         intent_id: UUID,
+        owner: str,
     ) -> tuple[WriteIntent, WriteReceipt | None]:
+        now = self._now()
         with self._unit_of_work() as uow:
             intent = _required_intent(uow.write_intents.get(intent_id))
+            if not _holds_reconciliation_lease(intent, owner, now):
+                raise OperationConflictError("The write reconciliation lease is no longer current")
             receipt = uow.write_receipts.for_intent(intent.id)
             if receipt is None and intent.status is WriteStatus.UNKNOWN:
                 _require_approved(uow, intent)
@@ -455,56 +549,82 @@ class ApprovedOutboxExecutor:
             uow.commit()
         return DeliveryResult(updated.id, updated.status)
 
-    def _record_confirmed_absence(self, snapshot: WriteIntent) -> DeliveryResult:
-        if snapshot.attempt_count >= self._max_attempts:
-            return self._record_failure(
-                snapshot,
-                FailureCode.PROVIDER_UNAVAILABLE,
-                FailureDisposition.PERMANENT,
-                _EXHAUSTED_MESSAGE,
-            )
+    def _record_confirmed_absence(
+        self,
+        snapshot: WriteIntent,
+        owner: str,
+    ) -> DeliveryResult:
         now = self._now()
-        failure = _failure(
-            FailureCode.UNKNOWN_REMOTE_OUTCOME,
-            FailureDisposition.RETRYABLE,
-            _ABSENT_MESSAGE,
-            now,
-        )
         with self._unit_of_work() as uow:
             current = _required_intent(uow.write_intents.get(snapshot.id))
-            if current != snapshot:
+            if current != snapshot or not _holds_reconciliation_lease(current, owner, now):
                 return DeliveryResult(current.id, current.status)
-            updated = transition_write_intent(
-                current,
-                WriteStatus.RETRY_WAIT,
-                now,
-                failure=failure,
-                next_attempt_at=self._retry_scheduler.next_attempt_at(
+            if current.attempt_count >= self._max_attempts:
+                failure = _failure(
+                    FailureCode.PROVIDER_UNAVAILABLE,
+                    FailureDisposition.PERMANENT,
+                    _EXHAUSTED_MESSAGE,
                     now,
-                    current.attempt_count,
-                ),
-            )
+                )
+                updated = transition_write_intent(
+                    current,
+                    WriteStatus.PERMANENT_FAILED,
+                    now,
+                    failure=failure,
+                )
+            else:
+                failure = _failure(
+                    FailureCode.UNKNOWN_REMOTE_OUTCOME,
+                    FailureDisposition.RETRYABLE,
+                    _ABSENT_MESSAGE,
+                    now,
+                )
+                updated = transition_write_intent(
+                    current,
+                    WriteStatus.RETRY_WAIT,
+                    now,
+                    failure=failure,
+                    next_attempt_at=self._retry_scheduler.next_attempt_at(
+                        now,
+                        current.attempt_count,
+                    ),
+                )
             uow.write_intents.save(updated, current.version)
             self._reduce_meeting(uow, updated.approval_id, now)
             uow.commit()
         return DeliveryResult(updated.id, updated.status)
 
-    def _refresh_unknown(self, snapshot: WriteIntent) -> DeliveryResult:
+    def _refresh_unknown(
+        self,
+        snapshot: WriteIntent,
+        owner: str,
+        code: FailureCode = FailureCode.UNKNOWN_REMOTE_OUTCOME,
+        provider_request_id: str | None = None,
+    ) -> DeliveryResult:
         now = self._now()
         failure = _failure(
-            FailureCode.UNKNOWN_REMOTE_OUTCOME,
+            code,
             FailureDisposition.UNKNOWN_OUTCOME,
             _UNKNOWN_MESSAGE,
             now,
+            provider_request_id,
         )
         with self._unit_of_work() as uow:
             current = _required_intent(uow.write_intents.get(snapshot.id))
-            if current != snapshot:
+            if current != snapshot or not _holds_reconciliation_lease(current, owner, now):
                 return DeliveryResult(current.id, current.status)
+            reconcile_attempt_count = current.reconcile_attempt_count + 1
             updated = WriteIntent.model_validate(
                 current.model_dump(mode="python")
                 | {
                     "last_failure": failure,
+                    "next_reconcile_at": self._retry_scheduler.next_attempt_at(
+                        now,
+                        reconcile_attempt_count,
+                    ),
+                    "reconcile_attempt_count": reconcile_attempt_count,
+                    "reconcile_lease_owner": None,
+                    "reconcile_lease_expires_at": None,
                     "updated_at": now,
                     "version": current.version + 1,
                 }
@@ -520,12 +640,22 @@ class ApprovedOutboxExecutor:
         receipt: WriteReceipt,
         *,
         replayed: bool = False,
+        reconciliation_owner: str | None = None,
     ) -> DeliveryResult:
         validate_write_receipt(snapshot, receipt)
         now = self._now()
         with self._unit_of_work() as uow:
             current = _required_intent(uow.write_intents.get(snapshot.id))
             existing = uow.write_receipts.for_intent(current.id)
+            if reconciliation_owner is not None and (
+                current != snapshot
+                or not _holds_reconciliation_lease(
+                    current,
+                    reconciliation_owner,
+                    now,
+                )
+            ):
+                return DeliveryResult(current.id, current.status)
             if existing is not None:
                 validate_write_receipt(current, existing)
                 return self._commit_success(uow, current, replayed=True)
@@ -536,6 +666,10 @@ class ApprovedOutboxExecutor:
                 return DeliveryResult(current.id, current.status)
             uow.write_receipts.add(receipt)
             return self._commit_success(uow, current, now=now, replayed=replayed)
+
+    def _load_intent(self, intent_id: UUID) -> WriteIntent:
+        with self._unit_of_work() as uow:
+            return _required_intent(uow.write_intents.get(intent_id))
 
     def _commit_success(
         self,
@@ -603,6 +737,19 @@ def _is_executable(
     except ValueError:
         return False
     return True
+
+
+def _holds_reconciliation_lease(
+    intent: WriteIntent,
+    owner: str,
+    now: datetime,
+) -> bool:
+    return (
+        intent.status is WriteStatus.UNKNOWN
+        and intent.reconcile_lease_owner == owner
+        and intent.reconcile_lease_expires_at is not None
+        and intent.reconcile_lease_expires_at > now
+    )
 
 
 def _require_approved(uow: DeliveryUnitOfWork, intent: WriteIntent) -> None:

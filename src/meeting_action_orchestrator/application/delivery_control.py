@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import TracebackType
 from typing import Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from meeting_action_orchestrator.application.errors import (
     OperationConflictError,
@@ -18,6 +18,7 @@ from meeting_action_orchestrator.application.state_machine import (
 )
 from meeting_action_orchestrator.domain.enums import (
     DeliveryOperationKind,
+    DeliveryOperationStatus,
     FailureCode,
     FailureDisposition,
     MeetingStatus,
@@ -35,6 +36,14 @@ from meeting_action_orchestrator.domain.models import (
 )
 
 _RETRY_MESSAGE = "Delivery was queued for another approved attempt"
+_RECONCILE_MESSAGE = "Delivery requires remote reconciliation before another attempt"
+_AMBIGUOUS_FAILURE_CODES = frozenset(
+    {
+        FailureCode.IDEMPOTENCY_CONFLICT,
+        FailureCode.INTERNAL,
+        FailureCode.UNKNOWN_REMOTE_OUTCOME,
+    }
+)
 
 
 class Clock(Protocol):
@@ -76,6 +85,39 @@ class ControlDeliveryOperationRepository(Protocol):
 
     def get(self, request_key: str) -> DeliveryOperationBinding | None: ...
 
+    def claim(
+        self,
+        request_key: str,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None: ...
+
+    def release(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool: ...
+
+    def renew(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None: ...
+
+    def complete(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool: ...
+
 
 class ControlUnitOfWork(Protocol):
     meetings: ControlMeetingRepository
@@ -110,6 +152,8 @@ class _Selection:
     approval: Approval
     all_intents: tuple[WriteIntent, ...]
     selected: tuple[WriteIntent, ...]
+    binding: DeliveryOperationBinding
+    replayed: bool
 
 
 class DeliveryControlService:
@@ -120,14 +164,18 @@ class DeliveryControlService:
         reconciler: IntentReconciler,
         clock: Clock,
         retry_scheduler: RetryScheduler,
+        operation_lease_duration: timedelta = timedelta(minutes=2),
         max_attempts: int = 5,
     ) -> None:
+        if operation_lease_duration <= timedelta(0):
+            raise ValueError("operation_lease_duration must be positive")
         if not 1 <= max_attempts <= 5:
             raise ValueError("max_attempts must be between one and five")
         self._unit_of_work = unit_of_work
         self._reconciler = reconciler
         self._clock = clock
         self._retry_scheduler = retry_scheduler
+        self._operation_lease_duration = operation_lease_duration
         self._max_attempts = max_attempts
 
     async def retry(
@@ -140,33 +188,44 @@ class DeliveryControlService:
     ) -> DeliveryControlResult:
         _validate_operation_identity(request_key, actor_id)
         before = await asyncio.to_thread(
-            self._select_and_bind,
+            self._select_and_claim,
             meeting_id,
             intent_ids,
             request_key,
             actor_id,
             DeliveryOperationKind.RETRY,
         )
-        versions = {intent.id: intent.version for intent in before.all_intents}
-        for intent in before.selected:
-            if intent.status is WriteStatus.UNKNOWN:
-                await self._reconciler.reconcile_intent(intent.id)
-            elif (
-                intent.status is WriteStatus.PERMANENT_FAILED
-                and intent.attempt_count < self._max_attempts
-            ):
-                await asyncio.to_thread(
-                    self._queue_retry,
-                    meeting_id,
-                    before.approval.id,
-                    intent.id,
-                )
-        return await asyncio.to_thread(
-            self._snapshot,
-            meeting_id,
-            versions,
-            before.meeting.version,
-        )
+        if before.replayed:
+            return await asyncio.to_thread(self._snapshot, meeting_id, True)
+        binding = before.binding
+        try:
+            for intent in before.selected:
+                binding = await asyncio.to_thread(self._renew_operation, binding)
+                if intent.status is WriteStatus.UNKNOWN:
+                    await self._reconciler.reconcile_intent(intent.id)
+                elif _requires_reconciliation(intent):
+                    prepared = await asyncio.to_thread(
+                        self._prepare_reconciliation,
+                        meeting_id,
+                        before.approval.id,
+                        intent.id,
+                    )
+                    if prepared:
+                        await self._reconciler.reconcile_intent(intent.id)
+                elif _can_direct_retry(intent, self._max_attempts):
+                    await asyncio.to_thread(
+                        self._queue_retry,
+                        meeting_id,
+                        before.approval.id,
+                        intent.id,
+                    )
+            await asyncio.to_thread(self._complete_operation, binding)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.to_thread(self._release_operation, binding)
+            raise
+        return await asyncio.to_thread(self._snapshot, meeting_id, False)
 
     async def reconcile(
         self,
@@ -178,25 +237,30 @@ class DeliveryControlService:
     ) -> DeliveryControlResult:
         _validate_operation_identity(request_key, actor_id)
         before = await asyncio.to_thread(
-            self._select_and_bind,
+            self._select_and_claim,
             meeting_id,
             intent_ids,
             request_key,
             actor_id,
             DeliveryOperationKind.RECONCILE,
         )
-        versions = {intent.id: intent.version for intent in before.all_intents}
-        for intent in before.selected:
-            if intent.status is WriteStatus.UNKNOWN:
-                await self._reconciler.reconcile_intent(intent.id)
-        return await asyncio.to_thread(
-            self._snapshot,
-            meeting_id,
-            versions,
-            before.meeting.version,
-        )
+        if before.replayed:
+            return await asyncio.to_thread(self._snapshot, meeting_id, True)
+        binding = before.binding
+        try:
+            for intent in before.selected:
+                binding = await asyncio.to_thread(self._renew_operation, binding)
+                if intent.status is WriteStatus.UNKNOWN:
+                    await self._reconciler.reconcile_intent(intent.id)
+            await asyncio.to_thread(self._complete_operation, binding)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.to_thread(self._release_operation, binding)
+            raise
+        return await asyncio.to_thread(self._snapshot, meeting_id, False)
 
-    def _select_and_bind(
+    def _select_and_claim(
         self,
         meeting_id: UUID,
         intent_ids: tuple[UUID, ...],
@@ -229,18 +293,39 @@ class DeliveryControlService:
                 actor_id=actor_id,
                 selection_fingerprint=_selection_fingerprint(selected),
                 created_at=now,
+                updated_at=now,
             )
             existing = uow.delivery_operations.get(request_key)
             if existing is not None and not _same_binding(existing, binding):
                 raise IdempotencyConflictError(request_key)
+            if existing is not None and existing.status is DeliveryOperationStatus.COMPLETED:
+                return _Selection(
+                    meeting=meeting,
+                    approval=approval,
+                    all_intents=all_intents,
+                    selected=selected,
+                    binding=existing,
+                    replayed=True,
+                )
             if existing is None:
                 uow.delivery_operations.add(binding)
-                uow.commit()
+            owner = f"operation:{uuid4().hex}"
+            claimed = uow.delivery_operations.claim(
+                request_key,
+                owner,
+                now,
+                now + self._operation_lease_duration,
+            )
+            if claimed is None:
+                raise OperationConflictError("The delivery operation is already in progress")
+            uow.commit()
         return _Selection(
             meeting=meeting,
             approval=approval,
             all_intents=all_intents,
             selected=selected,
+            binding=claimed,
+            replayed=False,
         )
 
     def _queue_retry(self, meeting_id: UUID, approval_id: UUID, intent_id: UUID) -> None:
@@ -254,10 +339,7 @@ class DeliveryControlService:
             _validate_approval_binding(meeting, approval, (intent,))
             if approval.id != approval_id:
                 raise OperationConflictError("The approved delivery set changed")
-            if (
-                intent.status is not WriteStatus.PERMANENT_FAILED
-                or intent.attempt_count >= self._max_attempts
-            ):
+            if not _can_direct_retry(intent, self._max_attempts):
                 return
             previous = intent.last_failure
             retry_failure = WorkflowFailure(
@@ -285,11 +367,107 @@ class DeliveryControlService:
                 uow.meetings.save(filing, meeting.version)
             uow.commit()
 
+    def _prepare_reconciliation(
+        self,
+        meeting_id: UUID,
+        approval_id: UUID,
+        intent_id: UUID,
+    ) -> bool:
+        now = self._now()
+        with self._unit_of_work() as uow:
+            meeting = uow.meetings.get(meeting_id)
+            approval = uow.approvals.for_meeting(meeting_id)
+            intent = uow.write_intents.get(intent_id)
+            if meeting is None or approval is None or intent is None:
+                raise ResourceNotFoundError("Delivery state")
+            _validate_approval_binding(meeting, approval, (intent,))
+            if approval.id != approval_id:
+                raise OperationConflictError("The approved delivery set changed")
+            if intent.status is WriteStatus.UNKNOWN:
+                return True
+            if not _requires_reconciliation(intent):
+                return False
+            previous = intent.last_failure
+            if previous is None:
+                return False
+            failure = WorkflowFailure(
+                code=previous.code,
+                disposition=FailureDisposition.UNKNOWN_OUTCOME,
+                safe_message=_RECONCILE_MESSAGE,
+                occurred_at=now,
+            )
+            updated = transition_write_intent(
+                intent,
+                WriteStatus.UNKNOWN,
+                now,
+                failure=failure,
+                next_reconcile_at=now,
+            )
+            uow.write_intents.save(updated, intent.version)
+            if meeting.status in {
+                MeetingStatus.PARTIALLY_FILED,
+                MeetingStatus.FILING_FAILED,
+            }:
+                filing = transition_meeting(meeting, MeetingStatus.FILING, now)
+                uow.meetings.save(filing, meeting.version)
+            uow.commit()
+        return True
+
+    def _complete_operation(self, binding: DeliveryOperationBinding) -> None:
+        now = self._now()
+        owner = binding.lease_owner
+        if owner is None:
+            raise OperationConflictError("The delivery operation has no execution owner")
+        with self._unit_of_work() as uow:
+            completed = uow.delivery_operations.complete(
+                binding.request_key,
+                owner,
+                binding.version,
+                now,
+            )
+            if not completed:
+                raise OperationConflictError("The delivery operation lease is no longer current")
+            uow.commit()
+
+    def _renew_operation(
+        self,
+        binding: DeliveryOperationBinding,
+    ) -> DeliveryOperationBinding:
+        now = self._now()
+        owner = binding.lease_owner
+        if owner is None:
+            raise OperationConflictError("The delivery operation has no execution owner")
+        with self._unit_of_work() as uow:
+            renewed = uow.delivery_operations.renew(
+                binding.request_key,
+                owner,
+                binding.version,
+                now,
+                now + self._operation_lease_duration,
+            )
+            if renewed is None:
+                raise OperationConflictError("The delivery operation lease is no longer current")
+            uow.commit()
+        return renewed
+
+    def _release_operation(self, binding: DeliveryOperationBinding) -> None:
+        now = self._now()
+        owner = binding.lease_owner
+        if owner is None:
+            return
+        with self._unit_of_work() as uow:
+            uow.delivery_operations.release(
+                binding.request_key,
+                owner,
+                binding.version,
+                now,
+            )
+            uow.commit()
+
     def _snapshot(
         self,
         meeting_id: UUID,
-        previous_versions: dict[UUID, int],
-        previous_meeting_version: int,
+        replayed: bool,
     ) -> DeliveryControlResult:
         with self._unit_of_work() as uow:
             meeting = uow.meetings.get(meeting_id)
@@ -305,14 +483,11 @@ class DeliveryControlService:
                 if (receipt := uow.write_receipts.for_intent(intent.id)) is not None
             )
         _validate_approval_binding(meeting, approval, intents)
-        unchanged = meeting.version == previous_meeting_version and all(
-            previous_versions.get(intent.id) == intent.version for intent in intents
-        )
         return DeliveryControlResult(
             meeting=meeting,
             intents=intents,
             receipts=receipts,
-            replayed=unchanged,
+            replayed=replayed,
         )
 
     def _now(self) -> datetime:
@@ -357,4 +532,20 @@ def _same_binding(
         and existing.operation is requested.operation
         and existing.actor_id == requested.actor_id
         and existing.selection_fingerprint == requested.selection_fingerprint
+    )
+
+
+def _requires_reconciliation(intent: WriteIntent) -> bool:
+    return (
+        intent.status is WriteStatus.PERMANENT_FAILED
+        and intent.last_failure is not None
+        and intent.last_failure.code in _AMBIGUOUS_FAILURE_CODES
+    )
+
+
+def _can_direct_retry(intent: WriteIntent, max_attempts: int) -> bool:
+    return (
+        intent.status is WriteStatus.PERMANENT_FAILED
+        and intent.attempt_count < max_attempts
+        and not _requires_reconciliation(intent)
     )

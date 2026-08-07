@@ -307,12 +307,12 @@ class McpGateway:
         if not isinstance(result, _ReceiptResult) or result.outcome != "succeeded":
             raise _unknown(FailureCode.UNKNOWN_REMOTE_OUTCOME, _SAFE_RESPONSE_MESSAGE)
         if result.intent_id != intent.id:
-            raise _permanent(FailureCode.IDEMPOTENCY_CONFLICT, _SAFE_RESPONSE_MESSAGE)
+            raise _unknown(FailureCode.IDEMPOTENCY_CONFLICT, _SAFE_RESPONSE_MESSAGE)
         if (
             result.idempotency_key != intent.idempotency_key
             or result.payload_digest != intent.payload_digest
         ):
-            raise _permanent(FailureCode.IDEMPOTENCY_CONFLICT, _SAFE_RESPONSE_MESSAGE)
+            raise _unknown(FailureCode.IDEMPOTENCY_CONFLICT, _SAFE_RESPONSE_MESSAGE)
         return result
 
     async def _invoke(
@@ -456,9 +456,9 @@ class McpGateway:
         try:
             value = self._clock()
         except Exception:
-            raise _permanent(FailureCode.INTERNAL, _SAFE_RESPONSE_MESSAGE) from None
+            raise _unknown(FailureCode.INTERNAL, _SAFE_RESPONSE_MESSAGE) from None
         if value.tzinfo is None or value.utcoffset() is None:
-            raise _permanent(FailureCode.INTERNAL, _SAFE_RESPONSE_MESSAGE)
+            raise _unknown(FailureCode.INTERNAL, _SAFE_RESPONSE_MESSAGE)
         return value
 
 

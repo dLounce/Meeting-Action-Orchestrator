@@ -349,6 +349,9 @@ class WriteIntentResponse(ApiModel):
     proposal: WriteProposal
     status: WriteStatus
     attempt_count: int
+    next_attempt_at: datetime | None
+    reconcile_attempt_count: int
+    next_reconcile_at: datetime | None
     failure: FailureResponse | None
     created_at: datetime
     updated_at: datetime
@@ -365,6 +368,9 @@ class WriteIntentResponse(ApiModel):
             proposal=intent.proposal,
             status=intent.status,
             attempt_count=intent.attempt_count,
+            next_attempt_at=intent.next_attempt_at,
+            reconcile_attempt_count=intent.reconcile_attempt_count,
+            next_reconcile_at=intent.next_reconcile_at,
             failure=(
                 FailureResponse(
                     code=failure.code,

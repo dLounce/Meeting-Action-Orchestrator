@@ -456,8 +456,9 @@ class SqliteDeliveryOperationRepository:
             """
             INSERT INTO delivery_operation_bindings (
                 request_key, meeting_id, operation, actor_id,
-                selection_fingerprint, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                selection_fingerprint, status, lease_owner, lease_expires_at,
+                completed_at, version, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 binding.request_key,
@@ -465,7 +466,13 @@ class SqliteDeliveryOperationRepository:
                 binding.operation.value,
                 binding.actor_id,
                 binding.selection_fingerprint,
+                binding.status.value,
+                binding.lease_owner,
+                _as_text(binding.lease_expires_at),
+                _as_text(binding.completed_at),
+                binding.version,
                 str(binding.created_at),
+                str(binding.updated_at),
             ),
         )
 
@@ -477,6 +484,92 @@ class SqliteDeliveryOperationRepository:
         if row is None:
             return None
         return DeliveryOperationBinding.model_validate(dict(row))
+
+    def claim(
+        self,
+        request_key: str,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None:
+        cursor = self._connection.execute(
+            """
+            UPDATE delivery_operation_bindings
+            SET status = 'running', lease_owner = ?, lease_expires_at = ?,
+                completed_at = NULL, version = version + 1, updated_at = ?
+            WHERE request_key = ?
+              AND (
+                status = 'pending'
+                OR (status = 'running' AND lease_expires_at <= ?)
+              )
+            """,
+            (owner, str(lease_until), str(now), request_key, str(now)),
+        )
+        return self.get(request_key) if cursor.rowcount == 1 else None
+
+    def release(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool:
+        cursor = self._connection.execute(
+            """
+            UPDATE delivery_operation_bindings
+            SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL,
+                completed_at = NULL, version = version + 1, updated_at = ?
+            WHERE request_key = ? AND status = 'running'
+              AND lease_owner = ? AND version = ?
+            """,
+            (str(now), request_key, owner, expected_version),
+        )
+        return cursor.rowcount == 1
+
+    def renew(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None:
+        cursor = self._connection.execute(
+            """
+            UPDATE delivery_operation_bindings
+            SET lease_expires_at = ?, version = version + 1, updated_at = ?
+            WHERE request_key = ? AND status = 'running'
+              AND lease_owner = ? AND version = ? AND lease_expires_at > ?
+            """,
+            (
+                str(lease_until),
+                str(now),
+                request_key,
+                owner,
+                expected_version,
+                str(now),
+            ),
+        )
+        return self.get(request_key) if cursor.rowcount == 1 else None
+
+    def complete(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool:
+        cursor = self._connection.execute(
+            """
+            UPDATE delivery_operation_bindings
+            SET status = 'completed', lease_owner = NULL, lease_expires_at = NULL,
+                completed_at = ?, version = version + 1, updated_at = ?
+            WHERE request_key = ? AND status = 'running'
+              AND lease_owner = ? AND version = ? AND lease_expires_at > ?
+            """,
+            (str(now), str(now), request_key, owner, expected_version, str(now)),
+        )
+        return cursor.rowcount == 1
 
 
 class SqliteMeetingOperationRepository:
@@ -701,9 +794,11 @@ class SqliteWriteIntentRepository:
             INSERT INTO write_intents (
                 id, meeting_id, approval_id, source_action_id, kind, connector_id,
                 resource_id, idempotency_key, payload_json, payload_sha256, status,
-                attempt_count, next_attempt_at, lease_owner, lease_expires_at,
+                attempt_count, next_attempt_at, next_reconcile_at,
+                reconcile_attempt_count, reconcile_lease_owner,
+                reconcile_lease_expires_at, lease_owner, lease_expires_at,
                 last_failure_json, version, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [self._values(intent) for intent in intents],
         )
@@ -750,8 +845,11 @@ class SqliteWriteIntentRepository:
             self._connection.execute(
                 """
                 UPDATE write_intents SET status = ?, attempt_count = attempt_count + 1,
-                    next_attempt_at = NULL, lease_owner = ?, lease_expires_at = ?,
-                    last_failure_json = NULL, version = version + 1, updated_at = ?
+                    next_attempt_at = NULL, next_reconcile_at = NULL,
+                    reconcile_attempt_count = 0, reconcile_lease_owner = NULL,
+                    reconcile_lease_expires_at = NULL, lease_owner = ?,
+                    lease_expires_at = ?, last_failure_json = NULL,
+                    version = version + 1, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -800,6 +898,8 @@ class SqliteWriteIntentRepository:
         self._connection.executemany(
             """
             UPDATE write_intents SET status = ?, next_attempt_at = NULL,
+                next_reconcile_at = ?, reconcile_attempt_count = 0,
+                reconcile_lease_owner = NULL, reconcile_lease_expires_at = NULL,
                 lease_owner = NULL, lease_expires_at = NULL, last_failure_json = ?,
                 version = version + 1, updated_at = ?
             WHERE id = ? AND status = ? AND lease_expires_at <= ?
@@ -807,6 +907,7 @@ class SqliteWriteIntentRepository:
             [
                 (
                     WriteStatus.UNKNOWN.value,
+                    str(now),
                     _as_json(failure),
                     str(now),
                     str(intent_id),
@@ -818,17 +919,106 @@ class SqliteWriteIntentRepository:
         )
         return recovered
 
-    def list_unknown_ids(self, limit: int) -> Sequence[UUID]:
+    def list_unknown_ids(self, now: datetime, limit: int) -> Sequence[UUID]:
         if limit <= 0:
             return ()
         rows = self._connection.execute(
             """
-            SELECT id FROM write_intents WHERE status = ?
-            ORDER BY updated_at, created_at, id LIMIT ?
+            SELECT id FROM write_intents
+            WHERE status = ? AND next_reconcile_at <= ?
+              AND (
+                reconcile_lease_owner IS NULL
+                OR reconcile_lease_expires_at <= ?
+              )
+            ORDER BY next_reconcile_at, created_at, id LIMIT ?
             """,
-            (WriteStatus.UNKNOWN.value, limit),
+            (WriteStatus.UNKNOWN.value, str(now), str(now), limit),
         ).fetchall()
         return tuple(UUID(row["id"]) for row in rows)
+
+    def claim_due_unknown_ids(
+        self,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[UUID]:
+        if limit <= 0:
+            return ()
+        rows = self._connection.execute(
+            """
+            SELECT id FROM write_intents
+            WHERE status = ? AND next_reconcile_at <= ?
+              AND (
+                reconcile_lease_owner IS NULL
+                OR reconcile_lease_expires_at <= ?
+              )
+            ORDER BY next_reconcile_at, created_at, id LIMIT ?
+            """,
+            (WriteStatus.UNKNOWN.value, str(now), str(now), limit),
+        ).fetchall()
+        claimed: list[UUID] = []
+        for row in rows:
+            cursor = self._connection.execute(
+                """
+                UPDATE write_intents
+                SET reconcile_lease_owner = ?, reconcile_lease_expires_at = ?,
+                    next_reconcile_at = ?, version = version + 1, updated_at = ?
+                WHERE id = ? AND status = ? AND next_reconcile_at <= ?
+                  AND (
+                    reconcile_lease_owner IS NULL
+                    OR reconcile_lease_expires_at <= ?
+                  )
+                """,
+                (
+                    owner,
+                    str(lease_until),
+                    str(now),
+                    str(now),
+                    row["id"],
+                    WriteStatus.UNKNOWN.value,
+                    str(now),
+                    str(now),
+                ),
+            )
+            if cursor.rowcount == 1:
+                claimed.append(UUID(row["id"]))
+        return tuple(claimed)
+
+    def claim_unknown(
+        self,
+        intent_id: UUID,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+        *,
+        force: bool,
+    ) -> WriteIntent | None:
+        cursor = self._connection.execute(
+            """
+            UPDATE write_intents
+            SET reconcile_lease_owner = ?, reconcile_lease_expires_at = ?,
+                next_reconcile_at = ?, version = version + 1, updated_at = ?
+            WHERE id = ? AND status = ?
+              AND (
+                reconcile_lease_owner IS NULL
+                OR reconcile_lease_expires_at <= ?
+              )
+              AND (? = 1 OR next_reconcile_at <= ?)
+            """,
+            (
+                owner,
+                str(lease_until),
+                str(now),
+                str(now),
+                str(intent_id),
+                WriteStatus.UNKNOWN.value,
+                str(now),
+                int(force),
+                str(now),
+            ),
+        )
+        return self.get(intent_id) if cursor.rowcount == 1 else None
 
     def save(self, intent: WriteIntent, expected_version: int) -> None:
         values = self._values(intent)
@@ -838,6 +1028,8 @@ class SqliteWriteIntentRepository:
                 meeting_id = ?, approval_id = ?, source_action_id = ?, kind = ?,
                 connector_id = ?, resource_id = ?, idempotency_key = ?, payload_json = ?,
                 payload_sha256 = ?, status = ?, attempt_count = ?, next_attempt_at = ?,
+                next_reconcile_at = ?, reconcile_attempt_count = ?,
+                reconcile_lease_owner = ?, reconcile_lease_expires_at = ?,
                 lease_owner = ?, lease_expires_at = ?, last_failure_json = ?, version = ?,
                 created_at = ?, updated_at = ?
             WHERE id = ? AND version = ?
@@ -864,6 +1056,10 @@ class SqliteWriteIntentRepository:
             intent.status.value,
             intent.attempt_count,
             _as_text(intent.next_attempt_at),
+            _as_text(intent.next_reconcile_at),
+            intent.reconcile_attempt_count,
+            intent.reconcile_lease_owner,
+            _as_text(intent.reconcile_lease_expires_at),
             intent.lease_owner,
             _as_text(intent.lease_expires_at),
             _as_json(intent.last_failure) if intent.last_failure is not None else None,
@@ -885,6 +1081,10 @@ class SqliteWriteIntentRepository:
                 "status": row["status"],
                 "attempt_count": row["attempt_count"],
                 "next_attempt_at": row["next_attempt_at"],
+                "next_reconcile_at": row["next_reconcile_at"],
+                "reconcile_attempt_count": row["reconcile_attempt_count"],
+                "reconcile_lease_owner": row["reconcile_lease_owner"],
+                "reconcile_lease_expires_at": row["reconcile_lease_expires_at"],
                 "lease_owner": row["lease_owner"],
                 "lease_expires_at": row["lease_expires_at"],
                 "last_failure": _load_json(row["last_failure_json"]),

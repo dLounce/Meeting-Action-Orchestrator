@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
 from threading import get_ident
@@ -17,6 +18,7 @@ from meeting_action_orchestrator.application.state_machine import transition_wri
 from meeting_action_orchestrator.domain.enums import (
     DeadlineResolution,
     DeliveryOperationKind,
+    DeliveryOperationStatus,
     FailureCode,
     FailureDisposition,
     MeetingStatus,
@@ -45,9 +47,12 @@ def uid(value: int) -> UUID:
     return UUID(int=value)
 
 
-def make_failure(disposition: FailureDisposition) -> WorkflowFailure:
+def make_failure(
+    disposition: FailureDisposition,
+    code: FailureCode = FailureCode.CONNECTOR_REJECTED,
+) -> WorkflowFailure:
     return WorkflowFailure(
-        code=FailureCode.CONNECTOR_REJECTED,
+        code=code,
         disposition=disposition,
         safe_message="The connector rejected the approved action",
         occurred_at=NOW - timedelta(minutes=1),
@@ -123,6 +128,7 @@ def make_intent(
         proposal=proposal,
         status=status,
         attempt_count=attempt_count,
+        next_reconcile_at=NOW - timedelta(minutes=1) if status is WriteStatus.UNKNOWN else None,
         last_failure=last_failure,
         version=attempt_count,
         created_at=NOW - timedelta(minutes=3),
@@ -145,6 +151,14 @@ def make_receipt(intent: WriteIntent) -> WriteReceipt:
 class Clock:
     def now(self) -> datetime:
         return NOW
+
+
+class MutableClock:
+    def __init__(self, current: datetime = NOW) -> None:
+        self.current = current
+
+    def now(self) -> datetime:
+        return self.current
 
 
 class Scheduler:
@@ -238,6 +252,120 @@ class DeliveryOperationRepository:
     def get(self, request_key: str) -> DeliveryOperationBinding | None:
         return self.database.bindings.get(request_key)
 
+    def claim(
+        self,
+        request_key: str,
+        owner: str,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None:
+        binding = self.database.bindings[request_key]
+        available = binding.status is DeliveryOperationStatus.PENDING or (
+            binding.status is DeliveryOperationStatus.RUNNING
+            and binding.lease_expires_at is not None
+            and binding.lease_expires_at <= now
+        )
+        if not available:
+            return None
+        claimed = DeliveryOperationBinding.model_validate(
+            binding.model_dump(mode="python")
+            | {
+                "status": DeliveryOperationStatus.RUNNING,
+                "lease_owner": owner,
+                "lease_expires_at": lease_until,
+                "completed_at": None,
+                "version": binding.version + 1,
+                "updated_at": now,
+            }
+        )
+        self.database.bindings[request_key] = claimed
+        return claimed
+
+    def release(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool:
+        binding = self.database.bindings[request_key]
+        if (
+            binding.status is not DeliveryOperationStatus.RUNNING
+            or binding.lease_owner != owner
+            or binding.version != expected_version
+        ):
+            return False
+        released = DeliveryOperationBinding.model_validate(
+            binding.model_dump(mode="python")
+            | {
+                "status": DeliveryOperationStatus.PENDING,
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "version": binding.version + 1,
+                "updated_at": now,
+            }
+        )
+        self.database.bindings[request_key] = released
+        return True
+
+    def renew(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+        lease_until: datetime,
+    ) -> DeliveryOperationBinding | None:
+        binding = self.database.bindings[request_key]
+        if (
+            binding.status is not DeliveryOperationStatus.RUNNING
+            or binding.lease_owner != owner
+            or binding.version != expected_version
+            or binding.lease_expires_at is None
+            or binding.lease_expires_at <= now
+        ):
+            return None
+        renewed = DeliveryOperationBinding.model_validate(
+            binding.model_dump(mode="python")
+            | {
+                "lease_expires_at": lease_until,
+                "version": binding.version + 1,
+                "updated_at": now,
+            }
+        )
+        self.database.bindings[request_key] = renewed
+        return renewed
+
+    def complete(
+        self,
+        request_key: str,
+        owner: str,
+        expected_version: int,
+        now: datetime,
+    ) -> bool:
+        binding = self.database.bindings[request_key]
+        if (
+            binding.status is not DeliveryOperationStatus.RUNNING
+            or binding.lease_owner != owner
+            or binding.version != expected_version
+            or binding.lease_expires_at is None
+            or binding.lease_expires_at <= now
+        ):
+            return False
+        completed = DeliveryOperationBinding.model_validate(
+            binding.model_dump(mode="python")
+            | {
+                "status": DeliveryOperationStatus.COMPLETED,
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "completed_at": now,
+                "version": binding.version + 1,
+                "updated_at": now,
+            }
+        )
+        self.database.bindings[request_key] = completed
+        return True
+
 
 class UnitOfWork:
     def __init__(self, database: Database) -> None:
@@ -271,11 +399,13 @@ class Reconciler:
         self.database = database
         self.resolve = resolve
         self.calls: list[UUID] = []
+        self.seen_statuses: list[WriteStatus] = []
 
     async def reconcile_intent(self, intent_id: UUID) -> object:
         assert self.database.depth == 0
         self.calls.append(intent_id)
         intent = self.database.intents[intent_id]
+        self.seen_statuses.append(intent.status)
         if self.resolve:
             updated = transition_write_intent(intent, WriteStatus.SUCCEEDED, NOW)
             self.database.intents[intent_id] = updated
@@ -290,10 +420,37 @@ class CrashingReconciler(Reconciler):
         raise RuntimeError("connector stopped")
 
 
+class BlockingReconciler(Reconciler):
+    def __init__(self, database: Database) -> None:
+        super().__init__(database, resolve=False)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def reconcile_intent(self, intent_id: UUID) -> object:
+        assert self.database.depth == 0
+        self.calls.append(intent_id)
+        self.entered.set()
+        await self.release.wait()
+        return object()
+
+
+class AdvancingReconciler(Reconciler):
+    def __init__(self, database: Database, clock: MutableClock) -> None:
+        super().__init__(database, resolve=False)
+        self.clock = clock
+
+    async def reconcile_intent(self, intent_id: UUID) -> object:
+        result = await super().reconcile_intent(intent_id)
+        self.clock.current += timedelta(seconds=90)
+        return result
+
+
 def service(
     database: Database,
     reconciler: Reconciler | None = None,
     scheduler: Scheduler | None = None,
+    clock: Clock | MutableClock | None = None,
+    operation_lease_duration: timedelta = timedelta(minutes=2),
 ) -> tuple[DeliveryControlService, Reconciler, Scheduler]:
     connector = reconciler or Reconciler(database)
     retry_scheduler = scheduler or Scheduler()
@@ -301,8 +458,9 @@ def service(
         DeliveryControlService(
             unit_of_work=database.unit_of_work,
             reconciler=connector,
-            clock=Clock(),
+            clock=clock or Clock(),
             retry_scheduler=retry_scheduler,
+            operation_lease_duration=operation_lease_duration,
         ),
         connector,
         retry_scheduler,
@@ -361,6 +519,42 @@ async def test_retry_reconciles_unknown_before_it_can_return_to_the_create_queue
     assert reconciler.calls == [unknown.id]
     assert database.intents[unknown.id].status is WriteStatus.SUCCEEDED
     assert result.receipts == (database.receipts[unknown.id],)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    [
+        FailureCode.IDEMPOTENCY_CONFLICT,
+        FailureCode.INTERNAL,
+        FailureCode.UNKNOWN_REMOTE_OUTCOME,
+    ],
+)
+async def test_retry_routes_ambiguous_permanent_failures_through_reconciliation(
+    code: FailureCode,
+) -> None:
+    failed = make_intent(10, WriteStatus.PERMANENT_FAILED, attempt_count=2).model_copy(
+        update={"last_failure": make_failure(FailureDisposition.PERMANENT, code)}
+    )
+    database = Database(failed, meeting=make_meeting(MeetingStatus.FILING_FAILED))
+    reconciler = Reconciler(database, resolve=False)
+    control, _, scheduler = service(database, reconciler)
+
+    result = await control.retry(
+        MEETING_ID,
+        intent_ids=(failed.id,),
+        request_key=f"retry-{code.value}",
+        actor_id="owner",
+    )
+
+    updated = database.intents[failed.id]
+    assert reconciler.calls == [failed.id]
+    assert reconciler.seen_statuses == [WriteStatus.UNKNOWN]
+    assert updated.status is WriteStatus.UNKNOWN
+    assert updated.next_reconcile_at == NOW
+    assert updated.attempt_count == failed.attempt_count
+    assert result.intents[0].status is WriteStatus.UNKNOWN
+    assert not scheduler.attempts
 
 
 @pytest.mark.asyncio
@@ -436,7 +630,7 @@ async def test_exhausted_failure_is_an_idempotent_noop() -> None:
     )
 
     assert database.intents[exhausted.id] == exhausted
-    assert result.replayed is True
+    assert result.replayed is False
     assert not scheduler.attempts
 
 
@@ -496,6 +690,8 @@ async def test_request_binding_resumes_after_connector_crash() -> None:
     binding = database.bindings["reconcile-crash"]
     assert binding.operation is DeliveryOperationKind.RECONCILE
     assert binding.meeting_id == MEETING_ID
+    assert binding.status is DeliveryOperationStatus.PENDING
+    assert binding.lease_owner is None
     resumed, reconciler, _ = service(database)
 
     result = await resumed.reconcile(
@@ -507,6 +703,103 @@ async def test_request_binding_resumes_after_connector_crash() -> None:
 
     assert reconciler.calls == [unknown.id]
     assert result.intents[0].status is WriteStatus.SUCCEEDED
+    assert database.bindings["reconcile-crash"].status is DeliveryOperationStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_completed_request_replays_the_current_snapshot_without_reconciliation() -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    database = Database(unknown)
+    reconciler = Reconciler(database, resolve=False)
+    control, _, _ = service(database, reconciler)
+
+    first = await control.reconcile(
+        MEETING_ID,
+        intent_ids=(unknown.id,),
+        request_key="reconcile-completed",
+        actor_id="owner",
+    )
+    scheduled = WriteIntent.model_validate(
+        database.intents[unknown.id].model_dump(mode="python")
+        | {
+            "next_reconcile_at": NOW + timedelta(minutes=1),
+            "reconcile_attempt_count": 1,
+            "version": unknown.version + 1,
+            "updated_at": NOW,
+        }
+    )
+    database.intents[unknown.id] = scheduled
+
+    replay = await control.reconcile(
+        MEETING_ID,
+        intent_ids=(unknown.id,),
+        request_key="reconcile-completed",
+        actor_id="owner",
+    )
+
+    assert first.replayed is False
+    assert replay.replayed is True
+    assert replay.intents == (scheduled,)
+    assert reconciler.calls == [unknown.id]
+
+
+@pytest.mark.asyncio
+async def test_live_duplicate_request_cannot_share_operation_execution() -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    database = Database(unknown)
+    reconciler = BlockingReconciler(database)
+    control, _, _ = service(database, reconciler)
+    first = asyncio.create_task(
+        control.reconcile(
+            MEETING_ID,
+            intent_ids=(unknown.id,),
+            request_key="reconcile-concurrent",
+            actor_id="owner",
+        )
+    )
+    await reconciler.entered.wait()
+
+    with pytest.raises(OperationConflictError, match="already in progress"):
+        await control.reconcile(
+            MEETING_ID,
+            intent_ids=(unknown.id,),
+            request_key="reconcile-concurrent",
+            actor_id="owner",
+        )
+
+    reconciler.release.set()
+    result = await first
+    assert result.replayed is False
+    assert reconciler.calls == [unknown.id]
+    assert database.bindings["reconcile-concurrent"].status is DeliveryOperationStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_operation_lease_is_renewed_across_a_long_multi_intent_command() -> None:
+    intents = tuple(make_intent(value, WriteStatus.UNKNOWN) for value in range(10, 13))
+    database = Database(*intents)
+    clock = MutableClock()
+    reconciler = AdvancingReconciler(database, clock)
+    control, _, _ = service(
+        database,
+        reconciler,
+        clock=clock,
+        operation_lease_duration=timedelta(minutes=2),
+    )
+
+    result = await control.reconcile(
+        MEETING_ID,
+        intent_ids=tuple(intent.id for intent in intents),
+        request_key="reconcile-long-running",
+        actor_id="owner",
+    )
+
+    binding = database.bindings["reconcile-long-running"]
+    assert result.replayed is False
+    assert reconciler.calls == [intent.id for intent in intents]
+    assert clock.current == NOW + timedelta(seconds=270)
+    assert binding.status is DeliveryOperationStatus.COMPLETED
+    assert binding.version == 5
 
 
 @pytest.mark.asyncio

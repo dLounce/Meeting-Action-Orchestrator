@@ -66,7 +66,7 @@ WRITE_TRANSITIONS: dict[WriteStatus, frozenset[WriteStatus]] = {
         {WriteStatus.SUCCEEDED, WriteStatus.RETRY_WAIT, WriteStatus.PERMANENT_FAILED}
     ),
     WriteStatus.SUCCEEDED: frozenset(),
-    WriteStatus.PERMANENT_FAILED: frozenset({WriteStatus.RETRY_WAIT}),
+    WriteStatus.PERMANENT_FAILED: frozenset({WriteStatus.RETRY_WAIT, WriteStatus.UNKNOWN}),
 }
 
 
@@ -112,6 +112,7 @@ def transition_write_intent(
     *,
     failure: WorkflowFailure | None = None,
     next_attempt_at: datetime | None = None,
+    next_reconcile_at: datetime | None = None,
     lease_owner: str | None = None,
     lease_expires_at: datetime | None = None,
 ) -> WriteIntent:
@@ -137,6 +138,10 @@ def transition_write_intent(
         "status": target,
         "last_failure": failure,
         "next_attempt_at": next_attempt_at if target is WriteStatus.RETRY_WAIT else None,
+        "next_reconcile_at": (next_reconcile_at or at if target is WriteStatus.UNKNOWN else None),
+        "reconcile_attempt_count": 0,
+        "reconcile_lease_owner": None,
+        "reconcile_lease_expires_at": None,
         "lease_owner": lease_owner if target is WriteStatus.IN_FLIGHT else None,
         "lease_expires_at": lease_expires_at if target is WriteStatus.IN_FLIGHT else None,
         "attempt_count": intent.attempt_count + (1 if target is WriteStatus.IN_FLIGHT else 0),

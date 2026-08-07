@@ -8,6 +8,7 @@ import socket
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Protocol
 from uuid import UUID
 
@@ -411,6 +412,7 @@ def create_application(settings: Settings | None = None) -> FastAPI:
             reconciler=delivery_executor,
             clock=clock,
             retry_scheduler=DeliveryRetryScheduler(),
+            operation_lease_duration=_delivery_lease_duration(configured),
         )
         delivery_service = AsyncDeliveryFacade(delivery_control)
     dependencies = ApiDependencies(
@@ -500,8 +502,14 @@ def _delivery_runtime(
         clock=clock,
         retry_scheduler=DeliveryRetryScheduler(),
         worker_id=_worker_id("delivery"),
+        lease_duration=_delivery_lease_duration(settings),
+        reconciliation_lease_duration=_delivery_lease_duration(settings),
     )
     return client, executor
+
+
+def _delivery_lease_duration(settings: Settings) -> timedelta:
+    return timedelta(seconds=(settings.mcp_call_timeout_seconds * 2) + 30)
 
 
 def _worker_id(role: str) -> str:

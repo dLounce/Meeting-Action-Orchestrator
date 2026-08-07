@@ -44,6 +44,12 @@ class DeliveryOperationKind(str, Enum):
     RECONCILE = "reconcile"
 
 
+class DeliveryOperationStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+
+
 class MeetingOperationKind(str, Enum):
     PROCESSING_RETRY = "processing_retry"
     CANCELLATION = "cancellation"

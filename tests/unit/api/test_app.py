@@ -32,16 +32,20 @@ from meeting_action_orchestrator.domain.enums import (
     ProcessingStage,
     ReviewOrigin,
     WriteKind,
+    WriteStatus,
 )
 from meeting_action_orchestrator.domain.models import (
     Approval,
+    ConnectorTarget,
     Meeting,
     ProcessingJob,
     RecapArtifact,
     ReviewRevision,
+    TaskProposal,
     Transcript,
     TranscriptSegment,
     WorkflowFailure,
+    WriteIntent,
 )
 
 NOW = datetime(2026, 8, 7, 9, 0, tzinfo=timezone.utc)
@@ -157,6 +161,30 @@ def retrying_processing_job() -> ProcessingJob:
     )
 
 
+def unknown_write_intent() -> WriteIntent:
+    return WriteIntent(
+        id=UUID("a0000000-0000-4000-8000-000000000001"),
+        meeting_id=MEETING_ID,
+        approval_id=APPROVAL_ID,
+        idempotency_key=f"mao_v1_{'a' * 64}",
+        proposal=TaskProposal(
+            source_action_id=ACTION_ID,
+            target=ConnectorTarget(connector_id="tasks", resource_id="inbox"),
+            title="Publish the approved brief",
+        ),
+        status=WriteStatus.UNKNOWN,
+        next_reconcile_at=NOW,
+        last_failure=WorkflowFailure(
+            code=FailureCode.UNKNOWN_REMOTE_OUTCOME,
+            disposition=FailureDisposition.UNKNOWN_OUTCOME,
+            safe_message="The connector outcome is unknown",
+            occurred_at=NOW,
+        ),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
 class FakeAuthenticator:
     async def authenticate(self, token: str) -> Principal | None:
         return Principal("portfolio-owner") if token == VALID_TOKEN else None
@@ -214,6 +242,9 @@ class FakeWorkflow:
 
 
 class FakeQueries:
+    def __init__(self) -> None:
+        self.delivery_result = DeliveryResult(meeting(), ())
+
     async def list_meetings(
         self,
         *,
@@ -252,7 +283,7 @@ class FakeQueries:
 
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult:
         assert meeting_id == MEETING_ID
-        return DeliveryResult(meeting(), ())
+        return self.delivery_result
 
 
 class MissingRecapQueries(FakeQueries):
@@ -813,8 +844,46 @@ async def test_approval_requires_precondition_and_idempotency_headers() -> None:
     assert response.json()["replayed"] is False
 
 
-async def test_retry_and_reconcile_require_idempotency_keys() -> None:
+async def test_delivery_etag_changes_when_only_reconciliation_schedule_changes() -> None:
+    queries = FakeQueries()
+    first_intent = unknown_write_intent()
+    queries.delivery_result = DeliveryResult(meeting(), (first_intent,))
+    services = dependencies(queries=queries)
+
+    first = await request(
+        f"/v1/meetings/{MEETING_ID}/delivery",
+        services=services,
+        headers=authorization(),
+    )
+    scheduled = WriteIntent.model_validate(
+        first_intent.model_dump(mode="python")
+        | {
+            "next_reconcile_at": NOW + timedelta(minutes=1),
+            "reconcile_attempt_count": 1,
+            "version": 1,
+        }
+    )
+    queries.delivery_result = DeliveryResult(meeting(), (scheduled,))
+    second = await request(
+        f"/v1/meetings/{MEETING_ID}/delivery",
+        services=services,
+        headers=authorization(),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["meeting"]["version"] == second.json()["meeting"]["version"]
+    assert first.headers["etag"] != second.headers["etag"]
+
+
+async def test_retry_and_reconcile_require_and_return_control_headers() -> None:
     for operation in ("retry", "reconcile"):
+        missing = await request(
+            f"/v1/meetings/{MEETING_ID}/delivery/{operation}",
+            method="POST",
+            headers=authorization(),
+            json={"intent_ids": []},
+        )
         response = await request(
             f"/v1/meetings/{MEETING_ID}/delivery/{operation}",
             method="POST",
@@ -822,8 +891,10 @@ async def test_retry_and_reconcile_require_idempotency_keys() -> None:
             json={"intent_ids": []},
         )
 
+        assert missing.status_code == 400
         assert response.status_code == 200
         assert response.json()["meeting"]["id"] == str(MEETING_ID)
+        assert response.headers["etag"].startswith('"')
 
 
 async def test_api_responses_apply_security_and_request_id_headers() -> None:
@@ -888,3 +959,13 @@ def test_openapi_secures_all_data_routes_and_describes_problem_media() -> None:
         if parameter["in"] == "header"
     } == {"If-Match": True, "Idempotency-Key": True}
     assert "ETag" in cancellation["responses"]["200"]["headers"]
+    delivery_read = schema["paths"]["/v1/meetings/{meeting_id}/delivery"]["get"]
+    assert "ETag" in delivery_read["responses"]["200"]["headers"]
+    for operation in ("retry", "reconcile"):
+        control = schema["paths"][f"/v1/meetings/{{meeting_id}}/delivery/{operation}"]["post"]
+        assert {
+            parameter["name"]: parameter["required"]
+            for parameter in control["parameters"]
+            if parameter["in"] == "header"
+        } == {"Idempotency-Key": True}
+        assert "ETag" in control["responses"]["200"]["headers"]
