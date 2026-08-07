@@ -7,15 +7,22 @@ from datetime import datetime
 from types import TracebackType
 from uuid import UUID
 
-from meeting_action_orchestrator.domain.enums import WriteStatus
+from meeting_action_orchestrator.domain.enums import (
+    FailureDisposition,
+    ProcessingJobStatus,
+    ProcessingStage,
+    WriteStatus,
+)
 from meeting_action_orchestrator.domain.hashing import canonical_json
 from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
     Meeting,
+    ProcessingJob,
     RecapArtifact,
     ReviewRevision,
     Transcript,
+    WorkflowFailure,
     WriteIntent,
     WriteReceipt,
 )
@@ -388,6 +395,184 @@ class SqliteRecapRepository:
         )
 
 
+class SqliteProcessingJobRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, job: ProcessingJob) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO processing_jobs (
+                id, meeting_id, stage, status, attempt_count, max_attempts,
+                next_attempt_at, lease_owner, lease_expires_at, last_failure_json,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            self._values(job),
+        )
+
+    def get(self, job_id: UUID) -> ProcessingJob | None:
+        row = self._connection.execute(
+            "SELECT * FROM processing_jobs WHERE id = ?", (str(job_id),)
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def find_for_stage(
+        self,
+        meeting_id: UUID,
+        stage: ProcessingStage,
+    ) -> ProcessingJob | None:
+        row = self._connection.execute(
+            "SELECT * FROM processing_jobs WHERE meeting_id = ? AND stage = ?",
+            (str(meeting_id), stage.value),
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def list_for_meeting(self, meeting_id: UUID) -> Sequence[ProcessingJob]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM processing_jobs WHERE meeting_id = ?
+            ORDER BY CASE stage WHEN 'transcription' THEN 0 ELSE 1 END, id
+            """,
+            (str(meeting_id),),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
+    def claim_due(
+        self,
+        stage: ProcessingStage,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+        expired_failure: WorkflowFailure,
+    ) -> Sequence[ProcessingJob]:
+        if limit <= 0:
+            return ()
+        self._connection.execute(
+            """
+            UPDATE processing_jobs SET status = ?, next_attempt_at = NULL,
+                lease_owner = NULL, lease_expires_at = NULL,
+                last_failure_json = ?, updated_at = ?
+            WHERE stage = ? AND status = ? AND lease_expires_at <= ?
+                AND attempt_count >= max_attempts
+            """,
+            (
+                ProcessingJobStatus.FAILED.value,
+                _as_json(expired_failure),
+                str(now),
+                stage.value,
+                ProcessingJobStatus.RUNNING.value,
+                str(now),
+            ),
+        )
+        rows = self._connection.execute(
+            """
+            SELECT id FROM processing_jobs
+            WHERE stage = ? AND attempt_count < max_attempts AND (
+                status = ? OR
+                (status = ? AND next_attempt_at <= ?) OR
+                (status = ? AND lease_expires_at <= ?)
+            )
+            ORDER BY COALESCE(next_attempt_at, created_at), created_at, id
+            LIMIT ?
+            """,
+            (
+                stage.value,
+                ProcessingJobStatus.READY.value,
+                ProcessingJobStatus.RETRY_WAIT.value,
+                str(now),
+                ProcessingJobStatus.RUNNING.value,
+                str(now),
+                limit,
+            ),
+        ).fetchall()
+        claimed: list[ProcessingJob] = []
+        for row in rows:
+            self._connection.execute(
+                """
+                UPDATE processing_jobs SET status = ?, attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL, lease_owner = ?, lease_expires_at = ?,
+                    last_failure_json = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    ProcessingJobStatus.RUNNING.value,
+                    worker_id,
+                    str(lease_until),
+                    str(now),
+                    row["id"],
+                ),
+            )
+            item = self.get(UUID(row["id"]))
+            if item is not None:
+                claimed.append(item)
+        return tuple(claimed)
+
+    def save(
+        self,
+        job: ProcessingJob,
+        expected_status: ProcessingJobStatus,
+        expected_lease_owner: str | None,
+        expected_lease_expires_at: datetime | None,
+    ) -> None:
+        values = self._values(job)
+        cursor = self._connection.execute(
+            """
+            UPDATE processing_jobs SET meeting_id = ?, stage = ?, status = ?,
+                attempt_count = ?, max_attempts = ?, next_attempt_at = ?,
+                lease_owner = ?, lease_expires_at = ?, last_failure_json = ?,
+                created_at = ?, updated_at = ?
+            WHERE id = ? AND status = ? AND lease_owner IS ? AND lease_expires_at IS ?
+            """,
+            (
+                *values[1:],
+                values[0],
+                expected_status.value,
+                expected_lease_owner,
+                _as_text(expected_lease_expires_at),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise PersistenceConflictError("The processing job lease is no longer current")
+
+    @staticmethod
+    def _values(job: ProcessingJob) -> tuple[object, ...]:
+        return (
+            str(job.id),
+            str(job.meeting_id),
+            job.stage.value,
+            job.status.value,
+            job.attempt_count,
+            job.max_attempts,
+            _as_text(job.next_attempt_at),
+            job.lease_owner,
+            _as_text(job.lease_expires_at),
+            _as_json(job.last_failure) if job.last_failure is not None else None,
+            str(job.created_at),
+            str(job.updated_at),
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> ProcessingJob:
+        return ProcessingJob.model_validate(
+            {
+                "id": row["id"],
+                "meeting_id": row["meeting_id"],
+                "stage": row["stage"],
+                "status": row["status"],
+                "attempt_count": row["attempt_count"],
+                "max_attempts": row["max_attempts"],
+                "next_attempt_at": row["next_attempt_at"],
+                "lease_owner": row["lease_owner"],
+                "lease_expires_at": row["lease_expires_at"],
+                "last_failure": _load_json(row["last_failure_json"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+
+
 class SqliteWriteIntentRepository:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
@@ -463,6 +648,69 @@ class SqliteWriteIntentRepository:
             if item is not None:
                 claimed.append(item)
         return tuple(claimed)
+
+    def claim_due_ids(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[UUID]:
+        return tuple(intent.id for intent in self.claim_due(worker_id, now, lease_until, limit))
+
+    def recover_expired_ids(
+        self,
+        now: datetime,
+        failure: WorkflowFailure,
+        limit: int,
+    ) -> Sequence[UUID]:
+        if limit <= 0:
+            return ()
+        if failure.disposition is not FailureDisposition.UNKNOWN_OUTCOME:
+            raise ValueError("Expired writes require an unknown-outcome failure")
+        rows = self._connection.execute(
+            """
+            SELECT id FROM write_intents
+            WHERE status = ? AND lease_expires_at <= ?
+            ORDER BY lease_expires_at, created_at, id LIMIT ?
+            """,
+            (WriteStatus.IN_FLIGHT.value, str(now), limit),
+        ).fetchall()
+        recovered = tuple(UUID(row["id"]) for row in rows)
+        if not recovered:
+            return ()
+        self._connection.executemany(
+            """
+            UPDATE write_intents SET status = ?, next_attempt_at = NULL,
+                lease_owner = NULL, lease_expires_at = NULL, last_failure_json = ?,
+                version = version + 1, updated_at = ?
+            WHERE id = ? AND status = ? AND lease_expires_at <= ?
+            """,
+            [
+                (
+                    WriteStatus.UNKNOWN.value,
+                    _as_json(failure),
+                    str(now),
+                    str(intent_id),
+                    WriteStatus.IN_FLIGHT.value,
+                    str(now),
+                )
+                for intent_id in recovered
+            ],
+        )
+        return recovered
+
+    def list_unknown_ids(self, limit: int) -> Sequence[UUID]:
+        if limit <= 0:
+            return ()
+        rows = self._connection.execute(
+            """
+            SELECT id FROM write_intents WHERE status = ?
+            ORDER BY updated_at, created_at, id LIMIT ?
+            """,
+            (WriteStatus.UNKNOWN.value, limit),
+        ).fetchall()
+        return tuple(UUID(row["id"]) for row in rows)
 
     def save(self, intent: WriteIntent, expected_version: int) -> None:
         values = self._values(intent)
@@ -586,6 +834,7 @@ class SqliteUnitOfWork:
         self.reviews: SqliteReviewRepository
         self.approvals: SqliteApprovalRepository
         self.recaps: SqliteRecapRepository
+        self.processing_jobs: SqliteProcessingJobRepository
         self.write_intents: SqliteWriteIntentRepository
         self.write_receipts: SqliteWriteReceiptRepository
 
@@ -600,6 +849,7 @@ class SqliteUnitOfWork:
         self.reviews = SqliteReviewRepository(connection)
         self.approvals = SqliteApprovalRepository(connection)
         self.recaps = SqliteRecapRepository(connection)
+        self.processing_jobs = SqliteProcessingJobRepository(connection)
         self.write_intents = SqliteWriteIntentRepository(connection)
         self.write_receipts = SqliteWriteReceiptRepository(connection)
         return self

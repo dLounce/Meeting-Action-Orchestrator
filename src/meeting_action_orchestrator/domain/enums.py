@@ -25,6 +25,20 @@ class MeetingStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ProcessingStage(str, Enum):
+    TRANSCRIPTION = "transcription"
+    EXTRACTION = "extraction"
+
+
+class ProcessingJobStatus(str, Enum):
+    READY = "ready"
+    RUNNING = "running"
+    RETRY_WAIT = "retry_wait"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class ReviewOrigin(str, Enum):
     MODEL = "model"
     HUMAN = "human"

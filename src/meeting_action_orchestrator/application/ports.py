@@ -6,13 +6,19 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from meeting_action_orchestrator.domain.enums import (
+    ProcessingJobStatus,
+    ProcessingStage,
+)
 from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
     Meeting,
+    ProcessingJob,
     RecapArtifact,
     ReviewRevision,
     Transcript,
+    WorkflowFailure,
     WriteIntent,
     WriteReceipt,
 )
@@ -102,6 +108,38 @@ class RecapRepository(Protocol):
     def for_approval(self, approval_id: UUID) -> RecapArtifact | None: ...
 
 
+class ProcessingJobRepository(Protocol):
+    def add(self, job: ProcessingJob) -> None: ...
+
+    def get(self, job_id: UUID) -> ProcessingJob | None: ...
+
+    def find_for_stage(
+        self,
+        meeting_id: UUID,
+        stage: ProcessingStage,
+    ) -> ProcessingJob | None: ...
+
+    def list_for_meeting(self, meeting_id: UUID) -> Sequence[ProcessingJob]: ...
+
+    def claim_due(
+        self,
+        stage: ProcessingStage,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+        expired_failure: WorkflowFailure,
+    ) -> Sequence[ProcessingJob]: ...
+
+    def save(
+        self,
+        job: ProcessingJob,
+        expected_status: ProcessingJobStatus,
+        expected_lease_owner: str | None,
+        expected_lease_expires_at: datetime | None,
+    ) -> None: ...
+
+
 class WriteIntentRepository(Protocol):
     def add_many(self, intents: Sequence[WriteIntent]) -> None: ...
 
@@ -116,6 +154,23 @@ class WriteIntentRepository(Protocol):
         lease_until: datetime,
         limit: int,
     ) -> Sequence[WriteIntent]: ...
+
+    def claim_due_ids(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[UUID]: ...
+
+    def recover_expired_ids(
+        self,
+        now: datetime,
+        failure: WorkflowFailure,
+        limit: int,
+    ) -> Sequence[UUID]: ...
+
+    def list_unknown_ids(self, limit: int) -> Sequence[UUID]: ...
 
     def save(self, intent: WriteIntent, expected_version: int) -> None: ...
 
@@ -135,6 +190,7 @@ class UnitOfWork(Protocol):
     reviews: ReviewRepository
     approvals: ApprovalRepository
     recaps: RecapRepository
+    processing_jobs: ProcessingJobRepository
     write_intents: WriteIntentRepository
     write_receipts: WriteReceiptRepository
 

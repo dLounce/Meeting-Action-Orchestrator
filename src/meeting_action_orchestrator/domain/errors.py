@@ -78,6 +78,18 @@ class InvariantCode(str, Enum):
     PERMANENT_DISPOSITION = "failure must be permanent"
     TRANSITION_LEASE = "in-flight transition requires a lease"
     RECAP_MISSING = "approved recap is missing"
+    JOB_TIMESTAMPS = "processing job updated_at precedes created_at"
+    JOB_ATTEMPTS = "processing job attempt count exceeds its limit"
+    JOB_MAX_ATTEMPTS = "processing job retry limit does not match its stage"
+    JOB_LEASE_REQUIRED = "running processing job requires a lease"
+    JOB_LEASE_EXPIRY = "processing job lease must expire after its last update"
+    JOB_LEASE_FORBIDDEN = "only a running processing job can hold a lease"
+    JOB_RETRY_REQUIRED = "retrying processing job requires a schedule"
+    JOB_RETRY_EXPIRY = "processing job retry cannot precede its last update"
+    JOB_RETRY_FORBIDDEN = "only a retrying processing job can have a schedule"
+    JOB_FAILURE_REQUIRED = "failed processing job status requires a failure"
+    JOB_FAILURE_FORBIDDEN = "active or successful processing job cannot retain a failure"
+    JOB_RETRY_DISPOSITION = "processing job retry requires a retryable failure"
 
 
 class InvalidDomainValueError(DomainError):

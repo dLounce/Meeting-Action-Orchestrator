@@ -27,6 +27,8 @@ from meeting_action_orchestrator.domain.enums import (
     IssueStatus,
     MeetingStatus,
     Priority,
+    ProcessingJobStatus,
+    ProcessingStage,
     ReviewOrigin,
     WriteKind,
     WriteStatus,
@@ -72,6 +74,78 @@ class WorkflowFailure(DomainModel):
     safe_message: MediumText
     provider_request_id: ShortText | None = None
     occurred_at: AwareDatetime
+
+
+PROCESSING_MAX_ATTEMPTS = {
+    ProcessingStage.TRANSCRIPTION: 3,
+    ProcessingStage.EXTRACTION: 2,
+}
+
+
+class ProcessingJob(DomainModel):
+    id: UUID
+    meeting_id: UUID
+    stage: ProcessingStage
+    status: ProcessingJobStatus = ProcessingJobStatus.READY
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(gt=0)
+    next_attempt_at: AwareDatetime | None = None
+    lease_owner: ShortText | None = None
+    lease_expires_at: AwareDatetime | None = None
+    last_failure: WorkflowFailure | None = None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_limits(self) -> ProcessingJob:
+        if self.updated_at < self.created_at:
+            raise DomainInvariantError(InvariantCode.JOB_TIMESTAMPS)
+        if self.attempt_count > self.max_attempts:
+            raise DomainInvariantError(InvariantCode.JOB_ATTEMPTS)
+        if self.max_attempts != PROCESSING_MAX_ATTEMPTS[self.stage]:
+            raise DomainInvariantError(InvariantCode.JOB_MAX_ATTEMPTS)
+        return self
+
+    @model_validator(mode="after")
+    def validate_lease(self) -> ProcessingJob:
+        if self.status is ProcessingJobStatus.RUNNING:
+            if self.lease_owner is None or self.lease_expires_at is None:
+                raise DomainInvariantError(InvariantCode.JOB_LEASE_REQUIRED)
+            if self.lease_expires_at <= self.updated_at:
+                raise DomainInvariantError(InvariantCode.JOB_LEASE_EXPIRY)
+        elif self.lease_owner is not None or self.lease_expires_at is not None:
+            raise DomainInvariantError(InvariantCode.JOB_LEASE_FORBIDDEN)
+        return self
+
+    @model_validator(mode="after")
+    def validate_retry(self) -> ProcessingJob:
+        if self.status is ProcessingJobStatus.RETRY_WAIT:
+            if self.next_attempt_at is None:
+                raise DomainInvariantError(InvariantCode.JOB_RETRY_REQUIRED)
+            if self.next_attempt_at < self.updated_at:
+                raise DomainInvariantError(InvariantCode.JOB_RETRY_EXPIRY)
+            if (
+                self.last_failure is not None
+                and self.last_failure.disposition is not FailureDisposition.RETRYABLE
+            ):
+                raise DomainInvariantError(InvariantCode.JOB_RETRY_DISPOSITION)
+        elif self.next_attempt_at is not None:
+            raise DomainInvariantError(InvariantCode.JOB_RETRY_FORBIDDEN)
+        return self
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> ProcessingJob:
+        failed_statuses = {ProcessingJobStatus.RETRY_WAIT, ProcessingJobStatus.FAILED}
+        if self.status in failed_statuses and self.last_failure is None:
+            raise DomainInvariantError(InvariantCode.JOB_FAILURE_REQUIRED)
+        failure_forbidden = {
+            ProcessingJobStatus.READY,
+            ProcessingJobStatus.RUNNING,
+            ProcessingJobStatus.SUCCEEDED,
+        }
+        if self.status in failure_forbidden and self.last_failure is not None:
+            raise DomainInvariantError(InvariantCode.JOB_FAILURE_FORBIDDEN)
+        return self
 
 
 class AudioAsset(DomainModel):
