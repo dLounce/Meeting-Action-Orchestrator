@@ -33,13 +33,15 @@ reviewed Streamable HTTP MCP server is available. A resource ID requires
 
 ## Module ownership
 
-- `domain` owns immutable business models, invariants, canonical hashes, and pure state
-  transitions. It must not import framework, persistence, or provider code.
+- `domain` owns immutable business models, invariants, canonical hashes, workflow-event
+  contracts, and pure state transitions. It must not import framework, persistence, or
+  provider code.
 - `agents` owns typed semantic contracts, prompts, specialist definitions, and model-run
   budgets. It must not own workflow state or side effects.
 - `application` owns ports and use cases. It may depend on domain and typed agent contracts,
   but not FastAPI, SQLite, OpenAI, or MCP implementations.
-- `infrastructure` owns provider, transport, filesystem, and SQLite adapters.
+- `infrastructure` owns provider, transport, filesystem, and SQLite state and event-history
+  adapters.
 - `api` owns the JSON HTTP contract, authentication, ETags, middleware, and problem
   responses. It must not contain business rules.
 - `bootstrap.py` and `cli.py` own composition and process lifecycle.
@@ -60,6 +62,15 @@ port or removes repeated policy.
   operation bindings.
 - Preserve last-owner recording cleanup, identity verification, bounded remediation, and
   the WAL-checkpoint gate on erasure completion.
+- Append workflow events in the same immediate unit of work as the state mutation they
+  describe. Rollback, replay, rejected or stale commands, no-op transitions, and lease loss
+  must not create duplicate history.
+- Keep event metadata strict, versioned, bounded, and explicitly projected. Do not add raw
+  transcripts, review prose, prompts, filenames, idempotency keys, write-intent IDs, or
+  provider request IDs. Treat actor subjects and digests as sensitive even though they are
+  allowlisted.
+- Keep autonomous events actorless and derive human-event actors only from the
+  authenticated principal, never a request body.
 - Keep blocking filesystem and SQLite work off the async event loop.
 - Return safe public failures without provider payloads or internal exception detail.
 - Do not add a frontend to this repository; the supported integration surface is JSON HTTP.
@@ -73,6 +84,13 @@ through the migration command.
 Repository writes must participate in a unit of work. Avoid network calls while a SQLite
 transaction is open. Add integration coverage for migrations, repository round trips,
 claim behavior, and optimistic concurrency when those contracts change.
+
+Workflow-event appends require an immediate unit of work and must remain contiguous within
+each meeting. Preserve the duplicate-ID, contiguous-insert, update-rejection, and
+direct-delete triggers. Parent meeting deletion is the deliberate exception: its foreign
+key cascade must remove event history as part of bounded erasure. Do not describe these
+SQLite controls as cryptographic tamper evidence or protection from a privileged database
+administrator.
 
 An erasure migration must account for every meeting-owned table in graph validation and
 deletion. New references that cannot cascade safely must be deleted explicitly in the same
@@ -94,6 +112,13 @@ implementation.
 Update `README.md`, OpenAPI assertions, and API tests in the same change. Do not expose the
 static API bearer token through browser code or add permissive CORS as a substitute for a
 server-side integration.
+
+Changes to `GET /v1/meetings/{meeting_id}/events` must preserve ascending sequence
+pagination, a limit from 1 through 100, generic cursor errors, and a cursor bound to the
+requested meeting. Map domain events and every metadata variant to the public response
+explicitly; do not rely on generic model serialization. The route must check meeting
+existence and read the page in one deferred unit of work, return `Cache-Control: no-store`,
+and remain behind bearer authentication.
 
 ## Provider changes
 
@@ -132,6 +157,12 @@ Erasure changes require coverage for stale versions, idempotent replay, active-w
 blocking, malformed ownership, shared recordings, exact-file preflight, cleanup failure
 and group remediation, WAL checkpoint retries, historical key validation, tombstone ingest
 conflicts, privacy-safe responses, and restart recovery.
+
+Workflow-event changes require coverage for event order, same-transaction rollback,
+idempotent replay and no-op suppression, actor attribution, lease loss, failure and recovery
+paths, strict metadata validation, corrupt stored rows, append restrictions, erasure
+cascade, authenticated pagination, cross-meeting cursors, safe response projection, and
+generic post-erasure `404` behavior.
 
 ## Security and data
 

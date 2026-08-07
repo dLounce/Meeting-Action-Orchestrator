@@ -17,6 +17,8 @@ application backend, including a portfolio backend-for-frontend.
 - Ingest, approval, retry, and reconciliation requests have durable idempotency bindings.
 - Processing jobs and write intents survive restarts and use leases for crash recovery.
 - An uncertain remote write becomes `unknown` and must be looked up before another create.
+- Meeting-scoped workflow events are committed with the state changes they describe;
+  rejected, stale, replayed, and no-op commands do not add duplicate history.
 - Meeting erasure atomically removes the database-known workflow graph before asynchronous
   recording cleanup and database checkpointing.
 - Erasure persistence retains meeting, ingest, actor, and request identities only as
@@ -205,11 +207,13 @@ protect review changes and approval; erasure version ETags protect cleanup remed
 | `POST` | `/v1/meetings` | `Idempotency-Key` | Ingest multipart metadata and recording; queues transcription |
 | `GET` | `/v1/meetings` | none | List meetings with an optional status filter and opaque cursor |
 | `GET` | `/v1/meetings/{meeting_id}` | none | Read meeting state |
+| `GET` | `/v1/meetings/{meeting_id}/events` | none | Read ascending workflow-event history with an opaque cursor |
 | `GET` | `/v1/meetings/{meeting_id}/processing` | none | Read durable processing jobs |
 | `POST` | `/v1/meetings/{meeting_id}/processing/retry` | `If-Match`, `Idempotency-Key` | Retry eligible failed processing |
 | `PUT` | `/v1/meetings/{meeting_id}/cancellation` | `If-Match`, `Idempotency-Key` | Cancel eligible processing |
 | `GET` | `/v1/meetings/{meeting_id}/transcript` | none | Read the current transcript |
 | `GET` | `/v1/meetings/{meeting_id}/review` | none | Read the current review and its strong ETag |
+| `GET` | `/v1/meetings/{meeting_id}/recap` | none | Read the approved immutable recap artifact |
 | `PATCH` | `/v1/meetings/{meeting_id}/review/actions/{action_id}` | `If-Match` | Create a human action revision |
 | `PATCH` | `/v1/meetings/{meeting_id}/review/issues/{issue_id}` | `If-Match` | Resolve or accept a review issue |
 | `PUT` | `/v1/meetings/{meeting_id}/review/actions/{action_id}/deliveries/{kind}` | `If-Match` | Enable or disable `task` or `calendar_event` delivery |
@@ -221,7 +225,8 @@ protect review changes and approval; erasure version ETags protect cleanup remed
 | `GET` | `/v1/meeting-erasures/{erasure_job_id}` | none | Read erasure and recording-cleanup state |
 | `POST` | `/v1/meeting-erasures/{erasure_job_id}/retry` | `If-Match`, `Idempotency-Key` | Retry eligible failed recording cleanup |
 
-There are currently no event-stream or UI endpoints. Meeting retention is not automated.
+There is no live event stream or UI endpoint. The events route is an authenticated,
+paginated history read. Meeting retention is not automated.
 
 ### API workflow
 
@@ -317,6 +322,42 @@ curl -sS -X POST "$API_URL/v1/meetings/$MEETING_ID/delivery/reconcile" \
 Idempotency keys are 1 to 200 characters and use a restricted URL-safe character set.
 Treat each key as permanently bound to one logical operation and selection.
 
+### Workflow event history
+
+Read a meeting's workflow history through the same server-side integration used for the
+other `/v1/*` routes:
+
+```bash
+curl -sS "$API_URL/v1/meetings/$MEETING_ID/events?limit=20" \
+  -H "Authorization: Bearer $API_TOKEN"
+```
+
+The response contains `items` in ascending per-meeting `sequence` order and an opaque
+`next_cursor`. The default page size is 20; `limit` accepts values from 1 through 100. When
+`next_cursor` is not null, pass it unchanged with the same meeting ID to read the next
+page. A cursor is versioned, checksummed, and bound to one meeting, but it is not an
+authorization credential or a signed proof. Each page is read in its own SQLite snapshot,
+so events committed between requests can appear on a later page. This is cursor pagination,
+not a real-time change feed; the final page returns a null cursor.
+
+Each item explicitly projects `id`, `meeting_id`, `sequence`, `type`, `actor_id`,
+`safe_metadata`, and `occurred_at`. Metadata schemas are versioned by their `kind` and
+cover ingest, meeting transitions, processing attempts and operator retries, specialist
+handoffs, review revisions and approval, and delivery transitions. Human-triggered events
+use the authenticated `API_ACTOR_SUBJECT`; background work uses a null actor.
+
+The response does not expose transcripts, review prose, prompts, filenames, idempotency
+keys, write-intent IDs, or raw provider request IDs. It uses bounded statuses, counters,
+failure classifications, and digests instead. Those allowlisted fields are still
+deployment-sensitive: actor subjects and stable content digests must not be treated as
+anonymous or safe for a public browser.
+
+An event is appended in the same immediate unit of work as the successful state mutation
+it represents. A rollback removes both. Idempotent replay, validation failure, stale ETag,
+no-op transition, or lost worker lease does not append another event. Existing workflow
+rows are not backfilled; history starts when event-producing application code processes a
+successful mutation after deployment.
+
 ### Meeting erasure
 
 Fetch the meeting immediately before deletion and use its quoted meeting version ETag.
@@ -346,13 +387,14 @@ curl -i "$API_URL/v1/meeting-erasures/$ERASURE_JOB_ID" \
   -H "Authorization: Bearer $API_TOKEN"
 ```
 
-The relational meeting graph is removed in the deletion transaction. The job remains
-`active` while the service waits for the last reference to a shared recording, verifies
-and removes the recording, or retries a busy WAL checkpoint. Terminal `completed` means
-the database checkpoint and required recording cleanup have succeeded. Terminal `failed`
-means recording cleanup needs operator remediation. A deletion can return `409 Conflict`
-while processing is running, a delivery operation is live, a write is in flight, a remote
-write outcome is unknown, or an integrity condition makes erasure unsafe.
+The relational meeting graph, including its workflow-event history, is removed in the
+deletion transaction. The events route then returns the generic meeting `404`. The job
+remains `active` while the service waits for the last reference to a shared recording,
+verifies and removes the recording, or retries a busy WAL checkpoint. Terminal `completed`
+means the database checkpoint and required recording cleanup have succeeded. Terminal
+`failed` means recording cleanup needs operator remediation. A deletion can return
+`409 Conflict` while processing is running, a delivery operation is live, a write is in
+flight, a remote write outcome is unknown, or an integrity condition makes erasure unsafe.
 
 Only a failed erasure with failed recording cleanup is retryable. Fetch the latest job
 ETag, then submit a new idempotency key:
@@ -410,17 +452,19 @@ Browser -> portfolio backend or server route -> Meeting Action Orchestrator
 Keep `API_BEARER_TOKEN` only in the portfolio server's secret environment. Authenticate
 the portfolio user there, enforce ownership and CSRF controls, forward the multipart body,
 and inject `Authorization`, `Idempotency-Key`, and `If-Match` on the server. Apply the same
-server-side ownership check to erasure creation, status polling, and retry. Never expose
-the orchestrator token in rendered HTML, public JavaScript, `NEXT_PUBLIC_*` variables, or
-browser storage.
+server-side ownership check to workflow-event reads, erasure creation, status polling, and
+retry. Treat event cursors as opaque and relay only the fields the portfolio user is
+authorized to see. Never expose the orchestrator token in rendered HTML, public
+JavaScript, `NEXT_PUBLIC_*` variables, or browser storage.
 
 ## Operational limits
 
 - Readiness checks SQLite, recording storage, the registered erasure keyring, all runtime
   workers, the dedicated erasure worker, and MCP initialization when enabled. It does not
   call OpenAI or perform a side-effecting connector probe.
-- Logs are structured JSON with common sensitive fields redacted. No metrics exporter,
-  distributed tracing pipeline, or audit-event API is included.
+- Logs are structured JSON with common sensitive fields redacted. The authenticated event
+  API is query-only; no live push stream, cross-meeting feed, external audit sink, metrics
+  exporter, or distributed tracing pipeline is included.
 - There is no automated retention policy. Operators must schedule erasure requests and
   separately govern backups and external provider data.
 - SQLite and local recording storage target a single-node deployment. Backups, encryption

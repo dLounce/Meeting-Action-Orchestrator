@@ -23,8 +23,8 @@ multi-tenant identity or authorization system.
 
 Every `/v1/*` route requires the configured static bearer token. The token must contain at
 least 32 UTF-8 bytes. The process stores only its SHA-256 digest in the authenticator and
-uses constant-time digest comparison. `API_ACTOR_SUBJECT` is recorded as the actor for all
-requests using that token.
+uses constant-time digest comparison. `API_ACTOR_SUBJECT` is used as the actor when an
+authenticated command emits workflow history or creates an operation binding.
 
 Health routes and `/openapi.json` are public. The API does not implement user sessions,
 token rotation, scopes, role-based access control, tenant isolation, or rate limiting.
@@ -41,9 +41,10 @@ server-side route, which authenticates the user and injects the orchestrator tok
 private environment variable. Never place the token in public JavaScript, HTML, browser
 storage, source control, or a public environment-variable prefix.
 
-The server-side route must authorize ownership independently for deletion, erasure-status
-polling, and remediation. Possession of the orchestrator bearer token grants access to all
-meetings and erasure jobs in this single-operator deployment.
+The server-side route must authorize ownership independently for meeting and workflow-event
+reads, deletion, erasure-status polling, and remediation. Possession of the orchestrator
+bearer token grants access to all meetings, their event histories, and erasure jobs in this
+single-operator deployment.
 
 ## Erasure key management
 
@@ -131,8 +132,11 @@ connections require HTTPS even without `MCP_AUTH_TOKEN`. URL credentials are not
 Recordings are stored outside the HTTP static surface under unique generated per-upload
 names. The upload directory and files receive restrictive permissions where the operating
 system supports them. SQLite stores transcript text, participant details, reviews,
-approvals, intents, and receipts. SHA-256-based database ownership may reuse an existing
-audio asset; the unselected upload is durably scheduled for identity-verified cleanup.
+approvals, intents, receipts, and meeting-scoped workflow events. Event rows can contain an
+actor subject, content and identity digests, model identifiers, token counts, lifecycle
+statuses, and bounded failure classifications. SHA-256-based database ownership may reuse
+an existing audio asset; the unselected upload is durably scheduled for identity-verified
+cleanup.
 
 The application does not encrypt recordings or SQLite at rest. Use encrypted disks,
 restricted service accounts, private backups, and filesystem access controls in deployment.
@@ -148,6 +152,37 @@ no automated retention policy. The authenticated meeting-erasure API removes one
 on request, but operators must schedule those requests and define backup disposal
 separately.
 
+## Workflow audit boundary
+
+`GET /v1/meetings/{meeting_id}/events` is an authenticated, `no-store`, meeting-scoped
+history read. It returns events in ascending sequence order with a bounded page size and an
+opaque cursor tied to the meeting and last sequence. The cursor checksum detects malformed
+or cross-meeting use; it is not a secret, authorization token, digital signature, or proof
+of an untampered history. The server-side caller must perform its own user-to-meeting
+authorization before exposing an event page.
+
+The API maps each event type to a strict public schema. It does not generically serialize
+domain objects and does not expose transcripts, review prose, prompts, filenames,
+idempotency keys, write-intent IDs, or raw provider request IDs. Raw client and server
+request identifiers are represented only by one aggregate digest; a separate bounded
+`request_count` reports model calls. `safe_metadata` means bounded and allowlisted, not
+anonymous or non-sensitive: actor subjects, recording and review digests, workflow timing,
+model identifiers, and usage counts can still support correlation or disclose operational
+information.
+
+Application code appends an event in the same immediate transaction as the state mutation
+it describes. A rollback removes both, while replayed, stale, rejected, no-op, and lost
+lease paths do not create duplicate history. Per-meeting sequences are contiguous. SQLite
+triggers reject duplicate event IDs, sequence gaps, updates, and direct deletion while the
+parent meeting exists.
+
+This is an application audit trail, not a non-repudiation or compliance ledger. Events are
+not hash-chained, signed, sent to immutable storage, or anchored outside SQLite. A
+privileged database or filesystem operator can replace the file, change the schema, or
+remove the triggers. History predating event emission is not reconstructed. Meeting
+erasure intentionally cascades through the event rows, so the API cannot be used as a
+retained erasure log.
+
 ## Meeting erasure boundary
 
 `DELETE /v1/meetings/{meeting_id}` requires the current meeting ETag and a durable
@@ -160,10 +195,11 @@ An accepted request serializes writes with `BEGIN IMMEDIATE` and atomically remo
 database-known meeting graph, creates HMAC tombstones and idempotency bindings, and
 schedules recording cleanup when the meeting owns the last reference. The graph includes
 the meeting, ingest binding, transcripts, review revisions, approvals, recap artifacts,
-processing state, write intents and receipts, delivery-operation bindings, and
-meeting-control bindings. The retained erasure resource contains bounded status, failure,
-counter, version, and timestamp fields; durable HMAC records do not contain the raw
-meeting, ingest, actor, or request identities.
+processing state, write intents and receipts, workflow events, delivery-operation bindings,
+and meeting-control bindings. The event endpoint returns the generic meeting `404` after
+this cascade. The retained erasure resource contains bounded status, failure, counter,
+version, and timestamp fields; durable HMAC records do not contain the raw meeting, ingest,
+actor, or request identities.
 
 Recording deletion is identity-bound. Before unlinking, the local adapter verifies the
 generated storage key, expected byte size, and full SHA-256. Shared content is retained
@@ -215,9 +251,11 @@ not intentionally log request bodies, transcripts, prompts, recordings, or crede
 Redaction is defense in depth, not a substitute for controlling what is sent to logging
 APIs. Secure the log destination and review new fields before logging them.
 
-No metrics exporter, alerting integration, distributed tracing backend, audit-event API, or
-intrusion detection is bundled. Readiness checks local database and worker state but does
-not validate OpenAI credentials, quota, model availability, or downstream target access.
+An authenticated workflow-event read API is bundled, but no external audit sink, live
+event stream, cross-meeting feed, metrics exporter, alerting integration, distributed
+tracing backend, or intrusion detection is included. Readiness checks local database and
+worker state but does not validate OpenAI credentials, quota, model availability, or
+downstream target access.
 
 ## Operator checklist
 
@@ -227,6 +265,8 @@ not validate OpenAI credentials, quota, model availability, or downstream target
 - Retain every referenced historical erasure key and rotate only during no-write
   maintenance.
 - Keep the API private and expose only a separately authenticated server-side proxy.
+- Authorize meeting ownership before returning workflow-event history, and treat actor
+  subjects and event digests as sensitive operational data.
 - Restrict filesystem permissions and encrypt disks and backups.
 - Use HTTPS and least-privilege credentials for remote MCP access.
 - Verify MCP idempotency and lookup behavior before enabling writes.

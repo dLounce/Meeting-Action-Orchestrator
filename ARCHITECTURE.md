@@ -13,6 +13,7 @@ Portfolio backend or API client
     -> Application use cases
       -> Domain invariants and state transitions
       -> SQLite unit of work
+        -> Workflow state and meeting-scoped event ledger
       -> Private local audio store
       -> OpenAI adapters
     -> In-process runtime supervisor
@@ -30,8 +31,8 @@ current deployment model single-node.
 ## Module boundaries
 
 `domain` contains immutable Pydantic models, lifecycle enums, canonical hashing,
-validation rules, and pure projection logic. It has no framework, provider, transport, or
-database dependency.
+validation rules, workflow-event contracts, and pure projection logic. It has no
+framework, provider, transport, or database dependency.
 
 `agents` contains provider-neutral structured contracts, prompts, specialist definitions,
 and execution budgets. Specialists are tool-less and do not call one another.
@@ -41,13 +42,13 @@ approval, delivery control, outbox execution, recording cleanup, and meeting era
 depends on domain and typed agent contracts, not on FastAPI, SQLite, OpenAI, or MCP
 implementations.
 
-`infrastructure` implements the application ports for SQLite, local audio, OpenAI
-transcription, OpenAI Agents SDK execution, Streamable HTTP MCP, and the guarded MCP
-gateway.
+`infrastructure` implements the application ports for SQLite workflow state and event
+history, local audio, OpenAI transcription, OpenAI Agents SDK execution, Streamable HTTP
+MCP, and the guarded MCP gateway.
 
 `api` owns authentication, request and response schemas, RFC problem mapping, ETags,
-middleware, and routes. Adapters move blocking application and SQLite calls off the event
-loop.
+opaque page cursors, middleware, and routes. Adapters move blocking application and SQLite
+calls off the event loop.
 
 `bootstrap.py` is the composition root. It constructs adapters, use cases, worker loops,
 and API dependencies. `cli.py` exposes database migration, erasure-key verification, and
@@ -85,8 +86,8 @@ ingested
 ```
 
 Transcription and extraction can enter `transcription_failed` or `extraction_failed`.
-Delivery reduction can enter `partially_filed` or `filing_failed`. Cancellation exists in
-the domain before approval but is not exposed by the current HTTP API.
+Delivery reduction can enter `partially_filed` or `filing_failed`. Before approval, the
+processing-control API can cancel eligible queued or retry-waiting work.
 
 ### Durable processing
 
@@ -111,6 +112,41 @@ Each specialist receives one turn and no tools. SDK retries are disabled. Per-ca
 limits and a shared request/output budget bound one semantic run. Agent requests use
 `store=False`, and sensitive trace data is disabled.
 
+## Workflow audit ledger
+
+The application records a meeting-scoped workflow history for ingest, meeting status
+transitions, processing attempts and operator retries, specialist handoffs, review
+revisions and approval, and delivery transitions. Metadata is a strict, versioned scalar
+projection. It uses bounded statuses, counts, failure classifications, model identifiers,
+token usage, and content or identity digests instead of transcript text, review prose,
+prompts, filenames, idempotency keys, write-intent IDs, or raw provider request IDs.
+
+Every event is appended through the same immediate SQLite unit of work as the successful
+workflow mutation it describes. Event insertion and state persistence therefore commit or
+roll back together. Provider calls remain outside database transactions; their result is
+recorded only after the worker proves it still owns the live lease. Rejected or stale
+commands, idempotent replay, and no-op transitions do not append events. After lease loss,
+the stale worker does not append another completion, handoff, or outcome event.
+Operator-initiated events carry the authenticated actor subject, while autonomous worker
+events use a null actor.
+
+Events receive a contiguous sequence within each meeting. SQLite triggers reject duplicate
+event IDs, gaps, updates, and direct deletion while the parent meeting exists. Parent
+deletion deliberately cascades to the event rows so the ledger remains inside the bounded
+meeting-erasure graph. These controls protect normal application and SQL write paths; the
+ledger is not cryptographically chained, signed, externally anchored, or protected from a
+privileged operator who can replace the database or schema. The migration validates any
+existing event sequences but does not reconstruct workflow history that predates event
+emission.
+
+`GET /v1/meetings/{meeting_id}/events` checks meeting existence and reads a page in one
+deferred unit of work. Results are ordered by ascending sequence. The API returns at most
+100 items and probes for one later row before issuing `next_cursor`. Its versioned
+base64url cursor encodes the meeting and last sequence with a checksum, so malformed and
+cross-meeting cursors fail generically. The checksum is not an authorization mechanism or
+signature. HTTP schemas map every event and metadata variant explicitly before returning
+the actor and allowlisted metadata.
+
 ## Meeting erasure
 
 Meeting erasure is an authenticated, idempotent workflow rather than a synchronous file
@@ -129,11 +165,11 @@ ownership, or an inconsistent relational graph. When validation succeeds, one tr
 - creates a durable erasure job, immutable tombstone, and operation binding.
 
 Foreign-key cascades remove transcripts, review revisions, approvals, recap artifacts,
-processing jobs, write intents, receipts, ingest bindings, and meeting-operation records.
-The tombstone prevents the erased ingest identity from recreating the meeting. It stores
-purpose-scoped HMAC-SHA-256 tokens instead of raw meeting, ingest, actor, or request
-identities. The application checks candidates under every configured historical key so
-rotation does not make old tombstones invisible.
+processing jobs, write intents, receipts, workflow events, ingest bindings, and
+meeting-operation records. The tombstone prevents the erased ingest identity from
+recreating the meeting. It stores purpose-scoped HMAC-SHA-256 tokens instead of raw
+meeting, ingest, actor, or request identities. The application checks candidates under
+every configured historical key so rotation does not make old tombstones invisible.
 
 Recording cleanup is asynchronous because SHA-based database ownership can make one
 recording asset serve multiple meetings. The last owner schedules one identity-bound
@@ -243,9 +279,9 @@ durably scheduled for identity-verified abandoned-ingest cleanup; it is not dele
 with ingest failure handling.
 
 SQLite stores transcripts, immutable review revisions, approvals, recap artifacts,
-processing jobs, write intents, receipts, delivery-operation bindings, erasure key
-verifiers, HMAC tombstones, and erasure-operation bindings. It is the business source of
-truth; OpenAI continuation state is not used as workflow state.
+processing jobs, write intents, receipts, workflow events, delivery-operation bindings,
+erasure key verifiers, HMAC tombstones, and erasure-operation bindings. It is the business
+source of truth; OpenAI continuation state is not used as workflow state.
 
 ## HTTP boundary
 
@@ -259,6 +295,10 @@ Request middleware bounds declared and streamed bodies. Domain and application f
 are converted to `application/problem+json`; unknown exceptions receive a generic problem
 without internal detail. Responses include a generated request ID, `no-store`, a restrictive
 content security policy, frame denial, MIME sniffing protection, and related headers.
+
+The event-history route uses the same bearer boundary. It returns only an explicit public
+projection and a meeting-bound opaque cursor in ascending order. It is a query endpoint,
+not a WebSocket, server-sent-event stream, or cross-meeting audit feed.
 
 This boundary is designed for a trusted server-side caller. It does not provide CORS,
 browser sessions, user-level authorization, or tenant isolation.
@@ -278,12 +318,17 @@ cannot prove provider credentials, quota, model availability, or downstream targ
 
 The CLI installs structured JSON logging. Known sensitive field names are redacted and long
 strings are bounded. OpenAI tracing is disabled by default. The repository does not include
-a metrics exporter, distributed tracing backend, log sink, or public audit-event stream.
+a metrics exporter, distributed tracing backend, log sink, external audit sink, or public
+or live audit-event stream.
 
 ## Current limitations
 
 - No frontend is included.
-- No event-stream endpoint is implemented.
+- Workflow-event history is meeting-scoped and pull-based; there is no live stream,
+  cross-meeting feed, or external audit export.
+- Existing meetings and mutations that predate event emission are not backfilled.
+- The SQLite append restrictions are not cryptographic tamper evidence and do not defend
+  against a privileged database or filesystem administrator.
 - No automated retention scheduler or policy is implemented; erasure is requested per
   meeting.
 - Erasure is bounded to the local transaction snapshot and managed recording store; it
