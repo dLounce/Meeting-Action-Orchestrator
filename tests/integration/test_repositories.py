@@ -8,7 +8,12 @@ import pytest
 
 from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.application.state_machine import transition_meeting
-from meeting_action_orchestrator.domain.enums import AudioMediaType, MeetingStatus, ReviewOrigin
+from meeting_action_orchestrator.domain.enums import (
+    AudioMediaType,
+    MeetingStatus,
+    ProviderUsageKind,
+    ReviewOrigin,
+)
 from meeting_action_orchestrator.domain.models import (
     AudioAsset,
     Decision,
@@ -18,6 +23,7 @@ from meeting_action_orchestrator.domain.models import (
     Transcript,
     TranscriptSegment,
 )
+from meeting_action_orchestrator.domain.provider_budget import ProviderUsage
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.repositories import (
     PersistenceConflictError,
@@ -127,6 +133,59 @@ def test_round_trips_meeting_transcript_and_review(tmp_path: Path) -> None:
         assert uow.meetings.get(MEETING_ID) == original_meeting
         assert uow.transcripts.get(TRANSCRIPT_ID) == original_transcript
         assert uow.reviews.get(REVIEW_ID) == original_review
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        ProviderUsage(
+            kind=ProviderUsageKind.TOKENS,
+            input_tokens=120,
+            output_tokens=30,
+        ),
+        ProviderUsage(
+            kind=ProviderUsageKind.DURATION,
+            audio_duration_ms=60_001,
+        ),
+    ],
+)
+def test_round_trips_strict_transcription_usage(
+    tmp_path: Path,
+    usage: ProviderUsage,
+) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+    original = transcript().model_copy(update={"usage": usage})
+
+    with SqliteUnitOfWork(database) as uow:
+        uow.audio_assets.add(asset())
+        uow.meetings.add(meeting())
+        uow.transcripts.add(original)
+        uow.commit()
+
+    with SqliteUnitOfWork(database) as uow:
+        assert uow.transcripts.get(TRANSCRIPT_ID) == original
+
+
+def test_loads_legacy_empty_transcription_usage_as_absent(tmp_path: Path) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+
+    with SqliteUnitOfWork(database) as uow:
+        uow.audio_assets.add(asset())
+        uow.meetings.add(meeting())
+        uow.transcripts.add(transcript())
+        uow.commit()
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE transcripts SET usage_json = '{}' WHERE id = ?",
+            (str(TRANSCRIPT_ID),),
+        )
+
+    with SqliteUnitOfWork(database) as uow:
+        persisted = uow.transcripts.get(TRANSCRIPT_ID)
+    assert persisted is not None
+    assert persisted.usage is None
 
 
 def test_rejects_stale_meeting_update(tmp_path: Path) -> None:

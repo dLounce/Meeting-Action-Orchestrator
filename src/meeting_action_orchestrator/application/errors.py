@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from meeting_action_orchestrator.application.provider_policy import ProviderErrorMetadata
-from meeting_action_orchestrator.domain.enums import FailureCode, FailureDisposition
+from meeting_action_orchestrator.domain.enums import (
+    FailureCode,
+    FailureDisposition,
+    ProviderBudgetDimension,
+)
 
 
 class ApplicationError(RuntimeError):
+    pass
+
+
+class PersistenceIntegrityError(ApplicationError):
     pass
 
 
@@ -80,6 +88,22 @@ class ProviderError(RuntimeError):
 
 class ProviderConfigurationError(ProviderError):
     pass
+
+
+class ProviderBudgetExhaustedError(ApplicationError):
+    def __init__(self, dimension: ProviderBudgetDimension) -> None:
+        self.dimension = dimension
+        super().__init__("The processing job provider budget is exhausted")
+
+
+class ProviderBudgetLeaseLostError(OperationConflictError):
+    def __init__(self) -> None:
+        super().__init__("The processing job lease is no longer current")
+
+
+class ProviderBudgetIntegrityError(ApplicationError):
+    def __init__(self) -> None:
+        super().__init__("Provider budget accounting failed an integrity check")
 
 
 class ProviderInputError(ProviderError):

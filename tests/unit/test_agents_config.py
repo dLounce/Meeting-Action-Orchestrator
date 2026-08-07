@@ -10,12 +10,44 @@ def test_openai_defaults_use_stable_configurable_model_aliases() -> None:
     assert fields["openai_recap_model"].default == "gpt-5.6-terra"
     assert fields["openai_transcription_model"].default == "gpt-4o-transcribe-diarize"
     assert fields["openai_max_retries"].default == 0
+    assert fields["openai_budget_policy_version"].default == 1
+    assert fields["openai_extraction_preflight_request_limit"].default == 6
+    assert fields["openai_extraction_provider_request_limit"].default == 6
+    assert fields["openai_extraction_input_token_limit"].default == 800_000
+    assert fields["openai_extraction_output_token_limit"].default == 24_000
+    assert fields["openai_transcription_provider_request_limit"].default == 3
+    assert fields["openai_transcription_audio_duration_ms_limit"].default == 21_600_000
 
 
 def test_upload_default_matches_transcription_api_boundary() -> None:
     expected_bytes = 25 * 1024 * 1024
 
     assert Settings.model_fields["max_upload_bytes"].default == expected_bytes
+
+
+def test_openai_timeout_fits_within_the_processing_lease() -> None:
+    assert Settings(_env_file=None, openai_timeout_seconds=120).openai_timeout_seconds == 120
+
+    with pytest.raises(ValueError, match="openai_timeout_seconds"):
+        Settings(_env_file=None, openai_timeout_seconds=120.001)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "openai_worker_model",
+        "openai_recap_model",
+        "openai_transcription_model",
+    ],
+)
+def test_openai_model_names_are_normalized_and_bounded(field: str) -> None:
+    settings = Settings(_env_file=None, **{field: "  model-alias  "})
+
+    assert getattr(settings, field) == "model-alias"
+
+    for invalid in ("   ", "m" * 201):
+        with pytest.raises(ValueError, match="OpenAI model names"):
+            Settings(_env_file=None, **{field: invalid})
 
 
 def test_delivery_targets_are_disabled_until_resources_are_configured() -> None:
@@ -53,6 +85,35 @@ def test_run_budget_must_cover_all_specialist_limits() -> None:
             _env_file=None,
             openai_max_output_tokens_per_run=11_999,
         )
+
+
+def test_durable_output_budget_must_cover_one_specialist_run() -> None:
+    with pytest.raises(ValueError, match="durable output budget"):
+        Settings(
+            _env_file=None,
+            openai_extraction_output_token_limit=11_999,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("openai_budget_policy_version", 0),
+        ("openai_extraction_preflight_request_limit", 2),
+        ("openai_extraction_provider_request_limit", 2),
+        ("openai_extraction_input_token_limit", 0),
+        ("openai_transcription_provider_request_limit", 0),
+        ("openai_transcription_audio_duration_ms_limit", 0),
+    ],
+)
+def test_durable_provider_budget_settings_are_bounded(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(_env_file=None, **{field: value})
+
+
+def test_provider_tracing_cannot_bypass_budgeted_transport() -> None:
+    with pytest.raises(ValueError, match="tracing is disabled"):
+        Settings(_env_file=None, openai_tracing_enabled=True)
 
 
 def test_remote_mcp_credentials_require_https() -> None:

@@ -5,6 +5,8 @@ from typing import Generic, Literal, Protocol, TypeVar
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
+from meeting_action_orchestrator.domain.provider_budget import ProviderDispatchContext
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
@@ -244,6 +246,7 @@ class AgentRunContext:
     job_id: str
     stage: Literal["extract", "recap", "verify"]
     budget: AgentBudget
+    dispatch: ProviderDispatchContext | None = None
 
 
 class StructuredAgentRunner(Protocol):

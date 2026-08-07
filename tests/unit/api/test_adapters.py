@@ -343,6 +343,7 @@ def processing_job(meeting_id: UUID = MEETING_ID) -> ProcessingJob:
         max_attempts=3,
         lease_owner="worker-one",
         lease_expires_at=NOW + timedelta(minutes=5),
+        claim_token=UUID(int=7002),
         created_at=NOW,
         updated_at=NOW,
     )

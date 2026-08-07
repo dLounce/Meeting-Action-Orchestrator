@@ -5,8 +5,9 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from types import TracebackType
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from meeting_action_orchestrator.application.errors import PersistenceIntegrityError
 from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.domain.enums import (
     FailureDisposition,
@@ -43,6 +44,14 @@ from meeting_action_orchestrator.domain.models import (
     WriteIntent,
     WriteReceipt,
 )
+from meeting_action_orchestrator.domain.provider_budget import (
+    ProviderBudgetAccount,
+    ProviderBudgetLimits,
+    ProviderBudgetReservation,
+    ProviderBudgetSettlement,
+    ProviderBudgetUsage,
+    ProviderUsage,
+)
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.workflow_events import (
     SqliteWorkflowEventRepository,
@@ -53,21 +62,17 @@ class PersistenceConflictError(RuntimeError):
     pass
 
 
-class PersistenceIntegrityError(RuntimeError):
-    pass
-
-
 def _as_text(value: object | None) -> str | None:
     if value is None:
         return None
     return str(value)
 
 
-def _as_erasure_datetime(value: datetime | None) -> str | None:
+def _as_utc_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("Meeting erasure timestamps must be timezone-aware")
+        raise ValueError("Persisted timestamps must be timezone-aware")
     return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
@@ -98,7 +103,7 @@ def _erasure_failure_values(
     return (
         failure.code.value,
         failure.disposition.value,
-        _as_erasure_datetime(failure.occurred_at),
+        _as_utc_datetime(failure.occurred_at),
     )
 
 
@@ -586,7 +591,7 @@ class SqliteErasureKeyVerifierRepository:
                 verifier.key_id,
                 verifier.verifier_version,
                 verifier.verifier_digest,
-                _as_erasure_datetime(verifier.created_at),
+                _as_utc_datetime(verifier.created_at),
             ),
         )
 
@@ -709,7 +714,7 @@ class SqliteMeetingErasureRepository:
         cleanup_job_id: UUID,
         now: datetime,
     ) -> Sequence[MeetingErasureJob]:
-        normalized_now = _as_erasure_datetime(now)
+        normalized_now = _as_utc_datetime(now)
         self._connection.execute("SAVEPOINT meeting_erasure_group_remediation")
         try:
             cleanup_row = self._connection.execute(
@@ -822,8 +827,8 @@ class SqliteMeetingErasureRepository:
             raise ValueError("Lease expiry must follow the claim time")
         if limit <= 0:
             return ()
-        normalized_now = _as_erasure_datetime(now)
-        normalized_lease_until = _as_erasure_datetime(lease_until)
+        normalized_now = _as_utc_datetime(now)
+        normalized_lease_until = _as_utc_datetime(lease_until)
         rows = self._connection.execute(
             """
             SELECT id, version, lease_owner, lease_expires_at
@@ -1010,20 +1015,20 @@ class SqliteMeetingErasureRepository:
                 job.recording_state.value,
                 _as_text(job.pending_audio_asset_id),
                 _as_text(job.cleanup_job_id),
-                _as_erasure_datetime(job.database_checkpointed_at),
+                _as_utc_datetime(job.database_checkpointed_at),
                 job.retry_count,
-                _as_erasure_datetime(job.next_attempt_at),
+                _as_utc_datetime(job.next_attempt_at),
                 job.lease_owner,
-                _as_erasure_datetime(job.lease_expires_at),
+                _as_utc_datetime(job.lease_expires_at),
                 *failure,
                 job.remediation_count,
                 job.version,
-                _as_erasure_datetime(job.updated_at),
-                _as_erasure_datetime(job.completed_at),
+                _as_utc_datetime(job.updated_at),
+                _as_utc_datetime(job.completed_at),
                 str(job.id),
                 expected_version,
                 expected_lease_owner,
-                _as_erasure_datetime(expected_lease_expires_at),
+                _as_utc_datetime(expected_lease_expires_at),
             ),
         )
         if cursor.rowcount != 1:
@@ -1043,18 +1048,18 @@ class SqliteMeetingErasureRepository:
             job.recording_state.value,
             _as_text(job.pending_audio_asset_id),
             _as_text(job.cleanup_job_id),
-            _as_erasure_datetime(job.database_checkpointed_at),
+            _as_utc_datetime(job.database_checkpointed_at),
             job.retry_count,
-            _as_erasure_datetime(job.next_attempt_at),
+            _as_utc_datetime(job.next_attempt_at),
             job.lease_owner,
-            _as_erasure_datetime(job.lease_expires_at),
+            _as_utc_datetime(job.lease_expires_at),
             *failure,
             job.remediation_count,
             job.max_remediations,
             job.version,
-            _as_erasure_datetime(job.created_at),
-            _as_erasure_datetime(job.updated_at),
-            _as_erasure_datetime(job.completed_at),
+            _as_utc_datetime(job.created_at),
+            _as_utc_datetime(job.updated_at),
+            _as_utc_datetime(job.completed_at),
         )
 
     @staticmethod
@@ -1110,7 +1115,7 @@ class SqliteMeetingErasureOperationRepository:
                 binding.operation.value,
                 binding.expected_version,
                 binding.request_fingerprint,
-                _as_erasure_datetime(binding.created_at),
+                _as_utc_datetime(binding.created_at),
             ),
         )
 
@@ -1169,7 +1174,7 @@ class SqliteMeetingErasureTombstoneRepository:
                 tombstone.token_key_id,
                 tombstone.meeting_token,
                 tombstone.ingest_key_token,
-                _as_erasure_datetime(tombstone.erased_at),
+                _as_utc_datetime(tombstone.erased_at),
             ),
         )
 
@@ -1468,7 +1473,7 @@ class SqliteTranscriptRepository:
                 transcript.text,
                 transcript.sha256,
                 transcript.provider_request_id,
-                "{}",
+                _as_json(transcript.usage) if transcript.usage is not None else "{}",
                 str(transcript.created_at),
             ),
         )
@@ -1503,6 +1508,7 @@ class SqliteTranscriptRepository:
                 "text": row["text"],
                 "sha256": row["sha256"],
                 "provider_request_id": row["provider_request_id"],
+                "usage": _load_json(row["usage_json"]) or None,
                 "created_at": row["created_at"],
             }
         )
@@ -1820,9 +1826,9 @@ class SqliteProcessingJobRepository:
             """
             INSERT INTO processing_jobs (
                 id, meeting_id, stage, status, attempt_count, max_attempts,
-                next_attempt_at, lease_owner, lease_expires_at, last_failure_json,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                next_attempt_at, lease_owner, lease_expires_at, claim_token,
+                last_failure_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             self._values(job),
         )
@@ -1865,15 +1871,16 @@ class SqliteProcessingJobRepository:
         rows = self._connection.execute(
             """
             SELECT * FROM processing_jobs
-            WHERE stage = ? AND status = ? AND lease_expires_at <= ?
+            WHERE stage = ? AND status = ?
+                AND julianday(lease_expires_at) <= julianday(?)
                 AND attempt_count >= max_attempts
-            ORDER BY lease_expires_at, created_at, id
+            ORDER BY julianday(lease_expires_at), julianday(created_at), id
             LIMIT ?
             """,
             (
                 stage.value,
                 ProcessingJobStatus.RUNNING.value,
-                str(now),
+                _as_utc_datetime(now),
                 limit,
             ),
         ).fetchall()
@@ -1889,24 +1896,32 @@ class SqliteProcessingJobRepository:
     ) -> Sequence[ProcessingJob]:
         if limit <= 0:
             return ()
+        normalized_worker_id = worker_id.strip()
+        if not normalized_worker_id or len(normalized_worker_id) > 200:
+            raise ValueError("Worker ID is invalid")
+        normalized_now = _as_utc_datetime(now)
+        normalized_lease_until = _as_utc_datetime(lease_until)
+        if lease_until <= now:
+            raise ValueError("Processing lease expiry must be after its claim time")
         rows = self._connection.execute(
             """
             SELECT id FROM processing_jobs
             WHERE stage = ? AND attempt_count < max_attempts AND (
                 status = ? OR
-                (status = ? AND next_attempt_at <= ?) OR
-                (status = ? AND lease_expires_at <= ?)
+                (status = ? AND julianday(next_attempt_at) <= julianday(?)) OR
+                (status = ? AND julianday(lease_expires_at) <= julianday(?))
             )
-            ORDER BY COALESCE(next_attempt_at, created_at), created_at, id
+            ORDER BY COALESCE(julianday(next_attempt_at), julianday(created_at)),
+                julianday(created_at), id
             LIMIT ?
             """,
             (
                 stage.value,
                 ProcessingJobStatus.READY.value,
                 ProcessingJobStatus.RETRY_WAIT.value,
-                str(now),
+                normalized_now,
                 ProcessingJobStatus.RUNNING.value,
-                str(now),
+                normalized_now,
                 limit,
             ),
         ).fetchall()
@@ -1916,14 +1931,15 @@ class SqliteProcessingJobRepository:
                 """
                 UPDATE processing_jobs SET status = ?, attempt_count = attempt_count + 1,
                     next_attempt_at = NULL, lease_owner = ?, lease_expires_at = ?,
-                    last_failure_json = NULL, updated_at = ?
+                    claim_token = ?, last_failure_json = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (
                     ProcessingJobStatus.RUNNING.value,
-                    worker_id,
-                    str(lease_until),
-                    str(now),
+                    normalized_worker_id,
+                    normalized_lease_until,
+                    str(uuid4()),
+                    normalized_now,
                     row["id"],
                 ),
             )
@@ -1938,22 +1954,25 @@ class SqliteProcessingJobRepository:
         expected_status: ProcessingJobStatus,
         expected_lease_owner: str | None,
         expected_lease_expires_at: datetime | None,
+        expected_claim_token: UUID | None,
     ) -> None:
         values = self._values(job)
         cursor = self._connection.execute(
             """
             UPDATE processing_jobs SET meeting_id = ?, stage = ?, status = ?,
                 attempt_count = ?, max_attempts = ?, next_attempt_at = ?,
-                lease_owner = ?, lease_expires_at = ?, last_failure_json = ?,
-                created_at = ?, updated_at = ?
+                lease_owner = ?, lease_expires_at = ?, claim_token = ?,
+                last_failure_json = ?, created_at = ?, updated_at = ?
             WHERE id = ? AND status = ? AND lease_owner IS ? AND lease_expires_at IS ?
+                AND claim_token IS ?
             """,
             (
                 *values[1:],
                 values[0],
                 expected_status.value,
                 expected_lease_owner,
-                _as_text(expected_lease_expires_at),
+                _as_utc_datetime(expected_lease_expires_at),
+                _as_text(expected_claim_token),
             ),
         )
         if cursor.rowcount != 1:
@@ -1968,12 +1987,13 @@ class SqliteProcessingJobRepository:
             job.status.value,
             job.attempt_count,
             job.max_attempts,
-            _as_text(job.next_attempt_at),
+            _as_utc_datetime(job.next_attempt_at),
             job.lease_owner,
-            _as_text(job.lease_expires_at),
+            _as_utc_datetime(job.lease_expires_at),
+            _as_text(job.claim_token),
             _as_json(job.last_failure) if job.last_failure is not None else None,
-            str(job.created_at),
-            str(job.updated_at),
+            _as_utc_datetime(job.created_at),
+            _as_utc_datetime(job.updated_at),
         )
 
     @staticmethod
@@ -1989,11 +2009,268 @@ class SqliteProcessingJobRepository:
                 "next_attempt_at": row["next_attempt_at"],
                 "lease_owner": row["lease_owner"],
                 "lease_expires_at": row["lease_expires_at"],
+                "claim_token": row["claim_token"],
                 "last_failure": _load_json(row["last_failure_json"]),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
         )
+
+
+class SqliteProviderBudgetAccountRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, account: ProviderBudgetAccount) -> None:
+        limits = account.limits
+        self._connection.execute(
+            """
+            INSERT INTO provider_budget_accounts (
+                processing_job_id, stage, policy_version, legacy_locked,
+                preflight_request_limit,
+                provider_request_limit, input_token_limit, output_token_limit,
+                audio_duration_ms_limit, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(account.processing_job_id),
+                account.stage.value,
+                account.policy_version,
+                int(account.legacy_locked),
+                limits.preflight_request_limit,
+                limits.provider_request_limit,
+                limits.input_token_limit,
+                limits.output_token_limit,
+                limits.audio_duration_ms_limit,
+                _as_utc_datetime(account.created_at),
+            ),
+        )
+
+    def get(self, processing_job_id: UUID) -> ProviderBudgetAccount | None:
+        row = self._connection.execute(
+            "SELECT * FROM provider_budget_accounts WHERE processing_job_id = ?",
+            (str(processing_job_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        invalid = False
+        try:
+            account = ProviderBudgetAccount(
+                processing_job_id=row["processing_job_id"],
+                stage=row["stage"],
+                policy_version=row["policy_version"],
+                legacy_locked=bool(row["legacy_locked"]),
+                limits=ProviderBudgetLimits(
+                    preflight_request_limit=row["preflight_request_limit"],
+                    provider_request_limit=row["provider_request_limit"],
+                    input_token_limit=row["input_token_limit"],
+                    output_token_limit=row["output_token_limit"],
+                    audio_duration_ms_limit=row["audio_duration_ms_limit"],
+                ),
+                created_at=row["created_at"],
+            )
+        except (TypeError, ValueError):
+            invalid = True
+        if invalid:
+            raise PersistenceIntegrityError(
+                "Persisted provider budget state failed validation"
+            ) from None
+        return account
+
+
+class SqliteProviderBudgetReservationRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, reservation: ProviderBudgetReservation) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO provider_budget_reservations (
+                id, processing_job_id, sequence, attempt_number, claim_token,
+                dispatch_digest, operation_digest, request_fingerprint, operation, role, model,
+                reserved_input_tokens, reserved_output_tokens,
+                reserved_audio_duration_ms, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(reservation.id),
+                str(reservation.processing_job_id),
+                reservation.sequence,
+                reservation.attempt_number,
+                str(reservation.claim_token),
+                reservation.dispatch_digest,
+                reservation.operation_digest,
+                reservation.request_fingerprint,
+                reservation.operation.value,
+                reservation.role.value,
+                reservation.model,
+                reservation.reserved_input_tokens,
+                reservation.reserved_output_tokens,
+                reservation.reserved_audio_duration_ms,
+                _as_utc_datetime(reservation.created_at),
+            ),
+        )
+
+    def get(self, reservation_id: UUID) -> ProviderBudgetReservation | None:
+        row = self._connection.execute(
+            "SELECT * FROM provider_budget_reservations WHERE id = ?",
+            (str(reservation_id),),
+        ).fetchone()
+        return self._from_row(row)
+
+    def find_by_dispatch_digest(
+        self,
+        dispatch_digest: str,
+    ) -> ProviderBudgetReservation | None:
+        row = self._connection.execute(
+            "SELECT * FROM provider_budget_reservations WHERE dispatch_digest = ?",
+            (dispatch_digest,),
+        ).fetchone()
+        return self._from_row(row)
+
+    def next_sequence(self, processing_job_id: UUID) -> int:
+        row = self._connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+            FROM provider_budget_reservations WHERE processing_job_id = ?
+            """,
+            (str(processing_job_id),),
+        ).fetchone()
+        return int(row["next_sequence"])
+
+    def list_for_job(
+        self,
+        processing_job_id: UUID,
+    ) -> Sequence[ProviderBudgetReservation]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM provider_budget_reservations
+            WHERE processing_job_id = ? ORDER BY sequence
+            """,
+            (str(processing_job_id),),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows if row is not None)
+
+    def usage_for_job(self, processing_job_id: UUID) -> ProviderBudgetUsage:
+        row = self._connection.execute(
+            """
+            SELECT
+                COALESCE(SUM(
+                    reservation.operation = 'responses_input_token_count'
+                ), 0) AS preflight_requests,
+                COALESCE(SUM(
+                    reservation.operation IN ('responses_create', 'transcription_create')
+                ), 0) AS provider_requests,
+                COALESCE(SUM(CASE
+                    WHEN settlement.outcome = 'succeeded'
+                        AND settlement.usage_kind = 'tokens'
+                    THEN settlement.actual_input_tokens
+                    ELSE reservation.reserved_input_tokens
+                END), 0) AS input_tokens,
+                COALESCE(SUM(CASE
+                    WHEN settlement.outcome = 'succeeded'
+                        AND settlement.usage_kind = 'tokens'
+                    THEN settlement.actual_output_tokens
+                    ELSE reservation.reserved_output_tokens
+                END), 0) AS output_tokens,
+                COALESCE(SUM(CASE
+                    WHEN settlement.outcome = 'succeeded'
+                        AND settlement.usage_kind = 'duration'
+                    THEN settlement.actual_audio_duration_ms
+                    ELSE reservation.reserved_audio_duration_ms
+                END), 0) AS audio_duration_ms
+            FROM provider_budget_reservations reservation
+            LEFT JOIN provider_budget_settlements settlement
+                ON settlement.reservation_id = reservation.id
+            WHERE reservation.processing_job_id = ?
+            """,
+            (str(processing_job_id),),
+        ).fetchone()
+        invalid = False
+        try:
+            usage = ProviderBudgetUsage(
+                processing_job_id=processing_job_id,
+                preflight_requests=int(row["preflight_requests"]),
+                provider_requests=int(row["provider_requests"]),
+                input_tokens=int(row["input_tokens"]),
+                output_tokens=int(row["output_tokens"]),
+                audio_duration_ms=int(row["audio_duration_ms"]),
+            )
+        except (TypeError, ValueError):
+            invalid = True
+        if invalid:
+            raise PersistenceIntegrityError(
+                "Persisted provider budget state failed validation"
+            ) from None
+        return usage
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row | None) -> ProviderBudgetReservation | None:
+        if row is None:
+            return None
+        invalid = False
+        try:
+            reservation = ProviderBudgetReservation.model_validate(dict(row))
+        except (TypeError, ValueError):
+            invalid = True
+        if invalid:
+            raise PersistenceIntegrityError(
+                "Persisted provider budget state failed validation"
+            ) from None
+        return reservation
+
+
+class SqliteProviderBudgetSettlementRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, settlement: ProviderBudgetSettlement) -> None:
+        usage = settlement.usage
+        self._connection.execute(
+            """
+            INSERT INTO provider_budget_settlements (
+                reservation_id, outcome, usage_kind, actual_input_tokens,
+                actual_output_tokens, actual_audio_duration_ms, settled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(settlement.reservation_id),
+                settlement.outcome.value,
+                usage.kind.value,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.audio_duration_ms,
+                _as_utc_datetime(settlement.settled_at),
+            ),
+        )
+
+    def get(self, reservation_id: UUID) -> ProviderBudgetSettlement | None:
+        row = self._connection.execute(
+            "SELECT * FROM provider_budget_settlements WHERE reservation_id = ?",
+            (str(reservation_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        invalid = False
+        try:
+            settlement = ProviderBudgetSettlement(
+                reservation_id=row["reservation_id"],
+                outcome=row["outcome"],
+                usage=ProviderUsage(
+                    kind=row["usage_kind"],
+                    input_tokens=row["actual_input_tokens"],
+                    output_tokens=row["actual_output_tokens"],
+                    audio_duration_ms=row["actual_audio_duration_ms"],
+                ),
+                settled_at=row["settled_at"],
+            )
+        except (TypeError, ValueError):
+            invalid = True
+        if invalid:
+            raise PersistenceIntegrityError(
+                "Persisted provider budget state failed validation"
+            ) from None
+        return settlement
 
 
 class SqliteWriteIntentRepository:
@@ -2386,6 +2663,9 @@ class SqliteUnitOfWork:
         self.delivery_operations: SqliteDeliveryOperationRepository
         self.meeting_operations: SqliteMeetingOperationRepository
         self.processing_jobs: SqliteProcessingJobRepository
+        self.provider_budget_accounts: SqliteProviderBudgetAccountRepository
+        self.provider_budget_reservations: SqliteProviderBudgetReservationRepository
+        self.provider_budget_settlements: SqliteProviderBudgetSettlementRepository
         self.write_intents: SqliteWriteIntentRepository
         self.write_receipts: SqliteWriteReceiptRepository
         self.workflow_events: SqliteWorkflowEventRepository
@@ -2411,6 +2691,9 @@ class SqliteUnitOfWork:
         self.delivery_operations = SqliteDeliveryOperationRepository(connection)
         self.meeting_operations = SqliteMeetingOperationRepository(connection)
         self.processing_jobs = SqliteProcessingJobRepository(connection)
+        self.provider_budget_accounts = SqliteProviderBudgetAccountRepository(connection)
+        self.provider_budget_reservations = SqliteProviderBudgetReservationRepository(connection)
+        self.provider_budget_settlements = SqliteProviderBudgetSettlementRepository(connection)
         self.write_intents = SqliteWriteIntentRepository(connection)
         self.write_receipts = SqliteWriteReceiptRepository(connection)
         self.workflow_events = SqliteWorkflowEventRepository(

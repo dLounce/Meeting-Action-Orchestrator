@@ -32,6 +32,7 @@ from meeting_action_orchestrator.application.errors import (
     StaleWorkflowVersionError,
 )
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
+from meeting_action_orchestrator.application.ports import TranscriptionRunContext
 from meeting_action_orchestrator.application.processing import (
     FullJitterRetryScheduler,
     ProcessingWorker,
@@ -42,6 +43,7 @@ from meeting_action_orchestrator.application.workflow import IngestMeeting, Meet
 from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
     ProcessingStage,
+    ProviderUsageKind,
     RecordingCleanupReason,
     ReviewOrigin,
     WriteKind,
@@ -55,13 +57,13 @@ from meeting_action_orchestrator.domain.models import (
     PersonRef,
     RecordingCleanupJob,
 )
+from meeting_action_orchestrator.domain.provider_budget import ProviderUsage
 from meeting_action_orchestrator.infrastructure.audio import AudioMetadata, StoredAudio
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.erasure_tokens import ErasureTokenKeyring
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     TranscriptionOutput,
     TranscriptionSegment,
-    TranscriptionUsage,
 )
 from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOfWork
 
@@ -152,9 +154,13 @@ class FakeTranscriber:
         self,
         audio_path: Path,
         language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
     ) -> TranscriptionOutput:
         assert audio_path.suffix == ".wav"
         assert language is None
+        assert context.audio_size_bytes > 0
+        assert context.audio_duration_ms > 0
         text = "Mira approved the release plan. Dev will publish the brief by 2026-08-14."
         return TranscriptionOutput(
             model="transcribe-test",
@@ -171,7 +177,7 @@ class FakeTranscriber:
                     text=text,
                 ),
             ),
-            usage=TranscriptionUsage(seconds=4.0),
+            usage=ProviderUsage(kind=ProviderUsageKind.DURATION, audio_duration_ms=4000),
         )
 
 
@@ -182,6 +188,7 @@ class FakeSpecialists:
         context: AgentRunContext,
     ) -> AgentResult[MeetingExtraction]:
         assert context.stage == "extract"
+        assert context.dispatch is not None
         segment_id = request.transcript.segments[0].id
         output = MeetingExtraction(
             suggested_title="Release planning",
@@ -229,6 +236,7 @@ class FakeSpecialists:
         context: AgentRunContext,
     ) -> AgentResult[RecapDraft]:
         assert context.stage == "recap"
+        assert context.dispatch is not None
         assert request.record.title == "Release planning"
         return result(
             RecapDraft(
@@ -244,6 +252,7 @@ class FakeSpecialists:
         context: AgentRunContext,
     ) -> AgentResult[VerificationReport]:
         assert context.stage == "verify"
+        assert context.dispatch is not None
         assert request.record.items
         return result(VerificationReport(verdict="pass", findings=[]))
 

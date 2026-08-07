@@ -1,3 +1,4 @@
+import errno
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -7,6 +8,7 @@ import httpx
 import pytest
 
 from meeting_action_orchestrator.application.errors import (
+    AudioAssetIdentityMismatchError,
     ProviderConfigurationError,
     ProviderInputError,
     ProviderOutputError,
@@ -15,6 +17,8 @@ from meeting_action_orchestrator.application.errors import (
     ProviderTimeoutError,
     ProviderTransientError,
 )
+from meeting_action_orchestrator.domain.enums import ProviderOperation, ProviderUsageKind
+from meeting_action_orchestrator.domain.hashing import canonical_sha256
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriber,
     OpenAITranscriptionConfigurationError,
@@ -25,6 +29,7 @@ from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriptionTimeoutError,
     OpenAITranscriptionTransientError,
 )
+from tests.provider_budget_support import FakeBudgetController, transcription_context
 
 
 class FakeTranscriptions:
@@ -34,6 +39,11 @@ class FakeTranscriptions:
 
     async def create(self, **arguments: Any) -> object:
         self.calls.append(arguments)
+        if isinstance(self.response, dict) and "usage" not in self.response:
+            return {
+                **self.response,
+                "usage": {"type": "duration", "seconds": 1.0},
+            }
         return self.response
 
 
@@ -128,6 +138,7 @@ def configured_transcriber() -> OpenAITranscriber:
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=FakeClient({}),
     )
     transcriber._openai = SimpleNamespace(
@@ -162,6 +173,7 @@ async def _assert_diarized_output_rejected(tmp_path: Path, segments: object) -> 
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe-diarize",
+        budget_controller=FakeBudgetController(),
         client=FakeClient({"text": "Ship it", "segments": segments}),
     )
 
@@ -169,7 +181,7 @@ async def _assert_diarized_output_rejected(tmp_path: Path, segments: object) -> 
         OpenAITranscriptionOutputError,
         match=r"^OpenAI transcription failed with invalid_output$",
     ):
-        await transcriber.transcribe(audio_path)
+        await transcriber.transcribe(audio_path, context=transcription_context(audio_path))
 
 
 def test_transcriber_rejects_hidden_sdk_retries() -> None:
@@ -177,8 +189,32 @@ def test_transcriber_rejects_hidden_sdk_retries() -> None:
         OpenAITranscriber(
             api_key="test",
             model="gpt-4o-transcribe",
+            budget_controller=FakeBudgetController(),
             max_retries=1,
         )
+
+
+@pytest.mark.parametrize("model", ["", " ", "g" * 201])
+def test_transcriber_rejects_invalid_model(model: str) -> None:
+    with pytest.raises(OpenAITranscriptionConfigurationError) as captured:
+        OpenAITranscriber(
+            api_key="test",
+            model=model,
+            budget_controller=FakeBudgetController(),
+        )
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_transcriber_normalizes_model_name() -> None:
+    transcriber = OpenAITranscriber(
+        api_key="test",
+        model=" gpt-4o-transcribe ",
+        budget_controller=FakeBudgetController(),
+    )
+
+    assert transcriber._model == "gpt-4o-transcribe"
 
 
 def test_transcription_errors_implement_provider_failure_contracts() -> None:
@@ -200,7 +236,11 @@ async def test_transcriber_closes_and_recreates_its_owned_client() -> None:
     def create_client(**_arguments: object) -> FakeClient:
         return next(clients)
 
-    transcriber = OpenAITranscriber(api_key="test", model="gpt-4o-transcribe")
+    transcriber = OpenAITranscriber(
+        api_key="test",
+        model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
+    )
     transcriber._openai = SimpleNamespace(AsyncOpenAI=create_client)
 
     assert transcriber._get_client() is first
@@ -217,6 +257,7 @@ async def test_transcriber_does_not_close_an_injected_client() -> None:
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
 
@@ -250,7 +291,12 @@ async def test_diarized_transcription_maps_speaker_segments(tmp_path: Path) -> N
                         "text": "We will ship it.",
                     }
                 ],
-                "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": total_tokens},
+                "usage": {
+                    "type": "tokens",
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": total_tokens,
+                },
             },
             request_id,
         )
@@ -258,10 +304,15 @@ async def test_diarized_transcription_maps_speaker_segments(tmp_path: Path) -> N
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe-diarize",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
 
-    result = await transcriber.transcribe(audio_path, language="en")
+    result = await transcriber.transcribe(
+        audio_path,
+        language="en",
+        context=transcription_context(audio_path),
+    )
 
     call = client.transcriptions.calls[0]
     assert call["model"] == "gpt-4o-transcribe-diarize"
@@ -276,7 +327,10 @@ async def test_diarized_transcription_maps_speaker_segments(tmp_path: Path) -> N
     assert result.segments[0].start_ms == round(start_seconds * 1000)
     assert result.segments[0].end_ms == round(end_seconds * 1000)
     assert result.segments[0].speaker == "A"
-    assert result.usage.total_tokens == total_tokens
+    assert result.usage is not None
+    assert result.usage.kind is ProviderUsageKind.TOKENS
+    assert result.usage.input_tokens == 10
+    assert result.usage.output_tokens == total_tokens - 10
 
 
 @pytest.mark.asyncio
@@ -297,10 +351,14 @@ async def test_diarized_transcription_accepts_ordered_zero_length_segments(
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe-diarize",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
 
-    result = await transcriber.transcribe(audio_path)
+    result = await transcriber.transcribe(
+        audio_path,
+        context=transcription_context(audio_path),
+    )
 
     assert [(segment.start_ms, segment.end_ms) for segment in result.segments] == [
         (0, 0),
@@ -413,21 +471,29 @@ async def test_plain_transcription_builds_fallback_segment(tmp_path: Path) -> No
     usage_seconds = 3.0
     audio_path = tmp_path / "meeting.wav"
     audio_path.write_bytes(b"audio")
-    client = FakeClient({"text": "Ship it", "usage": {"seconds": usage_seconds}})
+    client = FakeClient(
+        {"text": "Ship it", "usage": {"type": "duration", "seconds": usage_seconds}}
+    )
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
 
-    result = await transcriber.transcribe(audio_path)
+    result = await transcriber.transcribe(
+        audio_path,
+        context=transcription_context(audio_path),
+    )
 
     call = client.transcriptions.calls[0]
     assert call["response_format"] == "json"
     assert "chunking_strategy" not in call
     assert result.segments[0].id == "segment_0001"
     assert result.segments[0].text == "Ship it"
-    assert result.usage.seconds == usage_seconds
+    assert result.usage is not None
+    assert result.usage.kind is ProviderUsageKind.DURATION
+    assert result.usage.audio_duration_ms == round(usage_seconds * 1000)
 
 
 @pytest.mark.asyncio
@@ -438,11 +504,13 @@ async def test_transcriber_sends_a_unique_client_request_id_per_call(tmp_path: P
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
 
-    first = await transcriber.transcribe(audio_path)
-    second = await transcriber.transcribe(audio_path)
+    context = transcription_context(audio_path)
+    first = await transcriber.transcribe(audio_path, context=context)
+    second = await transcriber.transcribe(audio_path, context=context)
 
     client_request_ids = tuple(
         call["extra_headers"]["X-Client-Request-Id"] for call in client.transcriptions.calls
@@ -460,11 +528,12 @@ async def test_transcription_rejects_empty_provider_output(tmp_path: Path) -> No
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=FakeClient({"text": ""}),
     )
 
     with pytest.raises(OpenAITranscriptionOutputError):
-        await transcriber.transcribe(audio_path)
+        await transcriber.transcribe(audio_path, context=transcription_context(audio_path))
 
 
 @pytest.mark.asyncio
@@ -472,11 +541,13 @@ async def test_transcription_rejects_missing_audio_file(tmp_path: Path) -> None:
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=FakeClient({}),
     )
 
-    with pytest.raises(OpenAITranscriptionInputError):
-        await transcriber.transcribe(tmp_path / "missing.mp3")
+    missing = tmp_path / "missing.mp3"
+    with pytest.raises(AudioAssetIdentityMismatchError):
+        await transcriber.transcribe(missing, context=transcription_context(missing))
 
 
 @pytest.mark.parametrize(
@@ -598,11 +669,12 @@ async def test_injected_transcriber_classifies_statusless_timeout(
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
 
     with pytest.raises(OpenAITranscriptionTimeoutError) as captured:
-        await transcriber.transcribe(audio_path)
+        await transcriber.transcribe(audio_path, context=transcription_context(audio_path))
 
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
@@ -623,7 +695,11 @@ def test_transcriber_detaches_sdk_import_error_context(
         "meeting_action_orchestrator.infrastructure.openai_transcription.import_module",
         fail_import,
     )
-    transcriber = OpenAITranscriber(api_key="test", model="gpt-4o-transcribe")
+    transcriber = OpenAITranscriber(
+        api_key="test",
+        model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
+    )
 
     with pytest.raises(OpenAITranscriptionConfigurationError) as captured:
         transcriber._get_client()
@@ -654,12 +730,13 @@ async def test_transcriber_raises_sanitized_error_without_raw_exception_context(
     transcriber = OpenAITranscriber(
         api_key="",
         model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
         client=client,
     )
     transcriber._openai = configured_transcriber()._openai
 
     with pytest.raises(OpenAITranscriptionTransientError) as captured:
-        await transcriber.transcribe(audio_path)
+        await transcriber.transcribe(audio_path, context=transcription_context(audio_path))
 
     error = captured.value
     assert error.request_id == "req_transcription_2"
@@ -669,3 +746,277 @@ async def test_transcriber_raises_sanitized_error_without_raw_exception_context(
     assert "private transcription provider detail" not in str(error)
     client_request_id = failing.calls[0]["extra_headers"]["X-Client-Request-Id"]
     assert error.request_id != client_request_id
+
+
+@pytest.mark.asyncio
+async def test_transcriber_reserves_exact_verified_audio_before_mock_transport(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"x-request-id": "req_transcription_budgeted"},
+            json={
+                "text": "Ship it",
+                "usage": {"type": "duration", "seconds": 1.2501},
+            },
+        )
+
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"verified audio")
+    context = transcription_context(audio_path, audio_duration_ms=2500)
+    controller = FakeBudgetController()
+    transcriber = OpenAITranscriber(
+        api_key="test",
+        model="gpt-4o-transcribe",
+        budget_controller=controller,
+        http_transport=httpx.MockTransport(handler),
+    )
+
+    result = await transcriber.transcribe(audio_path, language="en", context=context)
+    http_client = transcriber._http_client
+    await transcriber.close()
+
+    assert http_client is not None
+    assert http_client.follow_redirects is False
+    assert len(requests) == 1
+    assert len(controller.reservations) == 1
+    reserved_context, reservation = controller.reservations[0]
+    assert reserved_context == context.dispatch
+    assert reservation.operation is ProviderOperation.TRANSCRIPTION_CREATE
+    assert reservation.dispatch_key == requests[0].headers["X-Client-Request-Id"]
+    assert reservation.reserved_audio_duration_ms == context.audio_duration_ms
+    assert reservation.operation_digest == canonical_sha256(
+        {
+            "audio": {
+                "duration_ms": context.audio_duration_ms,
+                "sha256": context.audio_sha256,
+                "size_bytes": context.audio_size_bytes,
+            },
+            "request": {
+                "language": "en",
+                "model": "gpt-4o-transcribe",
+                "response_format": "json",
+                "temperature": 0,
+            },
+        }
+    )
+    assert result.usage is not None
+    assert result.usage.kind is ProviderUsageKind.DURATION
+    assert result.usage.audio_duration_ms == 1251
+    assert controller.settlements[0][2] == result.usage
+
+
+@pytest.mark.asyncio
+async def test_transcriber_settles_usage_before_rejecting_output(tmp_path: Path) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    controller = FakeBudgetController()
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        budget_controller=controller,
+        client=FakeClient(
+            {
+                "text": "",
+                "usage": {
+                    "type": "tokens",
+                    "input_tokens": 8,
+                    "output_tokens": 3,
+                    "total_tokens": 11,
+                },
+            }
+        ),
+    )
+
+    with pytest.raises(OpenAITranscriptionOutputError):
+        await transcriber.transcribe(
+            audio_path,
+            context=transcription_context(audio_path),
+        )
+
+    assert len(controller.reservations) == 1
+    assert len(controller.settlements) == 1
+    assert controller.settlements[0][2].input_tokens == 8
+    assert controller.settlements[0][2].output_tokens == 3
+
+
+@pytest.mark.asyncio
+async def test_transcriber_rejects_changed_audio_before_reservation(tmp_path: Path) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    context = transcription_context(audio_path)
+    audio_path.write_bytes(b"other")
+    controller = FakeBudgetController()
+    client = FakeClient({"text": "Ship it"})
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        budget_controller=controller,
+        client=client,
+    )
+
+    with pytest.raises(AudioAssetIdentityMismatchError):
+        await transcriber.transcribe(audio_path, context=context)
+
+    assert controller.reservations == []
+    assert client.transcriptions.calls == []
+
+
+@pytest.mark.asyncio
+async def test_transcriber_verifies_audio_without_no_follow_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    controller = FakeBudgetController()
+    client = FakeClient({"text": "Ship it"})
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        budget_controller=controller,
+        client=client,
+    )
+    monkeypatch.setattr(
+        "meeting_action_orchestrator.infrastructure.openai_transcription.os.O_NOFOLLOW",
+        0,
+        raising=False,
+    )
+
+    result = await transcriber.transcribe(
+        audio_path,
+        context=transcription_context(audio_path),
+    )
+
+    assert result.text == "Ship it"
+    assert len(controller.reservations) == 1
+    assert len(client.transcriptions.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transcriber_retries_pre_dispatch_audio_sharing_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    controller = FakeBudgetController()
+    client = FakeClient({"text": "Ship it"})
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        budget_controller=controller,
+        client=client,
+    )
+
+    def unavailable(*_arguments: object, **_keywords: object) -> int:
+        raise PermissionError(errno.EACCES, "private path detail")
+
+    monkeypatch.setattr(
+        "meeting_action_orchestrator.infrastructure.openai_transcription.os.open",
+        unavailable,
+    )
+
+    with pytest.raises(
+        OpenAITranscriptionTransientError,
+        match=r"^OpenAI transcription failed with local_audio_unavailable$",
+    ):
+        await transcriber.transcribe(
+            audio_path,
+            context=transcription_context(audio_path),
+        )
+
+    assert controller.reservations == []
+    assert client.transcriptions.calls == []
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"input_tokens": 1, "output_tokens": 1}, id="missing-type"),
+        pytest.param(
+            {
+                "type": "tokens",
+                "input_tokens": True,
+                "output_tokens": 1,
+                "total_tokens": 2,
+            },
+            id="boolean-token",
+        ),
+        pytest.param(
+            {
+                "type": "tokens",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 3,
+            },
+            id="inconsistent-total",
+        ),
+        pytest.param({"type": "duration", "seconds": 0}, id="zero-duration"),
+        pytest.param({"type": "duration", "seconds": float("nan")}, id="nan-duration"),
+    ],
+)
+def test_transcriber_keeps_invalid_usage_unsettled(usage: object) -> None:
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        budget_controller=FakeBudgetController(),
+        client=FakeClient({}),
+    )
+
+    assert transcriber._map_usage(usage) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"text": "Ship it"}, id="absent"),
+        pytest.param(
+            {
+                "text": "Ship it",
+                "usage": {
+                    "type": "tokens",
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "total_tokens": 7,
+                },
+            },
+            id="malformed-tokens",
+        ),
+        pytest.param(
+            {"text": "Ship it", "usage": {"type": "duration", "seconds": 0}},
+            id="malformed-duration",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_transcriber_keeps_envelope_when_optional_usage_is_invalid(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    controller = FakeBudgetController()
+    client = FakeClient(FakeResponse(payload, "req_usage_invalid"))
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        budget_controller=controller,
+        client=client,
+    )
+
+    result = await transcriber.transcribe(
+        audio_path,
+        context=transcription_context(audio_path),
+    )
+
+    assert result.text == "Ship it"
+    assert result.usage is None
+    assert len(controller.reservations) == 1
+    assert controller.settlements == []
+    assert len(client.transcriptions.calls) == 1

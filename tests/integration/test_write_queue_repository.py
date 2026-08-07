@@ -399,7 +399,7 @@ def test_version_six_migration_makes_existing_unknown_writes_due(tmp_path: Path)
         )
         connection.execute("PRAGMA user_version = 5")
 
-    assert database.migrate() == 10
+    assert database.migrate() == 11
     with SqliteUnitOfWork(database, immediate=False) as restarted:
         due = restarted.write_intents.list_unknown_ids(NOW, 1)
         loaded = restarted.write_intents.get(INTENT_ID)

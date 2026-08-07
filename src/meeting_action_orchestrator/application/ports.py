@@ -22,6 +22,7 @@ from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
+    ProviderSettlementOutcome,
     RecordingCleanupStatus,
     WriteStatus,
 )
@@ -46,6 +47,15 @@ from meeting_action_orchestrator.domain.models import (
     WorkflowFailure,
     WriteIntent,
     WriteReceipt,
+)
+from meeting_action_orchestrator.domain.provider_budget import (
+    ProviderBudgetAccount,
+    ProviderBudgetReservation,
+    ProviderBudgetReservationRequest,
+    ProviderBudgetSettlement,
+    ProviderBudgetUsage,
+    ProviderDispatchContext,
+    ProviderUsage,
 )
 from meeting_action_orchestrator.domain.workflow_events import (
     WORKFLOW_SEQUENCE_MAX,
@@ -103,6 +113,25 @@ class TranscriptionOutputLike(Protocol):
     text: str
     duration_seconds: float | None
     segments: tuple[TranscriptionSegmentLike, ...]
+    usage: ProviderUsage | None
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptionRunContext:
+    dispatch: ProviderDispatchContext
+    audio_duration_ms: int
+    audio_size_bytes: int
+    audio_sha256: str
+
+    def __post_init__(self) -> None:
+        if self.audio_duration_ms <= 0:
+            raise ValueError("audio_duration_ms must be positive")
+        if self.audio_size_bytes <= 0:
+            raise ValueError("audio_size_bytes must be positive")
+        if len(self.audio_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.audio_sha256
+        ):
+            raise ValueError("audio_sha256 must be a lowercase SHA-256 digest")
 
 
 class RecordingStore(Protocol):
@@ -153,6 +182,8 @@ class TranscriptionProvider(Protocol):
         self,
         audio_path: Path,
         language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
     ) -> TranscriptionOutputLike: ...
 
 
@@ -475,7 +506,56 @@ class ProcessingJobRepository(Protocol):
         expected_status: ProcessingJobStatus,
         expected_lease_owner: str | None,
         expected_lease_expires_at: datetime | None,
+        expected_claim_token: UUID | None,
     ) -> None: ...
+
+
+class ProviderBudgetAccountRepository(Protocol):
+    def add(self, account: ProviderBudgetAccount) -> None: ...
+
+    def get(self, processing_job_id: UUID) -> ProviderBudgetAccount | None: ...
+
+
+class ProviderBudgetReservationRepository(Protocol):
+    def add(self, reservation: ProviderBudgetReservation) -> None: ...
+
+    def get(self, reservation_id: UUID) -> ProviderBudgetReservation | None: ...
+
+    def find_by_dispatch_digest(
+        self,
+        dispatch_digest: str,
+    ) -> ProviderBudgetReservation | None: ...
+
+    def next_sequence(self, processing_job_id: UUID) -> int: ...
+
+    def list_for_job(
+        self,
+        processing_job_id: UUID,
+    ) -> Sequence[ProviderBudgetReservation]: ...
+
+    def usage_for_job(self, processing_job_id: UUID) -> ProviderBudgetUsage: ...
+
+
+class ProviderBudgetSettlementRepository(Protocol):
+    def add(self, settlement: ProviderBudgetSettlement) -> None: ...
+
+    def get(self, reservation_id: UUID) -> ProviderBudgetSettlement | None: ...
+
+
+class ProviderBudgetController(Protocol):
+    async def reserve(
+        self,
+        context: ProviderDispatchContext,
+        request: ProviderBudgetReservationRequest,
+    ) -> ProviderBudgetReservation: ...
+
+    async def settle(
+        self,
+        reservation_id: UUID,
+        *,
+        outcome: ProviderSettlementOutcome,
+        usage: ProviderUsage,
+    ) -> ProviderBudgetSettlement: ...
 
 
 class WriteIntentRepository(Protocol):
@@ -582,6 +662,9 @@ class UnitOfWork(Protocol):
     delivery_operations: DeliveryOperationRepository
     meeting_operations: MeetingOperationRepository
     processing_jobs: ProcessingJobRepository
+    provider_budget_accounts: ProviderBudgetAccountRepository
+    provider_budget_reservations: ProviderBudgetReservationRepository
+    provider_budget_settlements: ProviderBudgetSettlementRepository
     write_intents: WriteIntentRepository
     write_receipts: WriteReceiptRepository
     workflow_events: WorkflowEventRepository

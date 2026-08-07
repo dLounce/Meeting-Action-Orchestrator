@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
+from datetime import datetime, timezone
 from pathlib import Path
 
 from meeting_action_orchestrator.application.ports import WalCheckpointResult
@@ -1147,6 +1148,7 @@ def _expand_utc_checks(template: str) -> str:
         "next_attempt_at",
         "last_failure_occurred_at",
         "erased_at",
+        "settled_at",
     )
     for column in columns:
         marker = "__UTC_" + column.upper() + "__"
@@ -1212,6 +1214,586 @@ BEGIN
 END;
 """
 
+SCHEMA_V11 = """
+CREATE TABLE processing_jobs_v11_timestamp_guard (
+    valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO processing_jobs_v11_timestamp_guard (valid)
+SELECT CASE WHEN
+    mao_utc_datetime(created_at) IS NULL
+    OR mao_utc_datetime(updated_at) IS NULL
+    OR (next_attempt_at IS NOT NULL AND mao_utc_datetime(next_attempt_at) IS NULL)
+    OR (lease_expires_at IS NOT NULL AND mao_utc_datetime(lease_expires_at) IS NULL)
+    OR ((status = 'retry_wait') <> (next_attempt_at IS NOT NULL))
+    OR mao_utc_datetime(updated_at) < mao_utc_datetime(created_at)
+    OR (
+        next_attempt_at IS NOT NULL
+        AND mao_utc_datetime(next_attempt_at) < mao_utc_datetime(updated_at)
+    )
+    OR (
+        lease_expires_at IS NOT NULL
+        AND mao_utc_datetime(lease_expires_at) <= mao_utc_datetime(updated_at)
+    )
+THEN 0 ELSE 1 END
+FROM processing_jobs;
+DROP TABLE processing_jobs_v11_timestamp_guard;
+CREATE TABLE processing_jobs_v11 (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    next_attempt_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    claim_token TEXT CHECK (
+        claim_token IS NULL OR (
+            typeof(claim_token) = 'text'
+            AND length(claim_token) = 36
+            AND substr(claim_token, 9, 1) = '-'
+            AND substr(claim_token, 14, 1) = '-'
+            AND substr(claim_token, 19, 1) = '-'
+            AND substr(claim_token, 24, 1) = '-'
+            AND length(replace(claim_token, '-', '')) = 32
+            AND replace(claim_token, '-', '') NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    last_failure_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (meeting_id, stage),
+    CHECK (
+        (
+            status = 'running'
+            AND attempt_count > 0
+            AND lease_owner IS NOT NULL
+            AND lease_expires_at IS NOT NULL
+            AND claim_token IS NOT NULL
+        ) OR (
+            status <> 'running'
+            AND lease_owner IS NULL
+            AND lease_expires_at IS NULL
+            AND claim_token IS NULL
+        )
+    ),
+    CHECK (
+        (status = 'retry_wait' AND next_attempt_at IS NOT NULL)
+        OR (status <> 'retry_wait' AND next_attempt_at IS NULL)
+    ),
+    CHECK (
+        (status IN ('retry_wait', 'failed') AND last_failure_json IS NOT NULL)
+        OR (status IN ('ready', 'running', 'succeeded') AND last_failure_json IS NULL)
+        OR status = 'cancelled'
+        OR status NOT IN (
+            'ready', 'running', 'retry_wait', 'failed', 'succeeded', 'cancelled'
+        )
+    )
+);
+INSERT INTO processing_jobs_v11 (
+    id, meeting_id, stage, status, attempt_count, max_attempts,
+    next_attempt_at, lease_owner, lease_expires_at, claim_token,
+    last_failure_json, created_at, updated_at
+)
+SELECT
+    id, meeting_id, stage, status, attempt_count, max_attempts,
+    CASE WHEN next_attempt_at IS NULL THEN NULL
+        ELSE mao_utc_datetime(next_attempt_at)
+    END,
+    lease_owner,
+    CASE WHEN lease_expires_at IS NULL THEN NULL
+        ELSE mao_utc_datetime(lease_expires_at)
+    END,
+    CASE WHEN status = 'running' THEN lower(id) ELSE NULL END,
+    last_failure_json,
+    mao_utc_datetime(created_at),
+    mao_utc_datetime(updated_at)
+FROM processing_jobs;
+DROP TABLE processing_jobs;
+ALTER TABLE processing_jobs_v11 RENAME TO processing_jobs;
+CREATE INDEX idx_processing_jobs_claim
+ON processing_jobs (stage, status, next_attempt_at, lease_expires_at);
+CREATE UNIQUE INDEX idx_processing_jobs_claim_token
+ON processing_jobs (claim_token) WHERE claim_token IS NOT NULL;
+CREATE UNIQUE INDEX idx_processing_jobs_identity_stage
+ON processing_jobs (id, stage);
+CREATE TABLE provider_budget_accounts (
+    processing_job_id TEXT PRIMARY KEY CHECK (
+        typeof(processing_job_id) = 'text'
+        AND length(processing_job_id) = 36
+        AND substr(processing_job_id, 9, 1) = '-'
+        AND substr(processing_job_id, 14, 1) = '-'
+        AND substr(processing_job_id, 19, 1) = '-'
+        AND substr(processing_job_id, 24, 1) = '-'
+        AND length(replace(processing_job_id, '-', '')) = 32
+        AND replace(processing_job_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    stage TEXT NOT NULL CHECK (
+        typeof(stage) = 'text' AND stage IN ('transcription', 'extraction')
+    ),
+    policy_version INTEGER NOT NULL CHECK (
+        typeof(policy_version) = 'integer' AND policy_version BETWEEN 1 AND 1000
+    ),
+    legacy_locked INTEGER NOT NULL CHECK (
+        typeof(legacy_locked) = 'integer' AND legacy_locked IN (0, 1)
+    ),
+    preflight_request_limit INTEGER CHECK (
+        preflight_request_limit IS NULL OR (
+            typeof(preflight_request_limit) = 'integer'
+            AND preflight_request_limit BETWEEN 0 AND 1000
+        )
+    ),
+    provider_request_limit INTEGER CHECK (
+        provider_request_limit IS NULL OR (
+            typeof(provider_request_limit) = 'integer'
+            AND provider_request_limit BETWEEN 0 AND 1000
+        )
+    ),
+    input_token_limit INTEGER CHECK (
+        input_token_limit IS NULL OR (
+            typeof(input_token_limit) = 'integer'
+            AND input_token_limit BETWEEN 0 AND 1000000000000
+        )
+    ),
+    output_token_limit INTEGER CHECK (
+        output_token_limit IS NULL OR (
+            typeof(output_token_limit) = 'integer'
+            AND output_token_limit BETWEEN 0 AND 1000000000000
+        )
+    ),
+    audio_duration_ms_limit INTEGER CHECK (
+        audio_duration_ms_limit IS NULL OR (
+            typeof(audio_duration_ms_limit) = 'integer'
+            AND audio_duration_ms_limit BETWEEN 0 AND 1000000000000
+        )
+    ),
+    created_at TEXT NOT NULL CHECK (__UTC_CREATED_AT__),
+    CHECK (
+        (
+            legacy_locked = 1
+            AND preflight_request_limit = 0
+            AND provider_request_limit = 0
+            AND input_token_limit = 0
+            AND output_token_limit = 0
+            AND audio_duration_ms_limit = 0
+        ) OR (
+            legacy_locked = 0
+            AND stage = 'transcription'
+            AND preflight_request_limit IS NULL
+            AND provider_request_limit IS NOT NULL
+            AND input_token_limit IS NULL
+            AND output_token_limit IS NULL
+            AND audio_duration_ms_limit IS NOT NULL
+        ) OR (
+            legacy_locked = 0
+            AND stage = 'extraction'
+            AND preflight_request_limit IS NOT NULL
+            AND provider_request_limit IS NOT NULL
+            AND input_token_limit IS NOT NULL
+            AND output_token_limit IS NOT NULL
+            AND audio_duration_ms_limit IS NULL
+        )
+    ),
+    FOREIGN KEY (processing_job_id, stage)
+        REFERENCES processing_jobs (id, stage) ON DELETE CASCADE
+);
+CREATE TABLE provider_budget_reservations (
+    id TEXT PRIMARY KEY CHECK (
+        typeof(id) = 'text'
+        AND length(id) = 36
+        AND substr(id, 9, 1) = '-'
+        AND substr(id, 14, 1) = '-'
+        AND substr(id, 19, 1) = '-'
+        AND substr(id, 24, 1) = '-'
+        AND length(replace(id, '-', '')) = 32
+        AND replace(id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    processing_job_id TEXT NOT NULL
+        REFERENCES provider_budget_accounts (processing_job_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL
+        CHECK (typeof(sequence) = 'integer' AND sequence BETWEEN 1 AND 10000),
+    attempt_number INTEGER NOT NULL
+        CHECK (typeof(attempt_number) = 'integer' AND attempt_number BETWEEN 1 AND 1000),
+    claim_token TEXT NOT NULL CHECK (
+        typeof(claim_token) = 'text'
+        AND length(claim_token) = 36
+        AND substr(claim_token, 9, 1) = '-'
+        AND substr(claim_token, 14, 1) = '-'
+        AND substr(claim_token, 19, 1) = '-'
+        AND substr(claim_token, 24, 1) = '-'
+        AND length(replace(claim_token, '-', '')) = 32
+        AND replace(claim_token, '-', '') NOT GLOB '*[^0-9a-f]*'
+    ),
+    dispatch_digest TEXT NOT NULL UNIQUE CHECK (
+        typeof(dispatch_digest) = 'text'
+        AND length(dispatch_digest) = 64
+        AND dispatch_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    operation_digest TEXT NOT NULL CHECK (
+        typeof(operation_digest) = 'text'
+        AND length(operation_digest) = 64
+        AND operation_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    request_fingerprint TEXT NOT NULL CHECK (
+        typeof(request_fingerprint) = 'text'
+        AND length(request_fingerprint) = 64
+        AND request_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    operation TEXT NOT NULL CHECK (
+        typeof(operation) = 'text' AND operation IN (
+            'responses_input_token_count',
+            'responses_create',
+            'transcription_create'
+        )
+    ),
+    role TEXT NOT NULL CHECK (
+        typeof(role) = 'text'
+        AND role IN ('transcription', 'extract', 'recap', 'verify')
+    ),
+    model TEXT NOT NULL CHECK (
+        typeof(model) = 'text'
+        AND model = trim(model)
+        AND length(model) BETWEEN 1 AND 200
+    ),
+    reserved_input_tokens INTEGER NOT NULL CHECK (
+        typeof(reserved_input_tokens) = 'integer'
+        AND reserved_input_tokens BETWEEN 0 AND 1000000000000
+    ),
+    reserved_output_tokens INTEGER NOT NULL CHECK (
+        typeof(reserved_output_tokens) = 'integer'
+        AND reserved_output_tokens BETWEEN 0 AND 1000000000000
+    ),
+    reserved_audio_duration_ms INTEGER NOT NULL CHECK (
+        typeof(reserved_audio_duration_ms) = 'integer'
+        AND reserved_audio_duration_ms BETWEEN 0 AND 1000000000000
+    ),
+    created_at TEXT NOT NULL CHECK (__UTC_CREATED_AT__),
+    UNIQUE (processing_job_id, sequence),
+    CHECK (
+        (
+            operation = 'responses_input_token_count'
+            AND role IN ('extract', 'recap', 'verify')
+            AND reserved_input_tokens = 0
+            AND reserved_output_tokens = 0
+            AND reserved_audio_duration_ms = 0
+        ) OR (
+            operation = 'responses_create'
+            AND role IN ('extract', 'recap', 'verify')
+            AND reserved_input_tokens > 0
+            AND reserved_output_tokens > 0
+            AND reserved_audio_duration_ms = 0
+        ) OR (
+            operation = 'transcription_create'
+            AND role = 'transcription'
+            AND reserved_input_tokens = 0
+            AND reserved_output_tokens = 0
+            AND reserved_audio_duration_ms > 0
+        )
+    )
+);
+CREATE TABLE provider_budget_settlements (
+    reservation_id TEXT PRIMARY KEY CHECK (
+        typeof(reservation_id) = 'text'
+        AND length(reservation_id) = 36
+        AND substr(reservation_id, 9, 1) = '-'
+        AND substr(reservation_id, 14, 1) = '-'
+        AND substr(reservation_id, 19, 1) = '-'
+        AND substr(reservation_id, 24, 1) = '-'
+        AND length(replace(reservation_id, '-', '')) = 32
+        AND replace(reservation_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+    )
+        REFERENCES provider_budget_reservations (id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL CHECK (
+        typeof(outcome) = 'text' AND outcome IN ('succeeded', 'failed', 'abandoned')
+    ),
+    usage_kind TEXT NOT NULL CHECK (
+        typeof(usage_kind) = 'text' AND usage_kind IN ('none', 'tokens', 'duration')
+    ),
+    actual_input_tokens INTEGER CHECK (
+        actual_input_tokens IS NULL OR (
+            typeof(actual_input_tokens) = 'integer'
+            AND actual_input_tokens BETWEEN 0 AND 1000000000000
+        )
+    ),
+    actual_output_tokens INTEGER CHECK (
+        actual_output_tokens IS NULL OR (
+            typeof(actual_output_tokens) = 'integer'
+            AND actual_output_tokens BETWEEN 0 AND 1000000000000
+        )
+    ),
+    actual_audio_duration_ms INTEGER CHECK (
+        actual_audio_duration_ms IS NULL OR (
+            typeof(actual_audio_duration_ms) = 'integer'
+            AND actual_audio_duration_ms BETWEEN 1 AND 1000000000000
+        )
+    ),
+    settled_at TEXT NOT NULL CHECK (__UTC_SETTLED_AT__),
+    CHECK (
+        (
+            usage_kind = 'none'
+            AND actual_input_tokens IS NULL
+            AND actual_output_tokens IS NULL
+            AND actual_audio_duration_ms IS NULL
+        ) OR (
+            usage_kind = 'tokens'
+            AND actual_input_tokens IS NOT NULL
+            AND actual_output_tokens IS NOT NULL
+            AND actual_audio_duration_ms IS NULL
+        ) OR (
+            usage_kind = 'duration'
+            AND actual_input_tokens IS NULL
+            AND actual_output_tokens IS NULL
+            AND actual_audio_duration_ms IS NOT NULL
+        )
+    )
+);
+INSERT INTO provider_budget_accounts (
+    processing_job_id, stage, policy_version, legacy_locked, preflight_request_limit,
+    provider_request_limit, input_token_limit, output_token_limit,
+    audio_duration_ms_limit, created_at
+)
+SELECT
+    id,
+    stage,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    0,
+    mao_utc_datetime(created_at)
+FROM processing_jobs;
+CREATE TRIGGER provider_budget_accounts_reject_update
+BEFORE UPDATE ON provider_budget_accounts
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget accounts are immutable');
+END;
+CREATE TRIGGER processing_jobs_reject_direct_budget_delete
+BEFORE DELETE ON processing_jobs
+WHEN EXISTS (SELECT 1 FROM meetings WHERE id = OLD.meeting_id)
+BEGIN
+    SELECT RAISE(ABORT, 'processing jobs with provider budgets cannot be deleted directly');
+END;
+CREATE TRIGGER provider_budget_accounts_reject_direct_delete
+BEFORE DELETE ON provider_budget_accounts
+WHEN EXISTS (SELECT 1 FROM processing_jobs WHERE id = OLD.processing_job_id)
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget accounts are immutable');
+END;
+CREATE TRIGGER provider_budget_reservations_require_active_job
+BEFORE INSERT ON provider_budget_reservations
+WHEN NOT EXISTS (
+    SELECT 1 FROM processing_jobs job
+    WHERE job.id = NEW.processing_job_id
+      AND job.status = 'running'
+      AND job.attempt_count = NEW.attempt_number
+      AND job.lease_owner IS NOT NULL
+      AND job.claim_token = NEW.claim_token
+      AND job.lease_expires_at IS NOT NULL
+      AND julianday(job.lease_expires_at) > julianday(NEW.created_at)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider reservation requires the active processing attempt');
+END;
+CREATE TRIGGER provider_budget_reservations_require_stage
+BEFORE INSERT ON provider_budget_reservations
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_budget_accounts account
+    WHERE account.processing_job_id = NEW.processing_job_id
+      AND (
+        (account.stage = 'transcription' AND NEW.operation = 'transcription_create')
+        OR (
+            account.stage = 'extraction'
+            AND NEW.operation IN ('responses_input_token_count', 'responses_create')
+        )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider reservation operation does not match job stage');
+END;
+CREATE TRIGGER provider_budget_reservations_reject_locked
+BEFORE INSERT ON provider_budget_reservations
+WHEN EXISTS (
+    SELECT 1 FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id AND legacy_locked = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget account is locked');
+END;
+CREATE TRIGGER provider_budget_reservations_require_contiguous_sequence
+BEFORE INSERT ON provider_budget_reservations
+WHEN NEW.sequence <> (
+    SELECT COALESCE(MAX(sequence), 0) + 1
+    FROM provider_budget_reservations
+    WHERE processing_job_id = NEW.processing_job_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider reservation sequence is not contiguous');
+END;
+CREATE TRIGGER provider_budget_reservations_enforce_preflight_limit
+BEFORE INSERT ON provider_budget_reservations
+WHEN NEW.operation = 'responses_input_token_count'
+  AND (
+    SELECT preflight_request_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  ) IS NOT NULL
+  AND 1 + (
+    SELECT COUNT(*) FROM provider_budget_reservations
+    WHERE processing_job_id = NEW.processing_job_id
+      AND operation = 'responses_input_token_count'
+  ) > (
+    SELECT preflight_request_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider preflight request budget exhausted');
+END;
+CREATE TRIGGER provider_budget_reservations_enforce_provider_limit
+BEFORE INSERT ON provider_budget_reservations
+WHEN NEW.operation IN ('responses_create', 'transcription_create')
+  AND (
+    SELECT provider_request_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  ) IS NOT NULL
+  AND 1 + (
+    SELECT COUNT(*) FROM provider_budget_reservations
+    WHERE processing_job_id = NEW.processing_job_id
+      AND operation IN ('responses_create', 'transcription_create')
+  ) > (
+    SELECT provider_request_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider request budget exhausted');
+END;
+CREATE TRIGGER provider_budget_reservations_enforce_input_limit
+BEFORE INSERT ON provider_budget_reservations
+WHEN (
+    SELECT input_token_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  ) IS NOT NULL
+  AND NEW.reserved_input_tokens + COALESCE((
+    SELECT SUM(CASE
+        WHEN settlement.outcome = 'succeeded' AND settlement.usage_kind = 'tokens'
+        THEN settlement.actual_input_tokens
+        ELSE reservation.reserved_input_tokens
+    END)
+    FROM provider_budget_reservations reservation
+    LEFT JOIN provider_budget_settlements settlement
+      ON settlement.reservation_id = reservation.id
+    WHERE reservation.processing_job_id = NEW.processing_job_id
+  ), 0) > (
+    SELECT input_token_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider input token budget exhausted');
+END;
+CREATE TRIGGER provider_budget_reservations_enforce_output_limit
+BEFORE INSERT ON provider_budget_reservations
+WHEN (
+    SELECT output_token_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  ) IS NOT NULL
+  AND NEW.reserved_output_tokens + COALESCE((
+    SELECT SUM(CASE
+        WHEN settlement.outcome = 'succeeded' AND settlement.usage_kind = 'tokens'
+        THEN settlement.actual_output_tokens
+        ELSE reservation.reserved_output_tokens
+    END)
+    FROM provider_budget_reservations reservation
+    LEFT JOIN provider_budget_settlements settlement
+      ON settlement.reservation_id = reservation.id
+    WHERE reservation.processing_job_id = NEW.processing_job_id
+  ), 0) > (
+    SELECT output_token_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider output token budget exhausted');
+END;
+CREATE TRIGGER provider_budget_reservations_enforce_audio_limit
+BEFORE INSERT ON provider_budget_reservations
+WHEN (
+    SELECT audio_duration_ms_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  ) IS NOT NULL
+  AND NEW.reserved_audio_duration_ms + COALESCE((
+    SELECT SUM(CASE
+        WHEN settlement.outcome = 'succeeded' AND settlement.usage_kind = 'duration'
+        THEN settlement.actual_audio_duration_ms
+        ELSE reservation.reserved_audio_duration_ms
+    END)
+    FROM provider_budget_reservations reservation
+    LEFT JOIN provider_budget_settlements settlement
+      ON settlement.reservation_id = reservation.id
+    WHERE reservation.processing_job_id = NEW.processing_job_id
+  ), 0) > (
+    SELECT audio_duration_ms_limit FROM provider_budget_accounts
+    WHERE processing_job_id = NEW.processing_job_id
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider audio duration budget exhausted');
+END;
+CREATE TRIGGER provider_budget_reservations_reject_update
+BEFORE UPDATE ON provider_budget_reservations
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget reservations are append-only');
+END;
+CREATE TRIGGER provider_budget_reservations_reject_direct_delete
+BEFORE DELETE ON provider_budget_reservations
+WHEN EXISTS (
+    SELECT 1 FROM provider_budget_accounts
+    WHERE processing_job_id = OLD.processing_job_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget reservations are append-only');
+END;
+CREATE TRIGGER provider_budget_settlements_require_compatible_usage
+BEFORE INSERT ON provider_budget_settlements
+WHEN NOT EXISTS (
+    SELECT 1 FROM provider_budget_reservations reservation
+    WHERE reservation.id = NEW.reservation_id
+      AND (
+        (NEW.outcome IN ('failed', 'abandoned') AND NEW.usage_kind = 'none')
+        OR (
+            NEW.outcome = 'succeeded'
+            AND reservation.operation = 'responses_input_token_count'
+            AND NEW.usage_kind = 'none'
+        )
+        OR (
+            NEW.outcome = 'succeeded'
+            AND reservation.operation = 'responses_create'
+            AND NEW.usage_kind = 'tokens'
+        )
+        OR (
+            NEW.outcome = 'succeeded'
+            AND reservation.operation = 'transcription_create'
+            AND NEW.usage_kind IN ('tokens', 'duration')
+        )
+      )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider settlement usage is incompatible');
+END;
+CREATE TRIGGER provider_budget_settlements_reject_update
+BEFORE UPDATE ON provider_budget_settlements
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget settlements are append-only');
+END;
+CREATE TRIGGER provider_budget_settlements_reject_direct_delete
+BEFORE DELETE ON provider_budget_settlements
+WHEN EXISTS (
+    SELECT 1 FROM provider_budget_reservations WHERE id = OLD.reservation_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider budget settlements are append-only');
+END;
+"""
+
+SCHEMA_V11 = _expand_utc_checks(SCHEMA_V11)
+
 MIGRATIONS = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
@@ -1223,6 +1805,7 @@ MIGRATIONS = (
     (8, SCHEMA_V8),
     (9, SCHEMA_V9),
     (10, SCHEMA_V10),
+    (11, SCHEMA_V11),
 )
 
 
@@ -1241,6 +1824,12 @@ class Database:
         try:
             _restrict_permissions(self._path, 0o600)
             connection.row_factory = sqlite3.Row
+            connection.create_function(
+                "mao_utc_datetime",
+                1,
+                _migration_utc_datetime,
+                deterministic=True,
+            )
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = WAL")
             _restrict_permissions(Path(f"{self._path}-wal"), 0o600)
@@ -1314,6 +1903,18 @@ def _verify_connection_pragmas(connection: sqlite3.Connection) -> None:
     journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
     if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
         raise RuntimeError("SQLite connection security settings could not be enforced")
+
+
+def _migration_utc_datetime(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _restrict_permissions(path: Path, mode: int) -> None:

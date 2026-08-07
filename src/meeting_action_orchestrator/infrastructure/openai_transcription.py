@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import hashlib
+import os
+import stat
 from contextlib import suppress
 from dataclasses import dataclass
 from importlib import import_module
-from math import isfinite
+from math import ceil, isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 from uuid import uuid4
 
+import httpx
+
 from meeting_action_orchestrator.application.errors import (
+    AudioAssetIdentityMismatchError,
+    ProviderBudgetExhaustedError,
+    ProviderBudgetIntegrityError,
+    ProviderBudgetLeaseLostError,
     ProviderConfigurationError,
     ProviderError,
     ProviderInputError,
@@ -19,14 +29,125 @@ from meeting_action_orchestrator.application.errors import (
     ProviderTimeoutError,
     ProviderTransientError,
 )
+from meeting_action_orchestrator.application.ports import (
+    ProviderBudgetController,
+    TranscriptionRunContext,
+)
 from meeting_action_orchestrator.application.provider_policy import (
     ProviderErrorMetadata,
     provider_error_metadata,
     provider_error_requires_action,
     sanitize_provider_identifier,
 )
+from meeting_action_orchestrator.domain.enums import ProviderUsageKind
+from meeting_action_orchestrator.domain.provider_budget import (
+    PROVIDER_BUDGET_COUNTER_MAX,
+    ProviderUsage,
+)
+from meeting_action_orchestrator.infrastructure.openai_budget import OpenAITranscriptionBudget
 
 _DIARIZED_TRANSCRIPTION_MODELS = frozenset({"gpt-4o-transcribe-diarize"})
+_IDENTITY_IO_ERRNOS = frozenset(
+    value
+    for name in ("ENOENT", "ENOTDIR", "ELOOP")
+    if (value := getattr(errno, name, None)) is not None
+)
+
+
+class _AudioVerificationUnavailableError(RuntimeError):
+    pass
+
+
+async def _open_verified_audio(
+    path: Path,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> BinaryIO:
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            _verify_and_open_audio,
+            path,
+            expected_size_bytes,
+            expected_sha256,
+        )
+    )
+    try:
+        return await asyncio.shield(task)
+    except BaseException:
+        task.add_done_callback(_close_verified_audio_result)
+        raise
+
+
+def _close_verified_audio_result(task: asyncio.Task[BinaryIO]) -> None:
+    with suppress(BaseException):
+        task.result().close()
+
+
+def _verify_and_open_audio(
+    path: Path,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> BinaryIO:
+    descriptor = -1
+    audio_file: BinaryIO | None = None
+    try:
+        initial = os.lstat(path)
+        if not stat.S_ISREG(initial.st_mode) or initial.st_size != expected_size_bytes:
+            raise AudioAssetIdentityMismatchError
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (initial.st_dev, initial.st_ino)
+            or opened.st_size != expected_size_bytes
+        ):
+            raise AudioAssetIdentityMismatchError
+        audio_file = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        digest = hashlib.sha256()
+        while chunk := audio_file.read(1024 * 1024):
+            digest.update(chunk)
+        after = os.fstat(audio_file.fileno())
+        final = os.lstat(path)
+        if (
+            _audio_file_state(opened) != _audio_file_state(after)
+            or _audio_file_state(after) != _audio_file_state(final)
+            or digest.hexdigest() != expected_sha256
+        ):
+            raise AudioAssetIdentityMismatchError
+        audio_file.seek(0)
+        return audio_file
+    except AudioAssetIdentityMismatchError:
+        if audio_file is not None:
+            audio_file.close()
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if audio_file is not None:
+            audio_file.close()
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+        if error.errno in _IDENTITY_IO_ERRNOS:
+            raise AudioAssetIdentityMismatchError from None
+        raise _AudioVerificationUnavailableError(
+            "Stored audio verification is temporarily unavailable"
+        ) from None
+
+
+def _audio_file_state(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
 
 
 def _requires_diarized_segments(model: str) -> bool:
@@ -108,14 +229,6 @@ class TranscriptionSegment:
 
 
 @dataclass(frozen=True)
-class TranscriptionUsage:
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    seconds: float | None = None
-
-
-@dataclass(frozen=True)
 class TranscriptionOutput:
     model: str
     provider_request_id: str | None
@@ -123,7 +236,7 @@ class TranscriptionOutput:
     text: str
     duration_seconds: float | None
     segments: tuple[TranscriptionSegment, ...]
-    usage: TranscriptionUsage
+    usage: ProviderUsage | None
 
 
 class OpenAITranscriber:
@@ -131,13 +244,19 @@ class OpenAITranscriber:
         self,
         api_key: str,
         model: str,
+        *,
+        budget_controller: ProviderBudgetController,
         timeout_seconds: float = 120.0,
         max_retries: int = 0,
         client: Any = None,
+        http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not api_key and client is None:
             raise OpenAITranscriptionConfigurationError
-        if not model:
+        if not isinstance(model, str):
+            raise OpenAITranscriptionConfigurationError
+        model = model.strip()
+        if not model or len(model) > 200:
             raise OpenAITranscriptionConfigurationError
         if max_retries != 0:
             raise OpenAITranscriptionConfigurationError
@@ -147,8 +266,11 @@ class OpenAITranscriber:
         self._max_retries = max_retries
         self._diarization_required = _requires_diarized_segments(model)
         self._client = client
+        self._http_transport = http_transport
         self._openai: Any = None
         self._owns_client = False
+        self._http_client: httpx.AsyncClient | None = None
+        self._budget = OpenAITranscriptionBudget(budget_controller)
 
     async def close(self) -> None:
         if not self._owns_client:
@@ -158,15 +280,26 @@ class OpenAITranscriber:
         self._owns_client = False
         if client is not None:
             await client.close()
+        http_client = self._http_client
+        self._http_client = None
+        if http_client is not None:
+            await http_client.aclose()
 
     async def transcribe(
         self,
         audio_path: Path,
         language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
     ) -> TranscriptionOutput:
-        if not await asyncio.to_thread(audio_path.is_file):
-            raise OpenAITranscriptionInputError
-        client = self._get_client()
+        try:
+            audio_file = await _open_verified_audio(
+                audio_path,
+                context.audio_size_bytes,
+                context.audio_sha256,
+            )
+        except _AudioVerificationUnavailableError:
+            raise OpenAITranscriptionTransientError("local_audio_unavailable") from None
         client_request_id = str(uuid4())
         arguments: dict[str, Any] = {
             "model": self._model,
@@ -179,16 +312,40 @@ class OpenAITranscriber:
             arguments["chunking_strategy"] = "auto"
         if language is not None:
             arguments["language"] = language
-        try:
-            with audio_path.open("rb") as audio_file:
+        with audio_file:
+            client = self._get_client()
+            reservation_id = await self._budget.reserve(
+                context,
+                client_request_id=client_request_id,
+                model=self._model,
+                request_parameters={
+                    key: value for key, value in arguments.items() if key != "extra_headers"
+                },
+            )
+            try:
                 response = await client.audio.transcriptions.create(
                     file=audio_file,
                     **arguments,
                 )
-        except Exception as error:
-            translated = self._translate_error(error, client_request_id)
-        else:
-            return self._map_response(response, client_request_id)
+            except (
+                ProviderBudgetExhaustedError,
+                ProviderBudgetIntegrityError,
+                ProviderBudgetLeaseLostError,
+            ):
+                raise
+            except Exception as error:
+                translated = self._translate_error(error, client_request_id)
+            else:
+                data = self._as_mapping(response)
+                usage = self._map_usage(data.get("usage"))
+                if usage is not None:
+                    await self._budget.settle(reservation_id, usage)
+                return self._map_response(
+                    response,
+                    client_request_id,
+                    data=data,
+                    usage=usage,
+                )
         raise translated
 
     def _get_client(self) -> Any:
@@ -199,12 +356,23 @@ class OpenAITranscriber:
             raise OpenAITranscriptionConfigurationError
         client = None
         with suppress(Exception):
+            http_client = httpx.AsyncClient(
+                follow_redirects=False,
+                transport=self._http_transport,
+            )
+            self._http_client = http_client
             client = module.AsyncOpenAI(
                 api_key=self._api_key,
                 timeout=self._timeout_seconds,
                 max_retries=self._max_retries,
+                http_client=http_client,
             )
         if client is None:
+            http_client = self._http_client
+            self._http_client = None
+            if http_client is not None:
+                with suppress(Exception):
+                    asyncio.get_running_loop().create_task(http_client.aclose())
             raise OpenAITranscriptionConfigurationError
         self._client = client
         self._owns_client = True
@@ -224,14 +392,16 @@ class OpenAITranscriber:
         self,
         response: Any,
         client_request_id: str | None = None,
+        *,
+        data: dict[str, Any] | None = None,
+        usage: ProviderUsage | None = None,
     ) -> TranscriptionOutput:
-        data = self._as_mapping(response)
+        data = data if data is not None else self._as_mapping(response)
         text = self._string_value(data.get("text"))
         if not text:
             raise OpenAITranscriptionOutputError
         duration = self._float_value(data.get("duration"))
         segments = self._map_segments(data.get("segments"), text, duration)
-        usage = self._map_usage(data.get("usage"))
         return TranscriptionOutput(
             model=self._model,
             provider_request_id=self._provider_request_id(response, client_request_id),
@@ -318,14 +488,48 @@ class OpenAITranscriber:
             previous_start = start
         return tuple(segments)
 
-    def _map_usage(self, raw_usage: object) -> TranscriptionUsage:
+    def _map_usage(self, raw_usage: object) -> ProviderUsage | None:
         usage = self._as_mapping(raw_usage)
-        return TranscriptionUsage(
-            input_tokens=self._integer_value(usage.get("input_tokens")),
-            output_tokens=self._integer_value(usage.get("output_tokens")),
-            total_tokens=self._integer_value(usage.get("total_tokens")),
-            seconds=self._float_value(usage.get("seconds")),
-        )
+        usage_type = usage.get("type")
+        if usage_type == "tokens":
+            input_tokens = self._strict_nonnegative_integer(usage.get("input_tokens"))
+            output_tokens = self._strict_nonnegative_integer(usage.get("output_tokens"))
+            total_tokens = self._strict_nonnegative_integer(usage.get("total_tokens"))
+            if (
+                input_tokens is None
+                or output_tokens is None
+                or total_tokens is None
+                or total_tokens != input_tokens + output_tokens
+            ):
+                return None
+            return ProviderUsage(
+                kind=ProviderUsageKind.TOKENS,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        if usage_type == "duration":
+            seconds = self._finite_float_value(usage.get("seconds"))
+            if seconds is None or seconds <= 0:
+                return None
+            audio_duration_ms = ceil(seconds * 1000)
+            if audio_duration_ms > PROVIDER_BUDGET_COUNTER_MAX:
+                return None
+            return ProviderUsage(
+                kind=ProviderUsageKind.DURATION,
+                audio_duration_ms=audio_duration_ms,
+            )
+        return None
+
+    @staticmethod
+    def _strict_nonnegative_integer(value: object) -> int | None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > PROVIDER_BUDGET_COUNTER_MAX
+        ):
+            return None
+        return value
 
     def _translate_error(
         self,
@@ -437,10 +641,6 @@ class OpenAITranscriber:
     def _optional_string(cls, value: object) -> str | None:
         text = cls._string_value(value)
         return text or None
-
-    @staticmethod
-    def _integer_value(value: object) -> int:
-        return value if isinstance(value, int) else 0
 
     @staticmethod
     def _float_value(value: object) -> float | None:

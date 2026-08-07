@@ -5,6 +5,8 @@ from importlib import import_module
 from typing import Any
 from uuid import uuid4
 
+import httpx
+
 from meeting_action_orchestrator.agents.contracts import (
     AgentDefinition,
     AgentResult,
@@ -14,6 +16,9 @@ from meeting_action_orchestrator.agents.contracts import (
     StrictModel,
 )
 from meeting_action_orchestrator.application.errors import (
+    ProviderBudgetExhaustedError,
+    ProviderBudgetIntegrityError,
+    ProviderBudgetLeaseLostError,
     ProviderConfigurationError,
     ProviderError,
     ProviderInputError,
@@ -24,11 +29,19 @@ from meeting_action_orchestrator.application.errors import (
     ProviderTimeoutError,
     ProviderTransientError,
 )
+from meeting_action_orchestrator.application.ports import ProviderBudgetController
 from meeting_action_orchestrator.application.provider_policy import (
     ProviderErrorMetadata,
     provider_error_metadata,
     provider_error_requires_action,
     sanitize_provider_identifier,
+)
+from meeting_action_orchestrator.domain.enums import ProviderCallRole
+from meeting_action_orchestrator.infrastructure.openai_budget import (
+    OpenAICountHTTPStatusError,
+    OpenAICountOutputError,
+    OpenAIProviderDispatchError,
+    OpenAIResponsesBudgetHooks,
 )
 
 
@@ -114,29 +127,49 @@ class OpenAIAgentsRunner:
     def __init__(
         self,
         api_key: str,
+        *,
+        budget_controller: ProviderBudgetController,
         timeout_seconds: float = 120.0,
         max_retries: int = 0,
         tracing_enabled: bool = False,
+        generation_transport: httpx.AsyncBaseTransport | None = None,
+        count_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not api_key:
             raise OpenAIAgentConfigurationError
         if max_retries != 0:
             raise OpenAIAgentConfigurationError
+        if tracing_enabled:
+            raise OpenAIAgentConfigurationError
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._tracing_enabled = tracing_enabled
+        self._generation_transport = generation_transport
+        self._count_transport = count_transport
         self._sdk: Any = None
         self._openai: Any = None
         self._exceptions: Any = None
         self._reasoning_type: type[Any] | None = None
         self._client: Any = None
+        self._count_client: Any = None
+        self._http_clients: list[httpx.AsyncClient] = []
+        self._budget_hooks = OpenAIResponsesBudgetHooks(
+            budget_controller,
+            error_translator=self._translate_count_error,
+        )
 
     async def close(self) -> None:
         client = self._client
         self._client = None
+        self._count_client = None
+        self._budget_hooks.set_count_client(None)
         if client is not None:
             await client.close()
+        http_clients = tuple(self._http_clients)
+        self._http_clients.clear()
+        for http_client in http_clients:
+            await http_client.aclose()
 
     async def run(
         self,
@@ -144,7 +177,12 @@ class OpenAIAgentsRunner:
         payload: StrictModel,
         context: AgentRunContext,
     ) -> AgentResult[OutputT]:
+        model = self._provider_model(definition.model)
         client_request_id = str(uuid4())
+        if context.dispatch is None:
+            raise ProviderBudgetLeaseLostError
+        role = ProviderCallRole(context.stage)
+        self._budget_hooks.register(client_request_id, context.dispatch, role)
         try:
             self._load_bindings()
             sdk = self._require_sdk()
@@ -153,7 +191,7 @@ class OpenAIAgentsRunner:
             agent = sdk.Agent(
                 name=definition.name,
                 instructions=definition.instructions,
-                model=definition.model,
+                model=model,
                 model_settings=model_settings,
                 output_type=definition.output_type,
             )
@@ -177,13 +215,34 @@ class OpenAIAgentsRunner:
             return AgentResult(
                 output=output,
                 usage=usage,
-                model=definition.model,
+                model=model,
                 workflow_request_ids=self._request_ids(result, client_request_id),
             )
+        except (
+            ProviderBudgetExhaustedError,
+            ProviderBudgetIntegrityError,
+            ProviderBudgetLeaseLostError,
+        ):
+            raise
         except OpenAIAgentError:
             raise
         except Exception as error:
+            nested = self._nested_dispatch_exception(error)
+            if isinstance(
+                nested,
+                (
+                    ProviderBudgetExhaustedError,
+                    ProviderBudgetIntegrityError,
+                    ProviderBudgetLeaseLostError,
+                    OpenAIAgentError,
+                ),
+            ):
+                raise nested from None
+            if isinstance(nested, OpenAIProviderDispatchError):
+                raise OpenAIAgentConfigurationError from None
             translated = self._translate_error(error, client_request_id)
+        finally:
+            self._budget_hooks.unregister(client_request_id)
         raise translated
 
     def _load_bindings(self) -> None:
@@ -222,14 +281,32 @@ class OpenAIAgentsRunner:
             return
         if self._openai is None:
             raise OpenAIAgentConfigurationError
+        generation_http = httpx.AsyncClient(
+            follow_redirects=False,
+            transport=self._generation_transport,
+            timeout=self._timeout_seconds,
+            event_hooks={
+                "request": [self._budget_hooks.request],
+                "response": [self._budget_hooks.response],
+            },
+        )
+        count_http = httpx.AsyncClient(
+            follow_redirects=False,
+            transport=self._count_transport,
+            timeout=self._timeout_seconds,
+        )
+        self._http_clients.extend((generation_http, count_http))
         self._client = self._openai.AsyncOpenAI(
             api_key=self._api_key,
             timeout=self._timeout_seconds,
             max_retries=0,
+            http_client=generation_http,
         )
+        self._count_client = count_http
+        self._budget_hooks.set_count_client(self._count_client)
         sdk.set_default_openai_client(
             self._client,
-            use_for_tracing=self._tracing_enabled,
+            use_for_tracing=False,
         )
 
     def _build_model_settings(
@@ -297,6 +374,22 @@ class OpenAIAgentsRunner:
         else:
             translated = OpenAIAgentPermanentError(metadata=metadata)
         return translated
+
+    def _translate_count_error(
+        self,
+        error: Exception,
+        client_request_id: str | None = None,
+    ) -> OpenAIAgentError:
+        metadata = provider_error_metadata(error, client_request_id)
+        if isinstance(error, OpenAICountOutputError):
+            return OpenAIAgentOutputError(metadata=metadata)
+        if isinstance(error, httpx.TimeoutException):
+            return OpenAIAgentTimeoutError(metadata=metadata)
+        if isinstance(error, httpx.RequestError):
+            return OpenAIAgentTransientError(metadata=metadata)
+        if isinstance(error, OpenAICountHTTPStatusError):
+            return self._translate_error(error, client_request_id)
+        return OpenAIAgentPermanentError(metadata=metadata)
 
     def _transient_error(
         self,
@@ -383,6 +476,28 @@ class OpenAIAgentsRunner:
         return isinstance(exception_type, type) and isinstance(error, exception_type)
 
     @staticmethod
+    def _nested_dispatch_exception(error: Exception) -> Exception | None:
+        current: BaseException | None = error
+        visited: set[int] = set()
+        for _index in range(8):
+            if current is None or id(current) in visited:
+                return None
+            visited.add(id(current))
+            if isinstance(
+                current,
+                (
+                    ProviderBudgetExhaustedError,
+                    ProviderBudgetIntegrityError,
+                    ProviderBudgetLeaseLostError,
+                    OpenAIAgentError,
+                    OpenAIProviderDispatchError,
+                ),
+            ):
+                return current
+            current = current.__cause__ or current.__context__
+        return None
+
+    @staticmethod
     def _canonical_json(payload: StrictModel) -> str:
         return json.dumps(
             payload.model_dump(mode="json"),
@@ -390,6 +505,15 @@ class OpenAIAgentsRunner:
             separators=(",", ":"),
             sort_keys=True,
         )
+
+    @staticmethod
+    def _provider_model(value: object) -> str:
+        if not isinstance(value, str):
+            raise OpenAIAgentConfigurationError
+        model = value.strip()
+        if not model or len(model) > 200:
+            raise OpenAIAgentConfigurationError
+        return model
 
     @classmethod
     def _map_usage(cls, usage: Any) -> AgentUsage:

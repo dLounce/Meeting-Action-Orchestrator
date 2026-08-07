@@ -13,7 +13,10 @@ from meeting_action_orchestrator.application.auditing import (
     append_meeting_transition,
     append_processing_attempt,
 )
-from meeting_action_orchestrator.application.errors import ResourceNotFoundError
+from meeting_action_orchestrator.application.errors import (
+    ProviderBudgetIntegrityError,
+    ResourceNotFoundError,
+)
 from meeting_action_orchestrator.application.ports import Clock, UnitOfWork
 from meeting_action_orchestrator.application.state_machine import transition_meeting
 from meeting_action_orchestrator.domain.enums import (
@@ -28,6 +31,11 @@ from meeting_action_orchestrator.domain.models import (
     Meeting,
     ProcessingJob,
     WorkflowFailure,
+)
+from meeting_action_orchestrator.domain.provider_budget import (
+    DEFAULT_PROVIDER_BUDGET_LIMITS,
+    ProviderBudgetAccount,
+    ProviderBudgetLimits,
 )
 from meeting_action_orchestrator.domain.workflow_events import (
     ProcessingAttemptMetadata,
@@ -91,10 +99,19 @@ class ProcessingScheduler:
         unit_of_work: UnitOfWorkFactory,
         clock: Clock,
         id_factory: Callable[[], UUID] = uuid4,
+        budget_limits: Mapping[ProcessingStage, ProviderBudgetLimits] | None = None,
+        budget_policy_version: int = 1,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._clock = clock
         self._id_factory = id_factory
+        configured = DEFAULT_PROVIDER_BUDGET_LIMITS if budget_limits is None else budget_limits
+        if set(configured) != set(ProcessingStage):
+            raise ValueError("Provider budget limits must cover every processing stage")
+        self._budget_limits = dict(configured)
+        if not 1 <= budget_policy_version <= 1_000:
+            raise ValueError("Provider budget policy version is invalid")
+        self._budget_policy_version = budget_policy_version
 
     def enqueue(self, meeting_id: UUID, stage: ProcessingStage) -> ProcessingJob:
         now = self._clock.now()
@@ -115,6 +132,8 @@ class ProcessingScheduler:
             raise ResourceNotFoundError("Meeting")
         existing = uow.processing_jobs.find_for_stage(meeting_id, stage)
         if existing is not None:
+            if uow.provider_budget_accounts.get(existing.id) is None:
+                raise ProviderBudgetIntegrityError
             return existing
         now = scheduled_at or self._clock.now()
         job = ProcessingJob(
@@ -126,6 +145,15 @@ class ProcessingScheduler:
             updated_at=now,
         )
         uow.processing_jobs.add(job)
+        uow.provider_budget_accounts.add(
+            ProviderBudgetAccount(
+                processing_job_id=job.id,
+                stage=stage,
+                policy_version=self._budget_policy_version,
+                limits=self._budget_limits[stage],
+                created_at=now,
+            )
+        )
         return job
 
 
@@ -140,15 +168,16 @@ class ProcessingWorker:
         worker_id: str,
         lease_duration: timedelta = timedelta(minutes=15),
     ) -> None:
-        if not worker_id.strip():
-            raise ValueError("Worker ID cannot be empty")
+        normalized_worker_id = worker_id.strip()
+        if not normalized_worker_id or len(normalized_worker_id) > 200:
+            raise ValueError("Worker ID is invalid")
         if lease_duration <= timedelta(0):
             raise ValueError("Lease duration must be positive")
         self._unit_of_work = unit_of_work
         self._handlers = dict(handlers)
         self._clock = clock
         self._retry_scheduler = retry_scheduler
-        self._worker_id = worker_id
+        self._worker_id = normalized_worker_id
         self._lease_duration = lease_duration
 
     async def run_once(
@@ -191,11 +220,11 @@ class ProcessingWorker:
             results.append(ProcessingResult(job_id=job.id, outcome=outcome, job=persisted))
         return tuple(results)
 
-    def renew_lease(self, job_id: UUID) -> ProcessingJob | None:
-        now = self._clock.now()
+    def renew_lease(self, job_id: UUID, claim_token: UUID) -> ProcessingJob | None:
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             current = uow.processing_jobs.get(job_id)
-            if not self._owns_live_lease(current, now):
+            if not self._owns_live_lease(current, claim_token, now):
                 return None
             renewed = _replace_job(
                 current,
@@ -207,6 +236,7 @@ class ProcessingWorker:
                 current.status,
                 current.lease_owner,
                 current.lease_expires_at,
+                current.claim_token,
             )
             uow.commit()
         return renewed
@@ -219,20 +249,20 @@ class ProcessingWorker:
     ) -> tuple[ProcessingJob, ...]:
         if limit <= 0 and repair_limit <= 0:
             return ()
-        now = self._clock.now()
-        expired_failure = WorkflowFailure(
-            code=FailureCode.PROVIDER_TIMEOUT,
-            disposition=FailureDisposition.RETRYABLE,
-            safe_message="The processing lease expired before completion",
-            occurred_at=now,
-        )
-        inconsistent_failure = WorkflowFailure(
-            code=FailureCode.INTERNAL,
-            disposition=FailureDisposition.PERMANENT,
-            safe_message="The processing job state is inconsistent",
-            occurred_at=now,
-        )
         with self._unit_of_work() as uow:
+            now = self._clock.now()
+            expired_failure = WorkflowFailure(
+                code=FailureCode.PROVIDER_TIMEOUT,
+                disposition=FailureDisposition.RETRYABLE,
+                safe_message="The processing lease expired before completion",
+                occurred_at=now,
+            )
+            inconsistent_failure = WorkflowFailure(
+                code=FailureCode.INTERNAL,
+                disposition=FailureDisposition.PERMANENT,
+                safe_message="The processing job state is inconsistent",
+                occurred_at=now,
+            )
             expired_jobs = uow.processing_jobs.list_expired_exhausted(
                 stage,
                 now,
@@ -319,6 +349,7 @@ class ProcessingWorker:
             next_attempt_at=None,
             lease_owner=None,
             lease_expires_at=None,
+            claim_token=None,
             last_failure=job_failure,
         )
         if repaired_meeting is not None and meeting is not None:
@@ -330,6 +361,7 @@ class ProcessingWorker:
             job.status,
             job.lease_owner,
             job.lease_expires_at,
+            job.claim_token,
         )
         if has_open_attempt and meeting is not None and status is ProcessingJobStatus.SUCCEEDED:
             append_processing_attempt(
@@ -362,10 +394,12 @@ class ProcessingWorker:
             )
 
     def _finish_success(self, claimed: ProcessingJob) -> ProcessingJob | None:
-        now = self._clock.now()
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             current = uow.processing_jobs.get(claimed.id)
-            if not self._owns_live_lease(current, now):
+            if claimed.claim_token is None or not self._owns_live_lease(
+                current, claimed.claim_token, now
+            ):
                 return None
             completed = _replace_job(
                 current,
@@ -373,6 +407,7 @@ class ProcessingWorker:
                 updated_at=now,
                 lease_owner=None,
                 lease_expires_at=None,
+                claim_token=None,
                 last_failure=None,
             )
             uow.processing_jobs.save(
@@ -380,6 +415,7 @@ class ProcessingWorker:
                 current.status,
                 current.lease_owner,
                 current.lease_expires_at,
+                current.claim_token,
             )
             append_processing_attempt(
                 uow.workflow_events,
@@ -397,10 +433,12 @@ class ProcessingWorker:
         claimed: ProcessingJob,
         failure: WorkflowFailure,
     ) -> ProcessingJob | None:
-        now = self._clock.now()
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             current = uow.processing_jobs.get(claimed.id)
-            if not self._owns_live_lease(current, now):
+            if claimed.claim_token is None or not self._owns_live_lease(
+                current, claimed.claim_token, now
+            ):
                 return None
             meeting = uow.meetings.get(current.meeting_id)
             if meeting is not None and _has_committed_artifact(uow, current, meeting):
@@ -411,6 +449,7 @@ class ProcessingWorker:
                     next_attempt_at=None,
                     lease_owner=None,
                     lease_expires_at=None,
+                    claim_token=None,
                     last_failure=None,
                 )
                 uow.processing_jobs.save(
@@ -418,6 +457,7 @@ class ProcessingWorker:
                     current.status,
                     current.lease_owner,
                     current.lease_expires_at,
+                    current.claim_token,
                 )
                 append_processing_attempt(
                     uow.workflow_events,
@@ -463,6 +503,7 @@ class ProcessingWorker:
                 next_attempt_at=retry_at,
                 lease_owner=None,
                 lease_expires_at=None,
+                claim_token=None,
                 last_failure=effective_failure,
             )
             uow.processing_jobs.save(
@@ -470,6 +511,7 @@ class ProcessingWorker:
                 current.status,
                 current.lease_owner,
                 current.lease_expires_at,
+                current.claim_token,
             )
             append_processing_attempt(
                 uow.workflow_events,
@@ -490,12 +532,14 @@ class ProcessingWorker:
     def _owns_live_lease(
         self,
         job: ProcessingJob | None,
+        claim_token: UUID,
         now: datetime,
     ) -> TypeGuard[ProcessingJob]:
         return (
             job is not None
             and job.status is ProcessingJobStatus.RUNNING
             and job.lease_owner == self._worker_id
+            and job.claim_token == claim_token
             and job.lease_expires_at is not None
             and job.lease_expires_at > now
         )
@@ -585,6 +629,7 @@ def _prepare_claimed_attempt(
             status=ProcessingJobStatus.SUCCEEDED,
             lease_owner=None,
             lease_expires_at=None,
+            claim_token=None,
             last_failure=None,
         )
         uow.processing_jobs.save(
@@ -592,6 +637,7 @@ def _prepare_claimed_attempt(
             claimed.status,
             claimed.lease_owner,
             claimed.lease_expires_at,
+            claimed.claim_token,
         )
         if has_open_attempt:
             append_processing_attempt(
@@ -609,6 +655,7 @@ def _prepare_claimed_attempt(
             status=ProcessingJobStatus.CANCELLED,
             lease_owner=None,
             lease_expires_at=None,
+            claim_token=None,
             last_failure=None,
         )
         uow.processing_jobs.save(
@@ -616,6 +663,7 @@ def _prepare_claimed_attempt(
             claimed.status,
             claimed.lease_owner,
             claimed.lease_expires_at,
+            claimed.claim_token,
         )
         return False
     failure = _reclaimed_attempt_failure(meeting, claimed.stage, now)
@@ -625,6 +673,7 @@ def _prepare_claimed_attempt(
             status=ProcessingJobStatus.FAILED,
             lease_owner=None,
             lease_expires_at=None,
+            claim_token=None,
             last_failure=failure,
         )
         uow.processing_jobs.save(
@@ -632,6 +681,7 @@ def _prepare_claimed_attempt(
             claimed.status,
             claimed.lease_owner,
             claimed.lease_expires_at,
+            claimed.claim_token,
         )
         if has_open_attempt:
             append_processing_attempt(

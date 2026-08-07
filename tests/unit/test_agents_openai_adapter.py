@@ -36,6 +36,7 @@ from meeting_action_orchestrator.infrastructure.openai_agents import (
     OpenAIAgentTimeoutError,
     OpenAIAgentTransientError,
 )
+from tests.provider_budget_support import FakeBudgetController, dispatch_context
 
 
 class FakeClosableClient:
@@ -142,7 +143,10 @@ class FakeReasoning:
 
 
 def configured_runner() -> OpenAIAgentsRunner:
-    runner = OpenAIAgentsRunner(api_key="test")
+    runner = OpenAIAgentsRunner(
+        api_key="test",
+        budget_controller=FakeBudgetController(),
+    )
     runner._openai = SimpleNamespace(
         APIConnectionError=APIConnectionError,
         APITimeoutError=APITimeoutError,
@@ -182,7 +186,48 @@ def transcript_input() -> TranscriptInput:
 
 def test_openai_adapter_rejects_hidden_sdk_retries() -> None:
     with pytest.raises(OpenAIAgentConfigurationError):
-        OpenAIAgentsRunner(api_key="test", max_retries=1)
+        OpenAIAgentsRunner(
+            api_key="test",
+            budget_controller=FakeBudgetController(),
+            max_retries=1,
+        )
+
+
+def test_openai_adapter_rejects_unverified_tracing_transport() -> None:
+    with pytest.raises(OpenAIAgentConfigurationError):
+        OpenAIAgentsRunner(
+            api_key="test",
+            budget_controller=FakeBudgetController(),
+            tracing_enabled=True,
+        )
+
+
+@pytest.mark.parametrize("model", ["", " ", "g" * 201])
+@pytest.mark.asyncio
+async def test_openai_adapter_rejects_invalid_model_before_dispatch(model: str) -> None:
+    controller = FakeBudgetController()
+    runner = OpenAIAgentsRunner(api_key="test", budget_controller=controller)
+    definition = AgentDefinition(
+        name="test",
+        instructions="Return the supplied transcript",
+        model=model,
+        output_type=TranscriptInput,
+        reasoning_effort="low",
+        max_output_tokens=10,
+    )
+    context = AgentRunContext(
+        job_id="job_1",
+        stage="extract",
+        budget=AgentBudget(max_requests=1, max_output_tokens=10),
+        dispatch=dispatch_context(),
+    )
+
+    with pytest.raises(OpenAIAgentConfigurationError) as captured:
+        await runner.run(definition, transcript_input(), context)
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert controller.reservations == []
 
 
 def test_openai_adapter_errors_implement_provider_failure_contracts() -> None:
@@ -216,7 +261,10 @@ async def test_openai_adapter_closes_and_recreates_its_client() -> None:
         assert use_for_tracing is False
         configured.append(client)
 
-    runner = OpenAIAgentsRunner(api_key="test")
+    runner = OpenAIAgentsRunner(
+        api_key="test",
+        budget_controller=FakeBudgetController(),
+    )
     runner._openai = SimpleNamespace(AsyncOpenAI=create_client)
     sdk = SimpleNamespace(set_default_openai_client=configure_client)
 
@@ -305,14 +353,17 @@ async def test_openai_adapter_sends_a_unique_client_request_id_per_run() -> None
         ModelSettings=namespace,
         retry_policies=policies,
     )
-    runner = OpenAIAgentsRunner(api_key="test")
+    runner = OpenAIAgentsRunner(
+        api_key="test",
+        budget_controller=FakeBudgetController(),
+    )
     runner._sdk = sdk
     runner._client = object()
     runner._reasoning_type = FakeReasoning
     definition = AgentDefinition(
         name="test",
         instructions="Return the supplied transcript",
-        model="test-model",
+        model=" test-model ",
         output_type=TranscriptInput,
         reasoning_effort="low",
         max_output_tokens=10,
@@ -321,6 +372,7 @@ async def test_openai_adapter_sends_a_unique_client_request_id_per_run() -> None
         job_id="job_1",
         stage="extract",
         budget=AgentBudget(max_requests=1, max_output_tokens=10),
+        dispatch=dispatch_context(),
     )
     SuccessfulRunner.agents = []
 
@@ -333,6 +385,8 @@ async def test_openai_adapter_sends_a_unique_client_request_id_per_run() -> None
     )
     assert len(set(client_request_ids)) == 2
     assert all(str(UUID(value)) == value for value in client_request_ids)
+    assert all(agent.model == "test-model" for agent in SuccessfulRunner.agents)
+    assert first.model == second.model == "test-model"
     assert first.workflow_request_ids == (client_request_ids[0],)
     assert second.workflow_request_ids == (client_request_ids[1],)
 
@@ -508,7 +562,10 @@ def test_openai_adapter_detaches_sdk_import_error_context(
         "meeting_action_orchestrator.infrastructure.openai_agents.import_module",
         fail_import,
     )
-    runner = OpenAIAgentsRunner(api_key="test")
+    runner = OpenAIAgentsRunner(
+        api_key="test",
+        budget_controller=FakeBudgetController(),
+    )
 
     with pytest.raises(OpenAIAgentConfigurationError) as captured:
         runner._load_bindings()
@@ -564,6 +621,7 @@ async def test_openai_adapter_raises_sanitized_error_without_raw_exception_conte
         job_id="job_1",
         stage="extract",
         budget=AgentBudget(max_requests=1, max_output_tokens=10),
+        dispatch=dispatch_context(),
     )
 
     with pytest.raises(OpenAIAgentTransientError) as captured:

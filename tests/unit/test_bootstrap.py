@@ -239,6 +239,40 @@ def test_delivery_lease_covers_connector_timeout_and_session_cleanup(tmp_path: P
     assert lease.total_seconds() == 630
 
 
+def test_application_snapshots_configured_provider_budgets(tmp_path: Path) -> None:
+    app = create_application(
+        settings(
+            tmp_path,
+            openai_budget_policy_version=7,
+            openai_extraction_preflight_request_limit=9,
+            openai_extraction_provider_request_limit=8,
+            openai_extraction_input_token_limit=700_000,
+            openai_extraction_output_token_limit=30_000,
+            openai_transcription_provider_request_limit=4,
+            openai_transcription_audio_duration_ms_limit=28_800_000,
+        )
+    )
+
+    workflow = next(iter(app.state.runtime.processing._handlers.values())).__self__
+    scheduler = workflow._processing_scheduler
+
+    assert scheduler._budget_policy_version == 7
+    assert scheduler._budget_limits[ProcessingStage.EXTRACTION].model_dump() == {
+        "preflight_request_limit": 9,
+        "provider_request_limit": 8,
+        "input_token_limit": 700_000,
+        "output_token_limit": 30_000,
+        "audio_duration_ms_limit": None,
+    }
+    assert scheduler._budget_limits[ProcessingStage.TRANSCRIPTION].model_dump() == {
+        "preflight_request_limit": None,
+        "provider_request_limit": 4,
+        "input_token_limit": None,
+        "output_token_limit": None,
+        "audio_duration_ms_limit": 28_800_000,
+    }
+
+
 async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
     database = FakeDatabase()
     processing = FakeProcessingRunner()

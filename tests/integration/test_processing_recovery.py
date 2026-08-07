@@ -82,6 +82,7 @@ def expire_job(
                 "next_attempt_at": None,
                 "lease_owner": "crashed-worker",
                 "lease_expires_at": clock.now() + timedelta(seconds=lease_seconds),
+                "claim_token": UUID(int=9001),
                 "last_failure": None,
                 "updated_at": clock.now(),
             }
@@ -91,6 +92,7 @@ def expire_job(
             current.status,
             current.lease_owner,
             current.lease_expires_at,
+            current.claim_token,
         )
         uow.commit()
     return expired
@@ -494,6 +496,7 @@ async def test_stale_worker_cannot_overwrite_repaired_job(tmp_path: Path) -> Non
             current.status,
             current.lease_owner,
             current.lease_expires_at,
+            current.claim_token,
         )
         uow.commit()
     started = asyncio.Event()

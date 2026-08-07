@@ -47,13 +47,36 @@ class Settings(BaseSettings):
     openai_recap_model: str = "gpt-5.6-terra"
     openai_worker_model: str = "gpt-5.4-mini"
     openai_transcription_model: str = "gpt-4o-transcribe-diarize"
-    openai_timeout_seconds: float = Field(default=120.0, gt=0)
+    openai_timeout_seconds: float = Field(default=120.0, gt=0, le=120)
     openai_max_retries: int = Field(default=0, ge=0, le=0)
     openai_max_requests_per_run: int = Field(default=5, ge=3, le=20)
     openai_max_output_tokens_per_run: int = Field(default=12_000, ge=1_000)
     openai_extractor_max_output_tokens: int = Field(default=6_500, ge=500)
     openai_recap_max_output_tokens: int = Field(default=2_500, ge=500)
     openai_verifier_max_output_tokens: int = Field(default=3_000, ge=500)
+    openai_budget_policy_version: int = Field(default=1, ge=1, le=1_000)
+    openai_extraction_preflight_request_limit: int = Field(default=6, ge=3, le=1_000)
+    openai_extraction_provider_request_limit: int = Field(default=6, ge=3, le=1_000)
+    openai_extraction_input_token_limit: int = Field(
+        default=800_000,
+        ge=1,
+        le=1_000_000_000_000,
+    )
+    openai_extraction_output_token_limit: int = Field(
+        default=24_000,
+        ge=1,
+        le=1_000_000_000_000,
+    )
+    openai_transcription_provider_request_limit: int = Field(
+        default=3,
+        ge=1,
+        le=1_000,
+    )
+    openai_transcription_audio_duration_ms_limit: int = Field(
+        default=21_600_000,
+        ge=1,
+        le=1_000_000_000_000,
+    )
     openai_tracing_enabled: bool = False
 
     mcp_server_url: str | None = None
@@ -99,6 +122,21 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator(
+        "openai_recap_model",
+        "openai_worker_model",
+        "openai_transcription_model",
+        mode="before",
+    )
+    @classmethod
+    def normalize_openai_model(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if not 1 <= len(normalized) <= 200:
+            raise ValueError("OpenAI model names must contain 1 to 200 characters")
+        return normalized
+
     @field_validator("erasure_hmac_keys", mode="before")
     @classmethod
     def normalize_erasure_keyring(cls, value: object) -> object:
@@ -137,6 +175,10 @@ class Settings(BaseSettings):
         )
         if self.openai_max_output_tokens_per_run < specialist_budget:
             raise ValueError("The run output budget must cover all specialist limits")
+        if self.openai_extraction_output_token_limit < specialist_budget:
+            raise ValueError("The durable output budget must cover one specialist run")
+        if self.openai_tracing_enabled:
+            raise ValueError("OpenAI tracing is disabled for budgeted provider requests")
         if self.mcp_server_url is None:
             return self
         parsed = urlsplit(self.mcp_server_url)

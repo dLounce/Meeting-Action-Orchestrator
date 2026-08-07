@@ -100,6 +100,7 @@ def map_transcription(
         text=output.text,
         segments=tuple(segments),
         provider_request_id=output.provider_request_id,
+        usage=output.usage,
         created_at=created_at,
     )
 

@@ -168,7 +168,7 @@ def test_v9_rebuild_preserves_cleanup_rows_and_ownership_triggers(
             ).fetchall()
         )
 
-    assert database.migrate() == 10
+    assert database.migrate() == 11
     with database.connect() as connection:
         after = tuple(
             dict(row)
@@ -335,7 +335,7 @@ def test_v9_failure_restores_exact_v8_schema_and_data_then_retries(
             is None
         )
 
-    assert database.migrate() == 10
+    assert database.migrate() == 11
     with database.connect() as connection:
         assert dict(connection.execute("SELECT * FROM recording_cleanup_jobs").fetchone()) == (
             before_row

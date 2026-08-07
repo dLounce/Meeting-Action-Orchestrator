@@ -136,6 +136,7 @@ class ProcessingControlService:
                     "next_attempt_at": None,
                     "lease_owner": None,
                     "lease_expires_at": None,
+                    "claim_token": None,
                     "last_failure": None,
                     "updated_at": now,
                 }
@@ -161,6 +162,7 @@ class ProcessingControlService:
                 job.status,
                 job.lease_owner,
                 job.lease_expires_at,
+                job.claim_token,
             )
             uow.meetings.save(updated, meeting.version)
             uow.meeting_operations.add(binding)
@@ -222,6 +224,7 @@ class ProcessingControlService:
                     original.status,
                     original.lease_owner,
                     original.lease_expires_at,
+                    original.claim_token,
                 )
             uow.meetings.save(cancelled, meeting.version)
             uow.meeting_operations.add(binding)

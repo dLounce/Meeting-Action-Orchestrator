@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -43,6 +44,18 @@ class FrozenClock:
 
     def now(self) -> datetime:
         return self.current
+
+
+class AdvancingUnitOfWork(SqliteUnitOfWork):
+    def __init__(self, database: Database, clock: FrozenClock, advance: timedelta) -> None:
+        super().__init__(database)
+        self._clock = clock
+        self._advance = advance
+
+    def __enter__(self) -> SqliteUnitOfWork:
+        entered = super().__enter__()
+        self._clock.current += self._advance
+        return entered
 
 
 class FixedRetryScheduler:
@@ -170,8 +183,11 @@ def test_expired_lease_is_reclaimed_until_attempts_are_exhausted(tmp_path: Path)
         uow.commit()
 
     assert first[0].attempt_count == 1
+    assert first[0].claim_token is not None
     assert unavailable == ()
     assert reclaimed[0].attempt_count == 2
+    assert reclaimed[0].claim_token is not None
+    assert reclaimed[0].claim_token != first[0].claim_token
     assert exhausted == ()
     assert current is not None
     assert current.status is ProcessingJobStatus.RUNNING
@@ -208,6 +224,7 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
                 max_attempts=2,
                 lease_owner="worker-a",
                 lease_expires_at=NOW + timedelta(seconds=4),
+                claim_token=job_ids[3],
                 created_at=NOW,
                 updated_at=NOW,
             ),
@@ -220,6 +237,7 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
                 max_attempts=2,
                 lease_owner="worker-a",
                 lease_expires_at=NOW + timedelta(seconds=5),
+                claim_token=job_ids[1],
                 created_at=NOW,
                 updated_at=NOW,
             ),
@@ -232,6 +250,7 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
                 max_attempts=2,
                 lease_owner="worker-a",
                 lease_expires_at=NOW + timedelta(seconds=5),
+                claim_token=job_ids[0],
                 created_at=NOW,
                 updated_at=NOW,
             ),
@@ -244,6 +263,7 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
                 max_attempts=2,
                 lease_owner="worker-a",
                 lease_expires_at=NOW + timedelta(seconds=5),
+                claim_token=job_ids[2],
                 created_at=NOW + timedelta(seconds=1),
                 updated_at=NOW + timedelta(seconds=1),
             ),
@@ -256,6 +276,7 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
                 max_attempts=2,
                 lease_owner="worker-a",
                 lease_expires_at=NOW + timedelta(seconds=4),
+                claim_token=job_ids[4],
                 created_at=NOW,
                 updated_at=NOW,
             ),
@@ -268,6 +289,7 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
                 max_attempts=3,
                 lease_owner="worker-a",
                 lease_expires_at=NOW + timedelta(seconds=4),
+                claim_token=job_ids[5],
                 created_at=NOW,
                 updated_at=NOW,
             ),
@@ -309,6 +331,220 @@ def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> N
     )
     assert before == ()
     assert empty_limit == ()
+
+
+def test_offset_leases_are_compared_by_instant_before_reclaim(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = FrozenClock()
+    create_scheduler(database, clock).enqueue(MEETING_ID, ProcessingStage.EXTRACTION)
+    with SqliteUnitOfWork(database) as uow:
+        first = uow.processing_jobs.claim_due(
+            ProcessingStage.EXTRACTION,
+            "worker-a",
+            NOW,
+            NOW + timedelta(minutes=1),
+            1,
+        )[0]
+        uow.commit()
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET lease_expires_at = ? WHERE id = ?",
+            ("2026-08-07T14:31:00+05:30", str(first.id)),
+        )
+    with SqliteUnitOfWork(database) as uow:
+        live = uow.processing_jobs.claim_due(
+            ProcessingStage.EXTRACTION,
+            "worker-a",
+            NOW + timedelta(seconds=30),
+            NOW + timedelta(minutes=2),
+            1,
+        )
+        uow.commit()
+    assert live == ()
+
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET lease_expires_at = ? WHERE id = ?",
+            ("2026-08-07T06:59:00-02:00", str(first.id)),
+        )
+    with SqliteUnitOfWork(database) as uow:
+        reclaimed = uow.processing_jobs.claim_due(
+            ProcessingStage.EXTRACTION,
+            "worker-a",
+            NOW + timedelta(seconds=30),
+            NOW + timedelta(minutes=2),
+            1,
+        )
+        uow.commit()
+
+    assert reclaimed[0].attempt_count == 2
+    assert reclaimed[0].claim_token != first.claim_token
+
+
+def test_offset_expiry_order_and_claim_token_uniqueness(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    with SqliteUnitOfWork(database) as uow:
+        uow.meetings.add(
+            Meeting(
+                id=SECOND_MEETING_ID,
+                ingest_key="processing-second",
+                title="Processing second",
+                audio_asset_id=ASSET_ID,
+                occurred_at=NOW,
+                timezone="UTC",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        first = ProcessingJob(
+            id=JOB_ID,
+            meeting_id=MEETING_ID,
+            stage=ProcessingStage.EXTRACTION,
+            status=ProcessingJobStatus.RUNNING,
+            attempt_count=2,
+            max_attempts=2,
+            lease_owner="worker-a",
+            lease_expires_at=NOW + timedelta(seconds=4),
+            claim_token=JOB_ID,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        second = ProcessingJob(
+            id=SECOND_JOB_ID,
+            meeting_id=SECOND_MEETING_ID,
+            stage=ProcessingStage.EXTRACTION,
+            status=ProcessingJobStatus.RUNNING,
+            attempt_count=2,
+            max_attempts=2,
+            lease_owner="worker-a",
+            lease_expires_at=NOW + timedelta(seconds=5),
+            claim_token=SECOND_JOB_ID,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        uow.processing_jobs.add(first)
+        uow.processing_jobs.add(second)
+        uow.commit()
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE processing_jobs SET lease_expires_at = ? WHERE id = ?",
+            ("2026-08-07T14:30:04+05:30", str(first.id)),
+        )
+        connection.execute(
+            "UPDATE processing_jobs SET lease_expires_at = ? WHERE id = ?",
+            ("2026-08-07T07:00:05-02:00", str(second.id)),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "UPDATE processing_jobs SET claim_token = ? WHERE id = ?",
+                (str(first.claim_token), str(second.id)),
+            )
+    with SqliteUnitOfWork(database) as uow:
+        ordered = uow.processing_jobs.list_expired_exhausted(
+            ProcessingStage.EXTRACTION,
+            NOW + timedelta(seconds=5),
+            2,
+        )
+
+    assert tuple(job.id for job in ordered) == (first.id, second.id)
+
+
+def test_claim_token_survives_renewal_and_blocks_stale_finalization(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = FrozenClock()
+    create_scheduler(database, clock).enqueue(MEETING_ID, ProcessingStage.TRANSCRIPTION)
+    worker = ProcessingWorker(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        handlers={},
+        clock=clock,
+        retry_scheduler=FixedRetryScheduler(),
+        worker_id=" worker-a ",
+        lease_duration=timedelta(seconds=10),
+    )
+
+    first = worker._claim(ProcessingStage.TRANSCRIPTION, 1)[0]
+    assert first.claim_token is not None
+    assert first.lease_owner == "worker-a"
+    clock.current += timedelta(seconds=1)
+    renewed = worker.renew_lease(first.id, first.claim_token)
+    assert renewed is not None
+    assert renewed.lease_expires_at is not None
+    assert renewed.claim_token == first.claim_token
+    assert renewed.lease_expires_at == clock.now() + timedelta(seconds=10)
+    assert worker.renew_lease(first.id, UUID(int=9999)) is None
+
+    clock.current = renewed.lease_expires_at
+    with SqliteUnitOfWork(database) as uow:
+        replacement = uow.processing_jobs.claim_due(
+            ProcessingStage.TRANSCRIPTION,
+            "worker-a",
+            clock.now(),
+            clock.now() + timedelta(seconds=10),
+            1,
+        )[0]
+        uow.commit()
+    assert replacement.claim_token != first.claim_token
+    assert worker._finish_success(first) is None
+    with SqliteUnitOfWork(database) as uow:
+        current = uow.processing_jobs.get(first.id)
+    assert current is not None
+    assert current.status is ProcessingJobStatus.RUNNING
+    assert current.claim_token == replacement.claim_token
+
+
+def test_worker_samples_claim_and_finish_time_after_transaction_acquisition(
+    tmp_path: Path,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = FrozenClock()
+    create_scheduler(database, clock).enqueue(MEETING_ID, ProcessingStage.TRANSCRIPTION)
+    delayed_claim = ProcessingWorker(
+        unit_of_work=lambda: AdvancingUnitOfWork(
+            database,
+            clock,
+            timedelta(seconds=20),
+        ),
+        handlers={},
+        clock=clock,
+        retry_scheduler=FixedRetryScheduler(),
+        worker_id="worker-a",
+        lease_duration=timedelta(seconds=10),
+    )
+
+    claimed = delayed_claim._claim(ProcessingStage.TRANSCRIPTION, 1)[0]
+    assert claimed.updated_at == NOW + timedelta(seconds=20)
+    assert claimed.lease_expires_at == NOW + timedelta(seconds=30)
+
+    clock.current = NOW + timedelta(seconds=29)
+    delayed_finish = ProcessingWorker(
+        unit_of_work=lambda: AdvancingUnitOfWork(
+            database,
+            clock,
+            timedelta(seconds=1),
+        ),
+        handlers={},
+        clock=clock,
+        retry_scheduler=FixedRetryScheduler(),
+        worker_id="worker-a",
+        lease_duration=timedelta(seconds=10),
+    )
+    assert delayed_finish._finish_success(claimed) is None
+    with SqliteUnitOfWork(database) as uow:
+        current = uow.processing_jobs.get(claimed.id)
+    assert current is not None
+    assert current.status is ProcessingJobStatus.RUNNING
+
+
+def test_processing_worker_rejects_oversized_identity(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    with pytest.raises(ValueError, match="Worker ID"):
+        ProcessingWorker(
+            unit_of_work=lambda: SqliteUnitOfWork(database),
+            handlers={},
+            clock=FrozenClock(),
+            retry_scheduler=FixedRetryScheduler(),
+            worker_id="x" * 201,
+        )
 
 
 async def test_worker_releases_claim_transaction_before_handler(tmp_path: Path) -> None:

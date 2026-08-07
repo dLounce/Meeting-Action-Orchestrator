@@ -19,6 +19,8 @@ from meeting_action_orchestrator.application.meeting_erasure import (
     MeetingErasureResult,
     MeetingErasureService,
 )
+from meeting_action_orchestrator.application.processing import ProcessingScheduler
+from meeting_action_orchestrator.application.provider_budget import ProviderBudgetService
 from meeting_action_orchestrator.domain.enums import (
     AudioMediaType,
     DeliveryOperationKind,
@@ -28,6 +30,10 @@ from meeting_action_orchestrator.domain.enums import (
     MeetingErasureRecordingState,
     ProcessingJobStatus,
     ProcessingStage,
+    ProviderCallRole,
+    ProviderOperation,
+    ProviderSettlementOutcome,
+    ProviderUsageKind,
     RecordingCleanupReason,
     RecordingCleanupStatus,
 )
@@ -41,6 +47,11 @@ from meeting_action_orchestrator.domain.models import (
     MeetingErasureTombstone,
     ProcessingJob,
     RecordingCleanupJob,
+)
+from meeting_action_orchestrator.domain.provider_budget import (
+    ProviderBudgetReservationRequest,
+    ProviderDispatchContext,
+    ProviderUsage,
 )
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.erasure_tokens import (
@@ -251,6 +262,74 @@ def add_full_graph(database: Database, value: Meeting) -> None:
         )
 
 
+def add_provider_budget_graph(database: Database, value: Meeting) -> None:
+    job_id = UUID(int=20_009)
+    scheduler = ProcessingScheduler(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        clock=FrozenClock(),
+        id_factory=lambda: job_id,
+    )
+    scheduler.enqueue(value.id, ProcessingStage.TRANSCRIPTION)
+    with SqliteUnitOfWork(database) as uow:
+        claimed = uow.processing_jobs.claim_due(
+            ProcessingStage.TRANSCRIPTION,
+            "provider-budget-worker",
+            NOW,
+            NOW + timedelta(minutes=5),
+            1,
+        )[0]
+        uow.commit()
+    assert claimed.claim_token is not None
+    controller = ProviderBudgetService(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        clock=FrozenClock(),
+        id_factory=lambda: UUID(int=20_010),
+    )
+    reservation = controller._reserve(
+        ProviderDispatchContext(
+            processing_job_id=claimed.id,
+            attempt_number=claimed.attempt_count,
+            lease_owner="provider-budget-worker",
+            claim_token=claimed.claim_token,
+        ),
+        ProviderBudgetReservationRequest(
+            dispatch_key="erasure-provider-call",
+            operation_digest="1" * 64,
+            operation=ProviderOperation.TRANSCRIPTION_CREATE,
+            role=ProviderCallRole.TRANSCRIPTION,
+            model="transcribe-test",
+            reserved_audio_duration_ms=4_000,
+        ),
+    )
+    controller._settle(
+        reservation.id,
+        outcome=ProviderSettlementOutcome.SUCCEEDED,
+        usage=ProviderUsage(
+            kind=ProviderUsageKind.DURATION,
+            audio_duration_ms=4_000,
+        ),
+    )
+    succeeded = ProcessingJob.model_validate(
+        claimed.model_dump(mode="python")
+        | {
+            "status": ProcessingJobStatus.SUCCEEDED,
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "claim_token": None,
+            "updated_at": NOW,
+        }
+    )
+    with SqliteUnitOfWork(database) as uow:
+        uow.processing_jobs.save(
+            succeeded,
+            claimed.status,
+            claimed.lease_owner,
+            claimed.lease_expires_at,
+            claimed.claim_token,
+        )
+        uow.commit()
+
+
 def cleanup_job(
     number: int,
     digest: str,
@@ -279,6 +358,7 @@ def test_request_purges_full_graph_and_creates_token_only_state(tmp_path: Path) 
     value = meeting(1, audio.id)
     seed_meeting(database, value, audio)
     add_full_graph(database, value)
+    add_provider_budget_graph(database, value)
 
     result = service(database, tokens)._request(value.id, 0, "erase-request", "actor")
 
@@ -293,6 +373,18 @@ def test_request_purges_full_graph_and_creates_token_only_state(tmp_path: Path) 
         assert connection.execute("SELECT COUNT(*) FROM write_attempts").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM write_receipts").fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM workflow_events").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM processing_jobs").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM provider_budget_accounts").fetchone()[0] == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM provider_budget_reservations").fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM provider_budget_settlements").fetchone()[0]
+            == 0
+        )
         assert (
             connection.execute("SELECT COUNT(*) FROM delivery_operation_bindings").fetchone()[0]
             == 0
@@ -543,6 +635,7 @@ def processing_job(meeting_id: UUID) -> ProcessingJob:
         max_attempts=3,
         lease_owner="worker",
         lease_expires_at=NOW + timedelta(minutes=1),
+        claim_token=UUID(int=40_002),
         created_at=NOW,
         updated_at=NOW,
     )

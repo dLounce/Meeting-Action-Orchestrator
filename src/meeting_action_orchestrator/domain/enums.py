@@ -39,6 +39,39 @@ class ProcessingJobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ProviderOperation(str, Enum):
+    RESPONSES_PREFLIGHT = "responses_input_token_count"
+    RESPONSES_CREATE = "responses_create"
+    TRANSCRIPTION_CREATE = "transcription_create"
+
+
+class ProviderCallRole(str, Enum):
+    TRANSCRIPTION = "transcription"
+    EXTRACT = "extract"
+    RECAP = "recap"
+    VERIFY = "verify"
+
+
+class ProviderSettlementOutcome(str, Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+
+
+class ProviderUsageKind(str, Enum):
+    NONE = "none"
+    TOKENS = "tokens"
+    DURATION = "duration"
+
+
+class ProviderBudgetDimension(str, Enum):
+    PREFLIGHT_REQUESTS = "preflight_requests"
+    PROVIDER_REQUESTS = "provider_requests"
+    INPUT_TOKENS = "input_tokens"
+    OUTPUT_TOKENS = "output_tokens"
+    AUDIO_DURATION_MS = "audio_duration_ms"
+
+
 class RecordingCleanupReason(str, Enum):
     ABANDONED_INGEST = "abandoned_ingest"
     ORPHAN_RECONCILIATION = "orphan_reconciliation"
@@ -158,6 +191,7 @@ class FailureCode(str, Enum):
     RATE_LIMITED = "rate_limited"
     PROVIDER_TIMEOUT = "provider_timeout"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    PROVIDER_BUDGET_EXHAUSTED = "provider_budget_exhausted"
     INVALID_MODEL_OUTPUT = "invalid_model_output"
     PROVIDER_AUTH = "provider_auth"
     CONNECTOR_AUTH = "connector_auth"

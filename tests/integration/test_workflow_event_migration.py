@@ -142,8 +142,8 @@ def installed_triggers(connection: sqlite3.Connection) -> set[str]:
 def test_v10_fresh_install_is_idempotent_and_integral(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 10
-    assert database.migrate() == 10
+    assert database.migrate() == 11
+    assert database.migrate() == 11
     with database.connect() as connection:
         assert installed_triggers(connection) == TRIGGERS
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -167,8 +167,8 @@ def test_v10_upgrade_preserves_contiguous_v9_events(
             ).fetchall()
         )
 
-    assert database.migrate() == 10
-    assert database.migrate() == 10
+    assert database.migrate() == 11
+    assert database.migrate() == 11
     with database.connect() as connection:
         after = tuple(
             dict(row)
@@ -352,7 +352,7 @@ def test_v10_rejects_legacy_gaps_without_partial_migration(
             (SECOND_EVENT_ID,),
         )
 
-    assert database.migrate() == 10
+    assert database.migrate() == 11
 
 
 def test_v10_failure_rolls_back_installed_triggers_and_retries(
@@ -382,4 +382,4 @@ def test_v10_failure_rolls_back_installed_triggers_and_retries(
         assert connection.execute("SELECT COUNT(*) FROM workflow_events").fetchone()[0] == 1
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
-    assert database.migrate() == 10
+    assert database.migrate() == 11

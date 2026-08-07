@@ -11,14 +11,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import (
     AfterValidator,
     AwareDatetime,
-    BaseModel,
-    ConfigDict,
     Field,
     StringConstraints,
     field_validator,
     model_validator,
 )
 
+from meeting_action_orchestrator.domain.base import DomainModel, Sha256Digest
 from meeting_action_orchestrator.domain.enums import (
     AudioMediaType,
     DeadlineKind,
@@ -52,12 +51,12 @@ from meeting_action_orchestrator.domain.errors import (
     InvariantCode,
 )
 from meeting_action_orchestrator.domain.hashing import canonical_sha256, text_sha256
+from meeting_action_orchestrator.domain.provider_budget import ProviderUsage
 
 ShortText = Annotated[str, StringConstraints(min_length=1, max_length=200)]
 MediumText = Annotated[str, StringConstraints(min_length=1, max_length=1_000)]
 DetailedText = Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
 LongText = Annotated[str, StringConstraints(min_length=1, max_length=10_000)]
-Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 ErasureKeyId = Annotated[
     str,
     StringConstraints(
@@ -85,10 +84,6 @@ TimezoneName = Annotated[
     StringConstraints(min_length=1, max_length=100),
     AfterValidator(_validate_timezone),
 ]
-
-
-class DomainModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
 
 class WorkflowFailure(DomainModel):
@@ -199,6 +194,7 @@ class ProcessingJob(DomainModel):
     next_attempt_at: AwareDatetime | None = None
     lease_owner: ShortText | None = None
     lease_expires_at: AwareDatetime | None = None
+    claim_token: UUID | None = None
     last_failure: WorkflowFailure | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
@@ -216,11 +212,19 @@ class ProcessingJob(DomainModel):
     @model_validator(mode="after")
     def validate_lease(self) -> ProcessingJob:
         if self.status is ProcessingJobStatus.RUNNING:
-            if self.lease_owner is None or self.lease_expires_at is None:
+            if (
+                self.lease_owner is None
+                or self.lease_expires_at is None
+                or self.claim_token is None
+            ):
                 raise DomainInvariantError(InvariantCode.JOB_LEASE_REQUIRED)
             if self.lease_expires_at <= self.updated_at:
                 raise DomainInvariantError(InvariantCode.JOB_LEASE_EXPIRY)
-        elif self.lease_owner is not None or self.lease_expires_at is not None:
+        elif (
+            self.lease_owner is not None
+            or self.lease_expires_at is not None
+            or self.claim_token is not None
+        ):
             raise DomainInvariantError(InvariantCode.JOB_LEASE_FORBIDDEN)
         return self
 
@@ -786,6 +790,7 @@ class Transcript(DomainModel):
     segments: tuple[TranscriptSegment, ...] = Field(min_length=1, max_length=5_000)
     sha256: str = ""
     provider_request_id: ShortText | None = None
+    usage: ProviderUsage | None = None
     created_at: AwareDatetime
 
     @model_validator(mode="after")

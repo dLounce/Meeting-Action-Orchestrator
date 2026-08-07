@@ -25,6 +25,8 @@ from meeting_action_orchestrator.application.auditing import (
 from meeting_action_orchestrator.application.errors import (
     AudioAssetIdentityMismatchError,
     OperationConflictError,
+    ProviderBudgetExhaustedError,
+    ProviderBudgetIntegrityError,
     ProviderConfigurationError,
     ProviderError,
     ProviderInputError,
@@ -54,6 +56,7 @@ from meeting_action_orchestrator.application.ports import (
     SpecialistProvider,
     StoredAudio,
     TranscriptionProvider,
+    TranscriptionRunContext,
     UnitOfWork,
 )
 from meeting_action_orchestrator.application.processing import (
@@ -105,6 +108,7 @@ from meeting_action_orchestrator.domain.models import (
     WorkflowFailure,
     WriteIntent,
 )
+from meeting_action_orchestrator.domain.provider_budget import ProviderDispatchContext
 from meeting_action_orchestrator.domain.services import (
     approve_review,
     create_recap_artifact,
@@ -678,9 +682,16 @@ class MeetingWorkflow:
             job=job,
         )
         asset = await asyncio.to_thread(self._load_audio_asset, meeting.audio_asset_id)
+        dispatch = _provider_dispatch_context(job)
         try:
             output = await self._transcriber.transcribe(
-                self._recording_store.path(asset.storage_key)
+                self._recording_store.path(asset.storage_key),
+                context=TranscriptionRunContext(
+                    dispatch=dispatch,
+                    audio_duration_ms=asset.duration_ms,
+                    audio_size_bytes=asset.size_bytes,
+                    audio_sha256=asset.sha256,
+                ),
             )
             transcript = map_transcription(meeting, output, self._clock.now())
         except Exception as error:
@@ -715,11 +726,12 @@ class MeetingWorkflow:
             meeting.id,
         )
         budget = AgentBudget(self._max_agent_requests, self._max_agent_output_tokens)
+        dispatch = _provider_dispatch_context(job)
         try:
             extraction_request = build_extraction_request(meeting, transcript)
             extraction = await self._specialists.extract(
                 extraction_request,
-                AgentRunContext(str(job.id), "extract", budget),
+                AgentRunContext(str(job.id), "extract", budget, dispatch),
             )
             extraction_handoff = await asyncio.to_thread(
                 specialist_handoff_draft,
@@ -734,7 +746,7 @@ class MeetingWorkflow:
             recap_request = RecapRequest(meeting_id=str(meeting.id), record=record)
             recap = await self._specialists.write_recap(
                 recap_request,
-                AgentRunContext(str(job.id), "recap", budget),
+                AgentRunContext(str(job.id), "recap", budget, dispatch),
             )
             recap_handoff = await asyncio.to_thread(
                 specialist_handoff_draft,
@@ -753,7 +765,7 @@ class MeetingWorkflow:
             )
             verification = await self._specialists.verify(
                 verification_request,
-                AgentRunContext(str(job.id), "verify", budget),
+                AgentRunContext(str(job.id), "verify", budget, dispatch),
             )
             verification_handoff = await asyncio.to_thread(
                 specialist_handoff_draft,
@@ -807,8 +819,8 @@ class MeetingWorkflow:
         transcript: Transcript,
         job: ProcessingJob,
     ) -> Meeting:
-        now = self._clock.now()
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             self._require_active_job(uow, job, ProcessingStage.TRANSCRIPTION, now)
             current = _required(uow.meetings.get(meeting_id), "Meeting")
             completed = transition_meeting(
@@ -843,8 +855,8 @@ class MeetingWorkflow:
         job: ProcessingJob,
         handoffs: tuple[WorkflowEventDraft, WorkflowEventDraft, WorkflowEventDraft],
     ) -> Meeting:
-        now = self._clock.now()
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             self._require_active_job(uow, job, ProcessingStage.EXTRACTION, now)
             current = _required(uow.meetings.get(meeting_id), "Meeting")
             completed = transition_meeting(
@@ -874,8 +886,8 @@ class MeetingWorkflow:
         *,
         job: ProcessingJob,
     ) -> Meeting:
-        now = self._clock.now()
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             stage = _processing_stage_for(target)
             self._require_active_job(uow, job, stage, now)
             current = _required(uow.meetings.get(meeting.id), "Meeting")
@@ -911,8 +923,8 @@ class MeetingWorkflow:
         *,
         job: ProcessingJob,
     ) -> None:
-        now = self._clock.now()
         with self._unit_of_work() as uow:
+            now = self._clock.now()
             self._require_active_job(
                 uow,
                 job,
@@ -938,9 +950,9 @@ class MeetingWorkflow:
         job: ProcessingJob,
         stage: ProcessingStage,
     ) -> WorkflowFailure | None:
-        now = self._clock.now()
         try:
             with self._unit_of_work() as uow:
+                now = self._clock.now()
                 self._require_active_job(uow, job, stage, now)
         except WorkflowBusyError:
             return _invalid_job_failure(now)
@@ -963,6 +975,7 @@ class MeetingWorkflow:
             and persisted.status is ProcessingJobStatus.RUNNING
             and persisted.attempt_count == job.attempt_count
             and persisted.lease_owner == job.lease_owner
+            and persisted.claim_token == job.claim_token
             and persisted.lease_expires_at is not None
             and persisted.lease_expires_at > now
         )
@@ -977,6 +990,17 @@ def _required(value: ModelT | None, resource: str) -> ModelT:
     if value is None:
         raise ResourceNotFoundError(resource)
     return value
+
+
+def _provider_dispatch_context(job: ProcessingJob) -> ProviderDispatchContext:
+    if job.lease_owner is None or job.claim_token is None:
+        raise WorkflowBusyError
+    return ProviderDispatchContext(
+        processing_job_id=job.id,
+        attempt_number=job.attempt_count,
+        lease_owner=job.lease_owner,
+        claim_token=job.claim_token,
+    )
 
 
 def _processing_stage_for(status: MeetingStatus) -> ProcessingStage:
@@ -1009,6 +1033,30 @@ def _request_id(error: Exception) -> str | None:
 
 
 def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowFailure:
+    if isinstance(error, AudioAssetIdentityMismatchError):
+        return _failure(
+            error,
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            "The stored recording identity could not be verified",
+            occurred_at,
+        )
+    if isinstance(error, ProviderBudgetExhaustedError):
+        return _failure(
+            error,
+            FailureCode.PROVIDER_BUDGET_EXHAUSTED,
+            FailureDisposition.PERMANENT,
+            "The processing job provider budget is exhausted",
+            occurred_at,
+        )
+    if isinstance(error, ProviderBudgetIntegrityError):
+        return _failure(
+            error,
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            "Provider budget accounting could not be verified",
+            occurred_at,
+        )
     if isinstance(error, ProviderConfigurationError):
         return _failure(
             error,
@@ -1075,6 +1123,22 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
 
 
 def _extraction_failure(error: Exception, occurred_at: datetime) -> WorkflowFailure:
+    if isinstance(error, ProviderBudgetExhaustedError):
+        return _failure(
+            error,
+            FailureCode.PROVIDER_BUDGET_EXHAUSTED,
+            FailureDisposition.PERMANENT,
+            "The processing job provider budget is exhausted",
+            occurred_at,
+        )
+    if isinstance(error, ProviderBudgetIntegrityError):
+        return _failure(
+            error,
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            "Provider budget accounting could not be verified",
+            occurred_at,
+        )
     if isinstance(error, ProviderConfigurationError):
         return _failure(
             error,

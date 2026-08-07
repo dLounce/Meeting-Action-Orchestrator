@@ -147,6 +147,7 @@ def processing_job() -> ProcessingJob:
         max_attempts=3,
         lease_owner="private-worker",
         lease_expires_at=NOW + timedelta(minutes=5),
+        claim_token=UUID(int=7001),
         created_at=NOW,
         updated_at=NOW,
     )
@@ -763,6 +764,7 @@ async def test_processing_read_excludes_worker_and_lease_state() -> None:
     assert job["status"] == "running"
     assert "lease_owner" not in job
     assert "lease_expires_at" not in job
+    assert "claim_token" not in job
     retrying = response.json()["jobs"][1]
     assert retrying["failure"] == {
         "code": "provider_unavailable",

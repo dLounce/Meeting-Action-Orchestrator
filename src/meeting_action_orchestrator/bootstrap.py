@@ -54,9 +54,11 @@ from meeting_action_orchestrator.application.processing import (
     FullJitterRetryScheduler as ProcessingRetryScheduler,
 )
 from meeting_action_orchestrator.application.processing import (
+    ProcessingScheduler,
     ProcessingWorker,
 )
 from meeting_action_orchestrator.application.processing_control import ProcessingControlService
+from meeting_action_orchestrator.application.provider_budget import ProviderBudgetService
 from meeting_action_orchestrator.application.recording_cleanup import (
     OrphanDiscoveryBatch,
     RecordingCleanupOutcome,
@@ -69,6 +71,7 @@ from meeting_action_orchestrator.application.workflow import MeetingWorkflow, Sy
 from meeting_action_orchestrator.config import Settings, get_settings
 from meeting_action_orchestrator.domain.enums import ProcessingStage
 from meeting_action_orchestrator.domain.models import ConnectorTarget
+from meeting_action_orchestrator.domain.provider_budget import ProviderBudgetLimits
 from meeting_action_orchestrator.infrastructure.audio import (
     FFprobeAudioInspector,
     LocalAudioStore,
@@ -565,14 +568,20 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         unit_of_work=write_unit_of_work,
         clock=clock,
     )
+    provider_budget = ProviderBudgetService(
+        unit_of_work=write_unit_of_work,
+        clock=clock,
+    )
     transcriber = OpenAITranscriber(
         api_key=openai_key,
         model=configured.openai_transcription_model,
+        budget_controller=provider_budget,
         timeout_seconds=configured.openai_timeout_seconds,
         max_retries=configured.openai_max_retries,
     )
     agents_runner = OpenAIAgentsRunner(
         api_key=openai_key,
+        budget_controller=provider_budget,
         timeout_seconds=configured.openai_timeout_seconds,
         max_retries=configured.openai_max_retries,
         tracing_enabled=configured.openai_tracing_enabled,
@@ -585,6 +594,23 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         recap_max_output_tokens=configured.openai_recap_max_output_tokens,
         verifier_max_output_tokens=configured.openai_verifier_max_output_tokens,
     )
+    processing_scheduler = ProcessingScheduler(
+        unit_of_work=write_unit_of_work,
+        clock=clock,
+        budget_limits={
+            ProcessingStage.TRANSCRIPTION: ProviderBudgetLimits(
+                provider_request_limit=(configured.openai_transcription_provider_request_limit),
+                audio_duration_ms_limit=(configured.openai_transcription_audio_duration_ms_limit),
+            ),
+            ProcessingStage.EXTRACTION: ProviderBudgetLimits(
+                preflight_request_limit=(configured.openai_extraction_preflight_request_limit),
+                provider_request_limit=(configured.openai_extraction_provider_request_limit),
+                input_token_limit=configured.openai_extraction_input_token_limit,
+                output_token_limit=configured.openai_extraction_output_token_limit,
+            ),
+        },
+        budget_policy_version=configured.openai_budget_policy_version,
+    )
     workflow = MeetingWorkflow(
         unit_of_work=write_unit_of_work,
         recording_store=recording_store,
@@ -593,6 +619,7 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         specialists=specialists,
         clock=clock,
         delivery_targets=targets,
+        processing_scheduler=processing_scheduler,
         recording_cleanup_scheduler=recording_cleanup_scheduler,
         max_agent_requests=configured.openai_max_requests_per_run,
         max_agent_output_tokens=configured.openai_max_output_tokens_per_run,

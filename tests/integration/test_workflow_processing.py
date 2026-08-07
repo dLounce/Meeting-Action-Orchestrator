@@ -21,6 +21,9 @@ from meeting_action_orchestrator.agents.contracts import (
     VerificationRequest,
 )
 from meeting_action_orchestrator.application.errors import (
+    AudioAssetIdentityMismatchError,
+    ProviderBudgetExhaustedError,
+    ProviderBudgetIntegrityError,
     ProviderError,
     ProviderInputError,
     ProviderOutputError,
@@ -29,11 +32,13 @@ from meeting_action_orchestrator.application.errors import (
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderTransientError,
+    WorkflowBusyError,
 )
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
 from meeting_action_orchestrator.application.ports import (
     SpecialistProvider,
     TranscriptionProvider,
+    TranscriptionRunContext,
 )
 from meeting_action_orchestrator.application.processing import (
     ProcessingOutcome,
@@ -52,6 +57,7 @@ from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
+    ProviderBudgetDimension,
 )
 from meeting_action_orchestrator.domain.models import (
     ConnectorTarget,
@@ -87,6 +93,18 @@ class MutableClock:
         return self.current
 
 
+class AdvancingUnitOfWork(SqliteUnitOfWork):
+    def __init__(self, database: Database, clock: MutableClock, advance: timedelta) -> None:
+        super().__init__(database)
+        self._clock = clock
+        self._advance = advance
+
+    def __enter__(self) -> SqliteUnitOfWork:
+        entered = super().__enter__()
+        self._clock.current += self._advance
+        return entered
+
+
 class FixedRetryScheduler:
     def schedule(self, now: datetime, attempt_count: int) -> datetime:
         del attempt_count
@@ -98,8 +116,10 @@ class TransientTranscriber:
         self,
         audio_path: Path,
         language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
     ) -> TranscriptionOutput:
-        del audio_path, language
+        del audio_path, language, context
         raise ProviderTransientError
 
 
@@ -108,9 +128,23 @@ class PermanentTranscriber:
         self,
         audio_path: Path,
         language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
     ) -> TranscriptionOutput:
-        del audio_path, language
+        del audio_path, language, context
         raise ProviderInputError
+
+
+class IdentityMismatchTranscriber:
+    async def transcribe(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
+    ) -> TranscriptionOutput:
+        del audio_path, language, context
+        raise AudioAssetIdentityMismatchError
 
 
 class ExpiringOnceTranscriber:
@@ -123,11 +157,17 @@ class ExpiringOnceTranscriber:
         self,
         audio_path: Path,
         language: str | None = None,
+        *,
+        context: TranscriptionRunContext,
     ) -> TranscriptionOutput:
         self._calls += 1
         if self._calls == 1:
             self._clock.current += timedelta(seconds=11)
-        return await self._delegate.transcribe(audio_path, language)
+        return await self._delegate.transcribe(
+            audio_path,
+            language,
+            context=context,
+        )
 
 
 class FailingSpecialists(FakeSpecialists):
@@ -323,11 +363,46 @@ def test_ingest_persists_transcription_job_with_meeting(tmp_path: Path) -> None:
             meeting_id,
             ProcessingStage.TRANSCRIPTION,
         )
+        budget = uow.provider_budget_accounts.get(job.id) if job is not None else None
         binding = uow.ingest_requests.get("durable-upload")
     assert job is not None
     assert binding is not None
     assert job.status is ProcessingJobStatus.READY
     assert job.attempt_count == 0
+    assert budget is not None
+    assert budget.stage is ProcessingStage.TRANSCRIPTION
+    assert budget.limits.provider_request_limit == 3
+    assert budget.limits.audio_duration_ms_limit == 21_600_000
+
+
+def test_stage_mutation_rechecks_lease_after_transaction_acquisition(tmp_path: Path) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock)
+    meeting_id = ingest(service)
+    with SqliteUnitOfWork(database) as uow:
+        claimed = uow.processing_jobs.claim_due(
+            ProcessingStage.TRANSCRIPTION,
+            "worker-a",
+            clock.now(),
+            clock.now() + timedelta(seconds=10),
+            1,
+        )[0]
+        meeting = uow.meetings.get(meeting_id)
+        uow.commit()
+    assert meeting is not None
+    service._unit_of_work = lambda: AdvancingUnitOfWork(
+        database,
+        clock,
+        timedelta(seconds=10),
+    )
+
+    with pytest.raises(WorkflowBusyError):
+        service._start_stage(meeting, MeetingStatus.TRANSCRIBING, job=claimed)
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        persisted = uow.meetings.get(meeting_id)
+    assert persisted is not None
+    assert persisted.status is MeetingStatus.INGESTED
 
 
 async def test_workers_run_transcription_then_extraction(tmp_path: Path) -> None:
@@ -448,6 +523,26 @@ async def test_stage_handler_returns_classified_failure(tmp_path: Path) -> None:
     assert meeting.failure.disposition is FailureDisposition.RETRYABLE
 
 
+async def test_stored_audio_identity_mismatch_is_terminal(tmp_path: Path) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock, IdentityMismatchTranscriber())
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+
+    result = await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    assert result[0].outcome is ProcessingOutcome.FAILED
+    assert result[0].job is not None
+    assert result[0].job.last_failure is not None
+    assert result[0].job.last_failure.code is FailureCode.INTERNAL
+    assert result[0].job.last_failure.disposition is FailureDisposition.PERMANENT
+    assert result[0].job.last_failure.safe_message == (
+        "The stored recording identity could not be verified"
+    )
+    meeting = service.get_meeting(meeting_id)
+    assert meeting.failure == result[0].job.last_failure
+
+
 @pytest.mark.parametrize(
     ("error", "expected_code", "expected_disposition", "expected_outcome"),
     [
@@ -495,6 +590,18 @@ async def test_stage_handler_returns_classified_failure(tmp_path: Path) -> None:
         ),
         (
             ProviderError(),
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            ProcessingOutcome.FAILED,
+        ),
+        (
+            ProviderBudgetExhaustedError(ProviderBudgetDimension.PROVIDER_REQUESTS),
+            FailureCode.PROVIDER_BUDGET_EXHAUSTED,
+            FailureDisposition.PERMANENT,
+            ProcessingOutcome.FAILED,
+        ),
+        (
+            ProviderBudgetIntegrityError(),
             FailureCode.INTERNAL,
             FailureDisposition.PERMANENT,
             ProcessingOutcome.FAILED,
