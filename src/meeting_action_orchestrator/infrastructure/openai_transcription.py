@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib import import_module
 from math import isfinite
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from meeting_action_orchestrator.application.errors import (
     ProviderConfigurationError,
     ProviderError,
     ProviderInputError,
     ProviderOutputError,
+    ProviderPermanentError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     ProviderTransientError,
+)
+from meeting_action_orchestrator.application.provider_policy import (
+    ProviderErrorMetadata,
+    provider_error_metadata,
+    provider_error_requires_action,
+    sanitize_provider_identifier,
 )
 
 _DIARIZED_TRANSCRIPTION_MODELS = frozenset({"gpt-4o-transcribe-diarize"})
@@ -23,34 +34,68 @@ def _requires_diarized_segments(model: str) -> bool:
 
 
 class OpenAITranscriptionError(ProviderError):
-    def __init__(self, error_type: str | None = None) -> None:
+    def __init__(
+        self,
+        error_type: str | None = None,
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
         message = "OpenAI transcription failed"
         if error_type is not None:
             message = f"{message} with {error_type}"
-        super().__init__(message)
+        super().__init__(message, metadata=metadata)
 
 
 class OpenAITranscriptionConfigurationError(
     OpenAITranscriptionError,
     ProviderConfigurationError,
 ):
-    def __init__(self) -> None:
-        super().__init__("configuration_error")
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("configuration_error", metadata=metadata)
 
 
 class OpenAITranscriptionInputError(OpenAITranscriptionError, ProviderInputError):
-    def __init__(self) -> None:
-        super().__init__("invalid_input")
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("invalid_input", metadata=metadata)
 
 
 class OpenAITranscriptionTransientError(OpenAITranscriptionError, ProviderTransientError):
-    def __init__(self) -> None:
-        super().__init__("transient_error")
+    def __init__(
+        self,
+        error_type: str = "transient_error",
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
+        super().__init__(error_type, metadata=metadata)
+
+
+class OpenAITranscriptionTimeoutError(
+    OpenAITranscriptionTransientError,
+    ProviderTimeoutError,
+):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("timeout", metadata=metadata)
+
+
+class OpenAITranscriptionRateLimitError(
+    OpenAITranscriptionTransientError,
+    ProviderRateLimitError,
+):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("rate_limited", metadata=metadata)
 
 
 class OpenAITranscriptionOutputError(OpenAITranscriptionError, ProviderOutputError):
-    def __init__(self) -> None:
-        super().__init__("invalid_output")
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("invalid_output", metadata=metadata)
+
+
+class OpenAITranscriptionPermanentError(
+    OpenAITranscriptionError,
+    ProviderPermanentError,
+):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("permanent_error", metadata=metadata)
 
 
 @dataclass(frozen=True)
@@ -122,10 +167,12 @@ class OpenAITranscriber:
         if not await asyncio.to_thread(audio_path.is_file):
             raise OpenAITranscriptionInputError
         client = self._get_client()
+        client_request_id = str(uuid4())
         arguments: dict[str, Any] = {
             "model": self._model,
             "response_format": "json",
             "temperature": 0,
+            "extra_headers": {"X-Client-Request-Id": client_request_id},
         }
         if self._diarization_required:
             arguments["response_format"] = "diarized_json"
@@ -139,26 +186,45 @@ class OpenAITranscriber:
                     **arguments,
                 )
         except Exception as error:
-            raise self._translate_error(error) from error
-        return self._map_response(response)
+            translated = self._translate_error(error, client_request_id)
+        else:
+            return self._map_response(response, client_request_id)
+        raise translated
 
     def _get_client(self) -> Any:
         if self._client is not None:
             return self._client
-        try:
-            if self._openai is None:
-                self._openai = import_module("openai")
-            self._client = self._openai.AsyncOpenAI(
+        module = self._load_openai()
+        if module is None:
+            raise OpenAITranscriptionConfigurationError
+        client = None
+        with suppress(Exception):
+            client = module.AsyncOpenAI(
                 api_key=self._api_key,
                 timeout=self._timeout_seconds,
                 max_retries=self._max_retries,
             )
-            self._owns_client = True
-        except (AttributeError, ImportError) as error:
-            raise OpenAITranscriptionConfigurationError from error
+        if client is None:
+            raise OpenAITranscriptionConfigurationError
+        self._client = client
+        self._owns_client = True
         return self._client
 
-    def _map_response(self, response: Any) -> TranscriptionOutput:
+    def _load_openai(self) -> Any:
+        if self._openai is not None:
+            return self._openai
+        module = None
+        with suppress(AttributeError, ImportError):
+            module = import_module("openai")
+        if module is not None:
+            self._openai = module
+        return module
+
+    def _map_response(
+        self,
+        response: Any,
+        client_request_id: str | None = None,
+    ) -> TranscriptionOutput:
         data = self._as_mapping(response)
         text = self._string_value(data.get("text"))
         if not text:
@@ -168,7 +234,7 @@ class OpenAITranscriber:
         usage = self._map_usage(data.get("usage"))
         return TranscriptionOutput(
             model=self._model,
-            provider_request_id=self._provider_request_id(response),
+            provider_request_id=self._provider_request_id(response, client_request_id),
             language=self._optional_string(data.get("language")),
             text=text,
             duration_seconds=duration,
@@ -261,8 +327,22 @@ class OpenAITranscriber:
             seconds=self._float_value(usage.get("seconds")),
         )
 
-    def _translate_error(self, error: Exception) -> OpenAITranscriptionError:
-        module = self._openai
+    def _translate_error(
+        self,
+        error: Exception,
+        client_request_id: str | None = None,
+    ) -> OpenAITranscriptionError:
+        module = self._load_openai()
+        metadata = provider_error_metadata(error, client_request_id)
+        if provider_error_requires_action(error):
+            return OpenAITranscriptionConfigurationError(metadata=metadata)
+        if metadata.retry_control_rejected or metadata.provider_should_retry is False:
+            return self._non_retryable_error(error, module, metadata)
+        if metadata.provider_should_retry is True:
+            return self._transient_error(error, module, metadata)
+        status = metadata.http_status
+        if status in {408, 409, 429} or (status is not None and status >= 500):
+            return self._transient_error(error, module, metadata)
         transient_names = (
             "APIConnectionError",
             "APITimeoutError",
@@ -270,17 +350,67 @@ class OpenAITranscriber:
             "InternalServerError",
         )
         if any(self._is_exception(error, module, name) for name in transient_names):
-            return OpenAITranscriptionTransientError()
+            return self._transient_error(error, module, metadata)
         configuration_names = (
             "AuthenticationError",
             "PermissionDeniedError",
             "NotFoundError",
         )
-        if any(self._is_exception(error, module, name) for name in configuration_names):
-            return OpenAITranscriptionConfigurationError()
-        if self._is_exception(error, module, "BadRequestError"):
-            return OpenAITranscriptionInputError()
-        return OpenAITranscriptionError(type(error).__name__)
+        if status in {401, 403, 404} or any(
+            self._is_exception(error, module, name) for name in configuration_names
+        ):
+            return OpenAITranscriptionConfigurationError(metadata=metadata)
+        if isinstance(error, (AttributeError, TypeError)):
+            return OpenAITranscriptionConfigurationError(metadata=metadata)
+        input_names = ("BadRequestError", "UnprocessableEntityError")
+        if (status is not None and 400 <= status < 500 and status not in {408, 409, 429}) or any(
+            self._is_exception(error, module, name) for name in input_names
+        ):
+            return OpenAITranscriptionInputError(metadata=metadata)
+        return OpenAITranscriptionPermanentError(metadata=metadata)
+
+    def _transient_error(
+        self,
+        error: Exception,
+        module: Any,
+        metadata: ProviderErrorMetadata,
+    ) -> OpenAITranscriptionError:
+        if metadata.http_status == 408 or self._is_exception(
+            error,
+            module,
+            "APITimeoutError",
+        ):
+            return OpenAITranscriptionTimeoutError(metadata=metadata)
+        if metadata.http_status == 429 or self._is_exception(
+            error,
+            module,
+            "RateLimitError",
+        ):
+            return OpenAITranscriptionRateLimitError(metadata=metadata)
+        return OpenAITranscriptionTransientError(metadata=metadata)
+
+    def _non_retryable_error(
+        self,
+        error: Exception,
+        module: Any,
+        metadata: ProviderErrorMetadata,
+    ) -> OpenAITranscriptionError:
+        configuration_names = (
+            "AuthenticationError",
+            "PermissionDeniedError",
+            "NotFoundError",
+        )
+        if metadata.http_status in {401, 403, 404} or any(
+            self._is_exception(error, module, name) for name in configuration_names
+        ):
+            return OpenAITranscriptionConfigurationError(metadata=metadata)
+        input_names = ("BadRequestError", "UnprocessableEntityError")
+        status = metadata.http_status
+        if (status is not None and 400 <= status < 500 and status not in {408, 409, 429}) or any(
+            self._is_exception(error, module, name) for name in input_names
+        ):
+            return OpenAITranscriptionInputError(metadata=metadata)
+        return OpenAITranscriptionPermanentError(metadata=metadata)
 
     @staticmethod
     def _is_exception(error: Exception, module: Any, name: str) -> bool:
@@ -328,9 +458,12 @@ class OpenAITranscriber:
         return number
 
     @staticmethod
-    def _provider_request_id(response: Any) -> str | None:
+    def _provider_request_id(
+        response: Any,
+        client_request_id: str | None = None,
+    ) -> str | None:
         for attribute in ("_request_id", "request_id"):
-            value = getattr(response, attribute, None)
-            if isinstance(value, str) and value:
+            value = sanitize_provider_identifier(getattr(response, attribute, None))
+            if value is not None:
                 return value
-        return None
+        return sanitize_provider_identifier(client_request_id)

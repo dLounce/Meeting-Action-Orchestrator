@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from importlib import import_module
 from typing import Any
+from uuid import uuid4
 
 from meeting_action_orchestrator.agents.contracts import (
     AgentDefinition,
@@ -15,42 +16,98 @@ from meeting_action_orchestrator.agents.contracts import (
 from meeting_action_orchestrator.application.errors import (
     ProviderConfigurationError,
     ProviderError,
+    ProviderInputError,
     ProviderOutputError,
+    ProviderPermanentError,
+    ProviderPermanentOutputError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     ProviderTransientError,
+)
+from meeting_action_orchestrator.application.provider_policy import (
+    ProviderErrorMetadata,
+    provider_error_metadata,
+    provider_error_requires_action,
+    sanitize_provider_identifier,
 )
 
 
 class OpenAIAgentError(ProviderError):
-    def __init__(self, error_type: str | None = None) -> None:
+    def __init__(
+        self,
+        error_type: str | None = None,
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
         message = "OpenAI agent request failed"
         if error_type is not None:
             message = f"{message} with {error_type}"
-        super().__init__(message)
+        super().__init__(message, metadata=metadata)
 
 
 class OpenAIAgentConfigurationError(OpenAIAgentError, ProviderConfigurationError):
-    def __init__(self) -> None:
-        super().__init__("configuration_error")
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("configuration_error", metadata=metadata)
+
+
+class OpenAIAgentInputError(OpenAIAgentError, ProviderInputError):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("invalid_input", metadata=metadata)
 
 
 class OpenAIAgentTransientError(OpenAIAgentError, ProviderTransientError):
-    def __init__(self) -> None:
-        super().__init__("transient_error")
+    def __init__(
+        self,
+        error_type: str = "transient_error",
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
+        super().__init__(error_type, metadata=metadata)
+
+
+class OpenAIAgentTimeoutError(OpenAIAgentTransientError, ProviderTimeoutError):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("timeout", metadata=metadata)
+
+
+class OpenAIAgentRateLimitError(OpenAIAgentTransientError, ProviderRateLimitError):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("rate_limited", metadata=metadata)
 
 
 class OpenAIAgentOutputError(OpenAIAgentError, ProviderOutputError):
-    def __init__(self) -> None:
-        super().__init__("invalid_output")
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("invalid_output", metadata=metadata)
 
 
-class OpenAIAgentRefusalError(OpenAIAgentError):
-    def __init__(self) -> None:
-        super().__init__("model_refusal")
+class OpenAIAgentPermanentError(OpenAIAgentError, ProviderPermanentError):
+    def __init__(
+        self,
+        error_type: str = "permanent_error",
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
+        super().__init__(error_type, metadata=metadata)
 
 
-class OpenAIAgentLimitError(OpenAIAgentError):
-    def __init__(self) -> None:
-        super().__init__("turn_limit")
+class OpenAIAgentPermanentOutputError(OpenAIAgentPermanentError, ProviderPermanentOutputError):
+    def __init__(
+        self,
+        error_type: str = "permanent_output_error",
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
+        super().__init__(error_type, metadata=metadata)
+
+
+class OpenAIAgentRefusalError(OpenAIAgentPermanentOutputError):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("model_refusal", metadata=metadata)
+
+
+class OpenAIAgentLimitError(OpenAIAgentPermanentOutputError):
+    def __init__(self, *, metadata: ProviderErrorMetadata | None = None) -> None:
+        super().__init__("turn_limit", metadata=metadata)
 
 
 class OpenAIAgentsRunner:
@@ -87,11 +144,12 @@ class OpenAIAgentsRunner:
         payload: StrictModel,
         context: AgentRunContext,
     ) -> AgentResult[OutputT]:
+        client_request_id = str(uuid4())
         try:
             self._load_bindings()
             sdk = self._require_sdk()
             self._configure_client(sdk)
-            model_settings = self._build_model_settings(sdk, definition)
+            model_settings = self._build_model_settings(sdk, definition, client_request_id)
             agent = sdk.Agent(
                 name=definition.name,
                 instructions=definition.instructions,
@@ -120,24 +178,39 @@ class OpenAIAgentsRunner:
                 output=output,
                 usage=usage,
                 model=definition.model,
-                provider_request_ids=self._request_ids(result),
+                provider_request_ids=self._request_ids(result, client_request_id),
             )
         except OpenAIAgentError:
             raise
         except Exception as error:
-            raise self._translate_error(error) from error
+            translated = self._translate_error(error, client_request_id)
+        raise translated
 
     def _load_bindings(self) -> None:
         if self._sdk is not None:
             return
+        sdk = None
+        exceptions = None
+        openai = None
+        reasoning_type = None
         try:
-            self._sdk = import_module("agents")
-            self._exceptions = import_module("agents.exceptions")
-            self._openai = import_module("openai")
+            sdk = import_module("agents")
+            exceptions = import_module("agents.exceptions")
+            openai = import_module("openai")
             shared = import_module("openai.types.shared")
-            self._reasoning_type = shared.Reasoning
-        except (AttributeError, ImportError) as error:
-            raise OpenAIAgentConfigurationError from error
+            reasoning_type = shared.Reasoning
+        except (AttributeError, ImportError):
+            pass
+        if sdk is None or exceptions is None or openai is None or reasoning_type is None:
+            self._sdk = None
+            self._exceptions = None
+            self._openai = None
+            self._reasoning_type = None
+            raise OpenAIAgentConfigurationError
+        self._sdk = sdk
+        self._exceptions = exceptions
+        self._openai = openai
+        self._reasoning_type = reasoning_type
 
     def _require_sdk(self) -> Any:
         if self._sdk is None:
@@ -163,6 +236,7 @@ class OpenAIAgentsRunner:
         self,
         sdk: Any,
         definition: AgentDefinition[OutputT],
+        client_request_id: str,
     ) -> Any:
         if self._reasoning_type is None:
             raise OpenAIAgentConfigurationError
@@ -188,29 +262,86 @@ class OpenAIAgentsRunner:
             max_tokens=definition.max_output_tokens,
             parallel_tool_calls=False,
             store=False,
+            extra_headers={"X-Client-Request-Id": client_request_id},
             retry=retry,
         )
 
-    def _translate_error(self, error: Exception) -> OpenAIAgentError:
+    def _translate_error(
+        self,
+        error: Exception,
+        client_request_id: str | None = None,
+    ) -> OpenAIAgentError:
+        metadata = provider_error_metadata(error, client_request_id)
+        if provider_error_requires_action(error):
+            return OpenAIAgentConfigurationError(metadata=metadata)
+        if metadata.retry_control_rejected or metadata.provider_should_retry is False:
+            return self._non_retryable_error(error, metadata)
+        if metadata.provider_should_retry is True:
+            return self._transient_error(error, metadata)
         if self._is_exception(error, self._exceptions, "ModelRefusalError"):
-            translated: OpenAIAgentError = OpenAIAgentRefusalError()
+            translated: OpenAIAgentError = OpenAIAgentRefusalError(metadata=metadata)
         elif self._is_exception(error, self._exceptions, "MaxTurnsExceeded"):
-            translated = OpenAIAgentLimitError()
-        elif self._is_exception(error, self._exceptions, "ModelBehaviorError"):
-            translated = OpenAIAgentOutputError()
-        elif self._matches_transient_error(error):
-            translated = OpenAIAgentTransientError()
-        elif self._matches_configuration_error(error):
-            translated = OpenAIAgentConfigurationError()
-        elif self._is_exception(error, self._openai, "BadRequestError") or isinstance(
-            error, TypeError
+            translated = OpenAIAgentLimitError(metadata=metadata)
+        elif self._is_exception(error, self._exceptions, "UserError") or isinstance(
+            error, (AttributeError, TypeError)
         ):
-            translated = OpenAIAgentOutputError()
+            translated = OpenAIAgentConfigurationError(metadata=metadata)
+        elif self._is_exception(error, self._exceptions, "ModelBehaviorError"):
+            translated = OpenAIAgentOutputError(metadata=metadata)
+        elif self._matches_transient_error(error, metadata):
+            translated = self._transient_error(error, metadata)
+        elif self._matches_configuration_error(error, metadata):
+            translated = OpenAIAgentConfigurationError(metadata=metadata)
+        elif self._matches_input_error(error, metadata):
+            translated = OpenAIAgentInputError(metadata=metadata)
         else:
-            translated = OpenAIAgentError(type(error).__name__)
+            translated = OpenAIAgentPermanentError(metadata=metadata)
         return translated
 
-    def _matches_transient_error(self, error: Exception) -> bool:
+    def _transient_error(
+        self,
+        error: Exception,
+        metadata: ProviderErrorMetadata,
+    ) -> OpenAIAgentError:
+        if metadata.http_status == 408 or self._is_exception(
+            error,
+            self._openai,
+            "APITimeoutError",
+        ):
+            return OpenAIAgentTimeoutError(metadata=metadata)
+        if metadata.http_status == 429 or self._is_exception(
+            error,
+            self._openai,
+            "RateLimitError",
+        ):
+            return OpenAIAgentRateLimitError(metadata=metadata)
+        return OpenAIAgentTransientError(metadata=metadata)
+
+    def _non_retryable_error(
+        self,
+        error: Exception,
+        metadata: ProviderErrorMetadata,
+    ) -> OpenAIAgentError:
+        if self._is_exception(error, self._exceptions, "ModelRefusalError"):
+            return OpenAIAgentRefusalError(metadata=metadata)
+        if self._is_exception(error, self._exceptions, "MaxTurnsExceeded"):
+            return OpenAIAgentLimitError(metadata=metadata)
+        if self._is_exception(error, self._exceptions, "ModelBehaviorError"):
+            return OpenAIAgentPermanentOutputError(metadata=metadata)
+        if self._matches_configuration_error(error, metadata):
+            return OpenAIAgentConfigurationError(metadata=metadata)
+        if self._matches_input_error(error, metadata):
+            return OpenAIAgentInputError(metadata=metadata)
+        return OpenAIAgentPermanentError(metadata=metadata)
+
+    def _matches_transient_error(
+        self,
+        error: Exception,
+        metadata: ProviderErrorMetadata,
+    ) -> bool:
+        status = metadata.http_status
+        if status in {408, 409, 429} or (status is not None and status >= 500):
+            return True
         names = (
             "APIConnectionError",
             "APITimeoutError",
@@ -219,12 +350,29 @@ class OpenAIAgentsRunner:
         )
         return any(self._is_exception(error, self._openai, name) for name in names)
 
-    def _matches_configuration_error(self, error: Exception) -> bool:
+    def _matches_configuration_error(
+        self,
+        error: Exception,
+        metadata: ProviderErrorMetadata,
+    ) -> bool:
+        if metadata.http_status in {401, 403, 404}:
+            return True
         names = (
             "AuthenticationError",
             "PermissionDeniedError",
             "NotFoundError",
         )
+        return any(self._is_exception(error, self._openai, name) for name in names)
+
+    def _matches_input_error(
+        self,
+        error: Exception,
+        metadata: ProviderErrorMetadata,
+    ) -> bool:
+        status = metadata.http_status
+        if status is not None and 400 <= status < 500 and status not in {408, 409, 429}:
+            return True
+        names = ("BadRequestError", "UnprocessableEntityError")
         return any(self._is_exception(error, self._openai, name) for name in names)
 
     @staticmethod
@@ -262,12 +410,18 @@ class OpenAIAgentsRunner:
         return attribute if isinstance(attribute, int) else 0
 
     @staticmethod
-    def _request_ids(result: Any) -> tuple[str, ...]:
+    def _request_ids(
+        result: Any,
+        client_request_id: str | None = None,
+    ) -> tuple[str, ...]:
         request_ids: list[str] = []
         for response in getattr(result, "raw_responses", ()):
-            for attribute in ("response_id", "id", "_request_id"):
-                value = getattr(response, attribute, None)
-                if isinstance(value, str) and value and value not in request_ids:
+            for attribute in ("request_id", "_request_id"):
+                value = sanitize_provider_identifier(getattr(response, attribute, None))
+                if value is not None and value not in request_ids:
                     request_ids.append(value)
                     break
-        return tuple(request_ids)
+        if request_ids:
+            return tuple(request_ids)
+        fallback = sanitize_provider_identifier(client_request_id)
+        return (fallback,) if fallback is not None else ()

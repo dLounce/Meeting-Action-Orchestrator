@@ -6,6 +6,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from math import isfinite
 from typing import BinaryIO, Protocol, TypeVar
 from uuid import UUID, uuid4
 
@@ -18,8 +19,13 @@ from meeting_action_orchestrator.agents.contracts import (
 from meeting_action_orchestrator.application.errors import (
     AudioAssetIdentityMismatchError,
     ProviderConfigurationError,
+    ProviderError,
     ProviderInputError,
     ProviderOutputError,
+    ProviderPermanentError,
+    ProviderPermanentOutputError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     ProviderTransientError,
     ResourceNotFoundError,
     ReviewDigestMismatchError,
@@ -46,6 +52,7 @@ from meeting_action_orchestrator.application.processing import (
     ProcessingHandler,
     ProcessingScheduler,
 )
+from meeting_action_orchestrator.application.provider_policy import sanitize_provider_identifier
 from meeting_action_orchestrator.application.recording_cleanup import RecordingCleanupScheduler
 from meeting_action_orchestrator.application.reviewing import (
     ActionEdit,
@@ -844,8 +851,7 @@ def _invalid_job_failure(occurred_at: datetime) -> WorkflowFailure:
 
 
 def _request_id(error: Exception) -> str | None:
-    value = getattr(error, "request_id", None)
-    return value if isinstance(value, str) and value else None
+    return sanitize_provider_identifier(getattr(error, "request_id", None))
 
 
 def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowFailure:
@@ -868,7 +874,7 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
     if isinstance(error, ProviderTransientError):
         return _failure(
             error,
-            FailureCode.PROVIDER_UNAVAILABLE,
+            _transient_provider_failure_code(error),
             FailureDisposition.RETRYABLE,
             "The transcription provider is temporarily unavailable",
             occurred_at,
@@ -879,6 +885,30 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
             FailureCode.INVALID_MODEL_OUTPUT,
             FailureDisposition.RETRYABLE,
             "The transcription provider returned invalid output",
+            occurred_at,
+        )
+    if isinstance(error, ProviderPermanentOutputError):
+        return _failure(
+            error,
+            FailureCode.INVALID_MODEL_OUTPUT,
+            FailureDisposition.PERMANENT,
+            "The transcription provider cannot complete this request",
+            occurred_at,
+        )
+    if isinstance(error, ProviderPermanentError):
+        return _failure(
+            error,
+            _permanent_provider_failure_code(error),
+            FailureDisposition.PERMANENT,
+            "The transcription provider cannot complete this request",
+            occurred_at,
+        )
+    if isinstance(error, ProviderError):
+        return _failure(
+            error,
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            "The transcription provider request failed",
             occurred_at,
         )
     return _failure(
@@ -899,10 +929,18 @@ def _extraction_failure(error: Exception, occurred_at: datetime) -> WorkflowFail
             "The analysis provider is not configured",
             occurred_at,
         )
+    if isinstance(error, ProviderInputError):
+        return _failure(
+            error,
+            FailureCode.INVALID_INPUT,
+            FailureDisposition.PERMANENT,
+            "The analysis provider rejected the request",
+            occurred_at,
+        )
     if isinstance(error, ProviderTransientError):
         return _failure(
             error,
-            FailureCode.PROVIDER_UNAVAILABLE,
+            _transient_provider_failure_code(error),
             FailureDisposition.RETRYABLE,
             "The analysis provider is temporarily unavailable",
             occurred_at,
@@ -913,6 +951,30 @@ def _extraction_failure(error: Exception, occurred_at: datetime) -> WorkflowFail
             FailureCode.INVALID_MODEL_OUTPUT,
             FailureDisposition.RETRYABLE,
             "Meeting analysis could not be completed",
+            occurred_at,
+        )
+    if isinstance(error, ProviderPermanentOutputError):
+        return _failure(
+            error,
+            FailureCode.INVALID_MODEL_OUTPUT,
+            FailureDisposition.PERMANENT,
+            "The analysis provider cannot complete this request",
+            occurred_at,
+        )
+    if isinstance(error, ProviderPermanentError):
+        return _failure(
+            error,
+            _permanent_provider_failure_code(error),
+            FailureDisposition.PERMANENT,
+            "The analysis provider cannot complete this request",
+            occurred_at,
+        )
+    if isinstance(error, ProviderError):
+        return _failure(
+            error,
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            "The analysis provider request failed",
             occurred_at,
         )
     return _failure(
@@ -931,10 +993,41 @@ def _failure(
     message: str,
     occurred_at: datetime,
 ) -> WorkflowFailure:
+    retry_after_seconds = None
+    value = getattr(error, "retry_after_seconds", None)
+    if (
+        disposition is FailureDisposition.RETRYABLE
+        and not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and isfinite(value)
+        and 0 <= value <= 600
+    ):
+        retry_after_seconds = float(value)
     return WorkflowFailure(
         code=code,
         disposition=disposition,
         safe_message=message,
         provider_request_id=_request_id(error),
+        retry_after_seconds=retry_after_seconds,
         occurred_at=occurred_at,
     )
+
+
+def _transient_provider_failure_code(error: Exception) -> FailureCode:
+    status = getattr(error, "http_status", None)
+    if isinstance(error, ProviderTimeoutError) or status == 408:
+        return FailureCode.PROVIDER_TIMEOUT
+    if isinstance(error, ProviderRateLimitError) or status == 429:
+        return FailureCode.RATE_LIMITED
+    return FailureCode.PROVIDER_UNAVAILABLE
+
+
+def _permanent_provider_failure_code(error: Exception) -> FailureCode:
+    status = getattr(error, "http_status", None)
+    if status == 408:
+        return FailureCode.PROVIDER_TIMEOUT
+    if status == 429:
+        return FailureCode.RATE_LIMITED
+    if isinstance(status, int) and status >= 500:
+        return FailureCode.PROVIDER_UNAVAILABLE
+    return FailureCode.INTERNAL

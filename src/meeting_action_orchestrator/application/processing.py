@@ -382,9 +382,19 @@ class ProcessingWorker:
                 and current.attempt_count < current.max_attempts
             )
             status = ProcessingJobStatus.RETRY_WAIT if retryable else ProcessingJobStatus.FAILED
-            retry_at = (
-                self._retry_scheduler.schedule(now, current.attempt_count) if retryable else None
-            )
+            retry_at = None
+            if retryable:
+                retry_base = now
+                provider_retry_at = None
+                if failure.retry_after_seconds is not None:
+                    provider_retry_at = now + timedelta(seconds=failure.retry_after_seconds)
+                    retry_base = provider_retry_at
+                retry_at = self._retry_scheduler.schedule(retry_base, current.attempt_count)
+                if provider_retry_at is not None:
+                    minimum_retry_at = provider_retry_at
+                    if failure.retry_after_seconds > 0:
+                        minimum_retry_at += timedelta(microseconds=1)
+                    retry_at = max(retry_at, minimum_retry_at)
             failed = _replace_job(
                 current,
                 status=status,

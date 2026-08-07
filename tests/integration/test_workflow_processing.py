@@ -17,7 +17,13 @@ from meeting_action_orchestrator.agents.contracts import (
     MeetingExtraction,
 )
 from meeting_action_orchestrator.application.errors import (
+    ProviderError,
+    ProviderInputError,
     ProviderOutputError,
+    ProviderPermanentError,
+    ProviderPermanentOutputError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     ProviderTransientError,
 )
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
@@ -29,6 +35,7 @@ from meeting_action_orchestrator.application.processing import (
     ProcessingOutcome,
     ProcessingWorker,
 )
+from meeting_action_orchestrator.application.provider_policy import ProviderErrorMetadata
 from meeting_action_orchestrator.application.state_machine import transition_meeting
 from meeting_action_orchestrator.application.workflow import (
     IngestMeeting,
@@ -344,16 +351,64 @@ async def test_stage_handler_returns_classified_failure(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_code"),
+    ("error", "expected_code", "expected_disposition", "expected_outcome"),
     [
-        (ProviderTransientError(), FailureCode.PROVIDER_UNAVAILABLE),
-        (ProviderOutputError(), FailureCode.INVALID_MODEL_OUTPUT),
+        (
+            ProviderTransientError(),
+            FailureCode.PROVIDER_UNAVAILABLE,
+            FailureDisposition.RETRYABLE,
+            ProcessingOutcome.RETRY_SCHEDULED,
+        ),
+        (
+            ProviderOutputError(),
+            FailureCode.INVALID_MODEL_OUTPUT,
+            FailureDisposition.RETRYABLE,
+            ProcessingOutcome.RETRY_SCHEDULED,
+        ),
+        (
+            ProviderInputError(),
+            FailureCode.INVALID_INPUT,
+            FailureDisposition.PERMANENT,
+            ProcessingOutcome.FAILED,
+        ),
+        (
+            ProviderPermanentError(),
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            ProcessingOutcome.FAILED,
+        ),
+        (
+            ProviderPermanentOutputError(),
+            FailureCode.INVALID_MODEL_OUTPUT,
+            FailureDisposition.PERMANENT,
+            ProcessingOutcome.FAILED,
+        ),
+        (
+            ProviderTimeoutError(),
+            FailureCode.PROVIDER_TIMEOUT,
+            FailureDisposition.RETRYABLE,
+            ProcessingOutcome.RETRY_SCHEDULED,
+        ),
+        (
+            ProviderRateLimitError(),
+            FailureCode.RATE_LIMITED,
+            FailureDisposition.RETRYABLE,
+            ProcessingOutcome.RETRY_SCHEDULED,
+        ),
+        (
+            ProviderError(),
+            FailureCode.INTERNAL,
+            FailureDisposition.PERMANENT,
+            ProcessingOutcome.FAILED,
+        ),
     ],
 )
 async def test_extraction_failures_preserve_provider_category(
     tmp_path: Path,
     error: Exception,
     expected_code: FailureCode,
+    expected_disposition: FailureDisposition,
+    expected_outcome: ProcessingOutcome,
 ) -> None:
     clock = MutableClock()
     service, database = create_workflow(
@@ -367,13 +422,50 @@ async def test_extraction_failures_preserve_provider_category(
 
     result = await worker.run_once(ProcessingStage.EXTRACTION)
 
-    assert result[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
+    assert result[0].outcome is expected_outcome
     assert result[0].job is not None
     assert result[0].job.last_failure is not None
     assert result[0].job.last_failure.code is expected_code
+    assert result[0].job.last_failure.disposition is expected_disposition
     meeting = service.get_meeting(meeting_id)
     assert meeting.failure is not None
     assert meeting.failure.code is expected_code
+    assert meeting.failure.disposition is expected_disposition
+
+
+async def test_provider_retry_hint_is_persisted_and_delays_retry(tmp_path: Path) -> None:
+    clock = MutableClock()
+    provider_failure = ProviderRateLimitError(
+        metadata=ProviderErrorMetadata(
+            http_status=429,
+            request_id="req_rate_limited",
+            retry_after_seconds=45,
+        )
+    )
+    service, database = create_workflow(
+        tmp_path,
+        clock,
+        specialists=FailingSpecialists(provider_failure),
+    )
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    result = await worker.run_once(ProcessingStage.EXTRACTION)
+
+    assert result[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
+    assert result[0].job is not None
+    assert result[0].job.next_attempt_at == clock.now() + timedelta(seconds=75)
+    assert result[0].job.next_attempt_at > clock.now() + timedelta(seconds=45)
+    assert result[0].job.last_failure is not None
+    assert result[0].job.last_failure.retry_after_seconds == 45
+    with SqliteUnitOfWork(database) as restarted:
+        persisted_job = restarted.processing_jobs.get(result[0].job.id)
+        persisted_meeting = restarted.meetings.get(meeting_id)
+    assert persisted_job is not None
+    assert persisted_job.last_failure == result[0].job.last_failure
+    assert persisted_meeting is not None
+    assert persisted_meeting.failure == result[0].job.last_failure
 
 
 async def test_transcription_completion_fault_is_scheduled_for_retry(

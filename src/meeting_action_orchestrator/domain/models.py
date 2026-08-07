@@ -96,7 +96,22 @@ class WorkflowFailure(DomainModel):
     disposition: FailureDisposition
     safe_message: MediumText
     provider_request_id: ShortText | None = None
+    retry_after_seconds: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=600.0,
+        allow_inf_nan=False,
+    )
     occurred_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_retry_after(self) -> WorkflowFailure:
+        if (
+            self.retry_after_seconds is not None
+            and self.disposition is not FailureDisposition.RETRYABLE
+        ):
+            raise DomainInvariantError(InvariantCode.RETRY_DISPOSITION)
+        return self
 
 
 class DeliveryOperationBinding(DomainModel):

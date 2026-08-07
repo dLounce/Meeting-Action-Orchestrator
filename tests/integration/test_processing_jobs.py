@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import get_ident
 from uuid import UUID
 
+import pytest
+
 from meeting_action_orchestrator.application.processing import (
     ProcessingOutcome,
     ProcessingScheduler,
@@ -47,9 +49,11 @@ class FixedRetryScheduler:
     def __init__(self, delay: timedelta = timedelta(seconds=30)) -> None:
         self.delay = delay
         self.calls: list[int] = []
+        self.bases: list[datetime] = []
 
     def schedule(self, now: datetime, attempt_count: int) -> datetime:
         self.calls.append(attempt_count)
+        self.bases.append(now)
         return now + self.delay
 
 
@@ -338,10 +342,61 @@ async def test_worker_releases_claim_transaction_before_handler(tmp_path: Path) 
     assert first[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
     assert first[0].job is not None
     assert first[0].job.status is ProcessingJobStatus.RETRY_WAIT
+    assert first[0].job.next_attempt_at == NOW + timedelta(seconds=30)
     assert retry_scheduler.calls == [1]
+    assert retry_scheduler.bases == [NOW]
     assert second[0].outcome is ProcessingOutcome.SUCCEEDED
     assert second[0].job is not None
     assert second[0].job.attempt_count == 2
+
+
+@pytest.mark.parametrize(
+    ("provider_delay", "local_delay", "expected_delay"),
+    [(60.0, 30.0, 90.0), (10.0, 30.0, 40.0)],
+)
+async def test_worker_respects_local_and_provider_retry_minimums(
+    tmp_path: Path,
+    provider_delay: float,
+    local_delay: float,
+    expected_delay: float,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = FrozenClock()
+    create_scheduler(database, clock).enqueue(MEETING_ID, ProcessingStage.TRANSCRIPTION)
+    failure = WorkflowFailure(
+        code=FailureCode.RATE_LIMITED,
+        disposition=FailureDisposition.RETRYABLE,
+        safe_message="The provider is temporarily unavailable",
+        retry_after_seconds=provider_delay,
+        occurred_at=clock.now(),
+    )
+
+    async def handler(job: ProcessingJob) -> WorkflowFailure:
+        del job
+        return failure
+
+    retry_scheduler = FixedRetryScheduler(timedelta(seconds=local_delay))
+    worker = ProcessingWorker(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        handlers={ProcessingStage.TRANSCRIPTION: handler},
+        clock=clock,
+        retry_scheduler=retry_scheduler,
+        worker_id="worker-a",
+        lease_duration=timedelta(minutes=1),
+    )
+
+    result = await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    assert result[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
+    assert result[0].job is not None
+    assert result[0].job.next_attempt_at == NOW + timedelta(seconds=expected_delay)
+    assert result[0].job.next_attempt_at > NOW + timedelta(seconds=provider_delay)
+    assert retry_scheduler.bases == [NOW + timedelta(seconds=provider_delay)]
+    assert result[0].job.last_failure == failure
+    with SqliteUnitOfWork(database) as restarted:
+        persisted = restarted.processing_jobs.get(JOB_ID)
+    assert persisted is not None
+    assert persisted.last_failure == failure
 
 
 async def test_worker_claims_each_job_with_a_fresh_lease(tmp_path: Path) -> None:

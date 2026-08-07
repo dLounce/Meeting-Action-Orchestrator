@@ -1,13 +1,18 @@
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
+import httpx
 import pytest
 
 from meeting_action_orchestrator.application.errors import (
     ProviderConfigurationError,
     ProviderInputError,
     ProviderOutputError,
+    ProviderPermanentError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     ProviderTransientError,
 )
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
@@ -15,6 +20,9 @@ from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriptionConfigurationError,
     OpenAITranscriptionInputError,
     OpenAITranscriptionOutputError,
+    OpenAITranscriptionPermanentError,
+    OpenAITranscriptionRateLimitError,
+    OpenAITranscriptionTimeoutError,
     OpenAITranscriptionTransientError,
 )
 
@@ -52,6 +60,88 @@ class FakeResponse:
     def model_dump(self, mode: str) -> dict[str, Any]:
         assert mode == "json"
         return self._payload
+
+
+class FakeProviderFailureError(Exception):
+    def __init__(
+        self,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        body: object = None,
+        response: object = None,
+    ) -> None:
+        self.status_code = status_code
+        self.code = code
+        self.body = body
+        self.response = response
+        super().__init__("private transcription provider detail")
+
+
+class APIConnectionError(FakeProviderFailureError):
+    pass
+
+
+class APITimeoutError(FakeProviderFailureError):
+    pass
+
+
+class RateLimitError(FakeProviderFailureError):
+    pass
+
+
+class InternalServerError(FakeProviderFailureError):
+    pass
+
+
+class AuthenticationError(FakeProviderFailureError):
+    pass
+
+
+class PermissionDeniedError(FakeProviderFailureError):
+    pass
+
+
+class NotFoundError(FakeProviderFailureError):
+    pass
+
+
+class BadRequestError(FakeProviderFailureError):
+    pass
+
+
+class UnprocessableEntityError(FakeProviderFailureError):
+    pass
+
+
+class FailingTranscriptions(FakeTranscriptions):
+    def __init__(self, error: Exception) -> None:
+        super().__init__({})
+        self.error = error
+
+    async def create(self, **arguments: Any) -> object:
+        self.calls.append(arguments)
+        raise self.error
+
+
+def configured_transcriber() -> OpenAITranscriber:
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        client=FakeClient({}),
+    )
+    transcriber._openai = SimpleNamespace(
+        APIConnectionError=APIConnectionError,
+        APITimeoutError=APITimeoutError,
+        RateLimitError=RateLimitError,
+        InternalServerError=InternalServerError,
+        AuthenticationError=AuthenticationError,
+        PermissionDeniedError=PermissionDeniedError,
+        NotFoundError=NotFoundError,
+        BadRequestError=BadRequestError,
+        UnprocessableEntityError=UnprocessableEntityError,
+    )
+    return transcriber
 
 
 def _diarized_segment(**updates: object) -> dict[str, object]:
@@ -95,7 +185,10 @@ def test_transcription_errors_implement_provider_failure_contracts() -> None:
     assert isinstance(OpenAITranscriptionConfigurationError(), ProviderConfigurationError)
     assert isinstance(OpenAITranscriptionInputError(), ProviderInputError)
     assert isinstance(OpenAITranscriptionTransientError(), ProviderTransientError)
+    assert isinstance(OpenAITranscriptionTimeoutError(), ProviderTimeoutError)
+    assert isinstance(OpenAITranscriptionRateLimitError(), ProviderRateLimitError)
     assert isinstance(OpenAITranscriptionOutputError(), ProviderOutputError)
+    assert isinstance(OpenAITranscriptionPermanentError(), ProviderPermanentError)
 
 
 @pytest.mark.asyncio
@@ -175,6 +268,8 @@ async def test_diarized_transcription_maps_speaker_segments(tmp_path: Path) -> N
     assert call["response_format"] == "diarized_json"
     assert call["chunking_strategy"] == "auto"
     assert call["language"] == "en"
+    client_request_id = call["extra_headers"]["X-Client-Request-Id"]
+    assert str(UUID(client_request_id)) == client_request_id
     assert result.duration_seconds == duration_seconds
     assert result.provider_request_id == request_id
     assert result.segments[0].id == "seg_1"
@@ -336,6 +431,29 @@ async def test_plain_transcription_builds_fallback_segment(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_transcriber_sends_a_unique_client_request_id_per_call(tmp_path: Path) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    client = FakeClient({"text": "Ship it"})
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        client=client,
+    )
+
+    first = await transcriber.transcribe(audio_path)
+    second = await transcriber.transcribe(audio_path)
+
+    client_request_ids = tuple(
+        call["extra_headers"]["X-Client-Request-Id"] for call in client.transcriptions.calls
+    )
+    assert len(set(client_request_ids)) == 2
+    assert all(str(UUID(value)) == value for value in client_request_ids)
+    assert first.provider_request_id == client_request_ids[0]
+    assert second.provider_request_id == client_request_ids[1]
+
+
+@pytest.mark.asyncio
 async def test_transcription_rejects_empty_provider_output(tmp_path: Path) -> None:
     audio_path = tmp_path / "meeting.wav"
     audio_path.write_bytes(b"audio")
@@ -359,3 +477,195 @@ async def test_transcription_rejects_missing_audio_file(tmp_path: Path) -> None:
 
     with pytest.raises(OpenAITranscriptionInputError):
         await transcriber.transcribe(tmp_path / "missing.mp3")
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type"),
+    [
+        (APIConnectionError(), OpenAITranscriptionTransientError),
+        (APITimeoutError(), OpenAITranscriptionTimeoutError),
+        (RateLimitError(status_code=429), OpenAITranscriptionRateLimitError),
+        (InternalServerError(status_code=503), OpenAITranscriptionTransientError),
+        (AuthenticationError(status_code=401), OpenAITranscriptionConfigurationError),
+        (PermissionDeniedError(status_code=403), OpenAITranscriptionConfigurationError),
+        (NotFoundError(status_code=404), OpenAITranscriptionConfigurationError),
+        (BadRequestError(status_code=400), OpenAITranscriptionInputError),
+        (UnprocessableEntityError(status_code=422), OpenAITranscriptionInputError),
+        (TypeError("adapter mismatch"), OpenAITranscriptionConfigurationError),
+        (FakeProviderFailureError(status_code=503), OpenAITranscriptionTransientError),
+        (FakeProviderFailureError(status_code=408), OpenAITranscriptionTimeoutError),
+        (FakeProviderFailureError(status_code=409), OpenAITranscriptionTransientError),
+        (RuntimeError("unknown"), OpenAITranscriptionPermanentError),
+    ],
+)
+def test_transcriber_classifies_provider_failures(
+    error: Exception,
+    expected_type: type[Exception],
+) -> None:
+    translated = configured_transcriber()._translate_error(error)
+
+    assert isinstance(translated, expected_type)
+    assert "private transcription provider detail" not in str(translated)
+
+
+def test_transcriber_does_not_retry_quota_or_oversized_retry_after() -> None:
+    quota = RateLimitError(
+        status_code=429,
+        code="insufficient_quota",
+        body={"message": "billing detail"},
+    )
+    oversized = RateLimitError(
+        status_code=429,
+        response=SimpleNamespace(status_code=429, headers={"retry-after": "601"}),
+    )
+
+    quota_error = configured_transcriber()._translate_error(quota)
+    oversized_error = configured_transcriber()._translate_error(oversized)
+
+    assert isinstance(quota_error, OpenAITranscriptionConfigurationError)
+    assert isinstance(oversized_error, OpenAITranscriptionPermanentError)
+    assert oversized_error.retry_after_seconds is None
+
+
+def test_transcriber_honors_provider_retry_directive_precedence() -> None:
+    retry_input = BadRequestError(
+        status_code=400,
+        response=SimpleNamespace(
+            status_code=400,
+            headers=httpx.Headers({"X-Should-Retry": "true"}),
+        ),
+    )
+    reject_server = InternalServerError(
+        status_code=503,
+        response=SimpleNamespace(
+            status_code=503,
+            headers=httpx.Headers({"x-should-retry": "false"}),
+        ),
+    )
+    quota = RateLimitError(
+        status_code=429,
+        code="insufficient_quota",
+        response=SimpleNamespace(
+            status_code=429,
+            headers=httpx.Headers({"x-should-retry": "true"}),
+        ),
+    )
+
+    assert isinstance(
+        configured_transcriber()._translate_error(retry_input),
+        OpenAITranscriptionTransientError,
+    )
+    assert isinstance(
+        configured_transcriber()._translate_error(reject_server),
+        OpenAITranscriptionPermanentError,
+    )
+    assert isinstance(
+        configured_transcriber()._translate_error(quota),
+        OpenAITranscriptionConfigurationError,
+    )
+
+
+def test_transcriber_fails_closed_on_ambiguous_retry_headers() -> None:
+    error = RateLimitError(
+        status_code=429,
+        response=SimpleNamespace(
+            status_code=429,
+            headers=httpx.Headers([("retry-after", "5"), ("Retry-After", "6")]),
+        ),
+    )
+
+    translated = configured_transcriber()._translate_error(error)
+
+    assert isinstance(translated, OpenAITranscriptionPermanentError)
+    assert translated.retry_after_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_injected_transcriber_classifies_statusless_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    client = FakeClient({})
+    failing = FailingTranscriptions(APITimeoutError())
+    client.audio = FakeAudio(failing)
+    module = configured_transcriber()._openai
+    monkeypatch.setattr(
+        "meeting_action_orchestrator.infrastructure.openai_transcription.import_module",
+        lambda _name: module,
+    )
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        client=client,
+    )
+
+    with pytest.raises(OpenAITranscriptionTimeoutError) as captured:
+        await transcriber.transcribe(audio_path)
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    client_request_id = failing.calls[0]["extra_headers"]["X-Client-Request-Id"]
+    assert str(UUID(client_request_id)) == client_request_id
+    assert captured.value.request_id == client_request_id
+
+
+def test_transcriber_detaches_sdk_import_error_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = "private sdk import detail"
+
+    def fail_import(_name: str) -> object:
+        raise ImportError(marker)
+
+    monkeypatch.setattr(
+        "meeting_action_orchestrator.infrastructure.openai_transcription.import_module",
+        fail_import,
+    )
+    transcriber = OpenAITranscriber(api_key="test", model="gpt-4o-transcribe")
+
+    with pytest.raises(OpenAITranscriptionConfigurationError) as captured:
+        transcriber._get_client()
+
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert marker not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_transcriber_raises_sanitized_error_without_raw_exception_context(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    provider_error = RateLimitError(
+        status_code=429,
+        code="rate_limit_exceeded",
+        body={"message": "private transcription provider detail"},
+        response=SimpleNamespace(
+            status_code=429,
+            headers={"retry-after": "9", "x-request-id": "req_transcription_2"},
+        ),
+    )
+    client = FakeClient({})
+    failing = FailingTranscriptions(provider_error)
+    client.audio = FakeAudio(failing)
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        client=client,
+    )
+    transcriber._openai = configured_transcriber()._openai
+
+    with pytest.raises(OpenAITranscriptionTransientError) as captured:
+        await transcriber.transcribe(audio_path)
+
+    error = captured.value
+    assert error.request_id == "req_transcription_2"
+    assert error.retry_after_seconds == 9
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert "private transcription provider detail" not in str(error)
+    client_request_id = failing.calls[0]["extra_headers"]["X-Client-Request-Id"]
+    assert error.request_id != client_request_id

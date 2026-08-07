@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from meeting_action_orchestrator.application.provider_policy import ProviderErrorMetadata
 from meeting_action_orchestrator.domain.enums import FailureCode, FailureDisposition
 
 
@@ -44,7 +45,22 @@ class PermanentWriteError(ApplicationError):
 
 
 class ProviderError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str = "Provider request failed",
+        *,
+        metadata: ProviderErrorMetadata | None = None,
+    ) -> None:
+        details = metadata or ProviderErrorMetadata()
+        self.http_status = details.http_status
+        self.provider_code = details.provider_code
+        self.request_id = details.request_id
+        self.response_id = details.response_id
+        self.retry_after_seconds = details.retry_after_seconds
+        self.retry_after_exceeds_limit = details.retry_after_exceeds_limit
+        self.provider_should_retry = details.provider_should_retry
+        self.retry_control_rejected = details.retry_control_rejected
+        super().__init__(message)
 
 
 class ProviderConfigurationError(ProviderError):
@@ -59,7 +75,23 @@ class ProviderTransientError(ProviderError):
     pass
 
 
+class ProviderTimeoutError(ProviderTransientError):
+    pass
+
+
+class ProviderRateLimitError(ProviderTransientError):
+    pass
+
+
 class ProviderOutputError(ProviderError):
+    pass
+
+
+class ProviderPermanentError(ProviderError):
+    pass
+
+
+class ProviderPermanentOutputError(ProviderPermanentError):
     pass
 
 

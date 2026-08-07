@@ -8,6 +8,10 @@ from meeting_action_orchestrator.application.errors import (
     ProviderConfigurationError,
     ProviderInputError,
     ProviderOutputError,
+    ProviderPermanentError,
+    ProviderPermanentOutputError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
     ProviderTransientError,
     RetryableDeliveryError,
     UnknownDeliveryOutcomeError,
@@ -25,13 +29,21 @@ from meeting_action_orchestrator.infrastructure.mcp_gateway import (
 )
 from meeting_action_orchestrator.infrastructure.openai_agents import (
     OpenAIAgentConfigurationError,
+    OpenAIAgentInputError,
     OpenAIAgentOutputError,
+    OpenAIAgentPermanentError,
+    OpenAIAgentPermanentOutputError,
+    OpenAIAgentRateLimitError,
+    OpenAIAgentTimeoutError,
     OpenAIAgentTransientError,
 )
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriptionConfigurationError,
     OpenAITranscriptionInputError,
     OpenAITranscriptionOutputError,
+    OpenAITranscriptionPermanentError,
+    OpenAITranscriptionRateLimitError,
+    OpenAITranscriptionTimeoutError,
     OpenAITranscriptionTransientError,
 )
 
@@ -57,12 +69,20 @@ def test_audio_contracts_remain_available_from_the_infrastructure_module() -> No
     ("implementation", "contract"),
     [
         (OpenAIAgentConfigurationError, ProviderConfigurationError),
+        (OpenAIAgentInputError, ProviderInputError),
         (OpenAIAgentTransientError, ProviderTransientError),
+        (OpenAIAgentTimeoutError, ProviderTimeoutError),
+        (OpenAIAgentRateLimitError, ProviderRateLimitError),
         (OpenAIAgentOutputError, ProviderOutputError),
+        (OpenAIAgentPermanentError, ProviderPermanentError),
+        (OpenAIAgentPermanentOutputError, ProviderPermanentOutputError),
         (OpenAITranscriptionConfigurationError, ProviderConfigurationError),
         (OpenAITranscriptionInputError, ProviderInputError),
         (OpenAITranscriptionTransientError, ProviderTransientError),
+        (OpenAITranscriptionTimeoutError, ProviderTimeoutError),
+        (OpenAITranscriptionRateLimitError, ProviderRateLimitError),
         (OpenAITranscriptionOutputError, ProviderOutputError),
+        (OpenAITranscriptionPermanentError, ProviderPermanentError),
     ],
 )
 def test_openai_errors_implement_application_provider_contracts(

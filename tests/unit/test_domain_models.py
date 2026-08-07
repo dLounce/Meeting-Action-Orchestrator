@@ -17,6 +17,8 @@ from meeting_action_orchestrator.domain import (
     DeliveryDirective,
     DomainInvariantError,
     EvidenceRef,
+    FailureCode,
+    FailureDisposition,
     IngestAudioIdentity,
     IngestRequestBinding,
     IngestRequestIdentity,
@@ -29,6 +31,7 @@ from meeting_action_orchestrator.domain import (
     Risk,
     Transcript,
     TranscriptSegment,
+    WorkflowFailure,
     canonical_json,
     canonical_sha256,
     validate_review_evidence,
@@ -390,3 +393,32 @@ def test_timezone_must_be_from_iana_database() -> None:
 def test_canonical_json_rejects_unknown_types() -> None:
     with pytest.raises(InvalidDomainValueError, match="unsupported value type"):
         canonical_json(object())
+
+
+@pytest.mark.parametrize("value", [-1.0, 600.000001, float("inf"), float("nan")])
+def test_workflow_failure_rejects_invalid_provider_retry_minimum(value: float) -> None:
+    with pytest.raises(ValidationError):
+        WorkflowFailure(
+            code=FailureCode.PROVIDER_UNAVAILABLE,
+            disposition=FailureDisposition.RETRYABLE,
+            safe_message="The provider is temporarily unavailable",
+            retry_after_seconds=value,
+            occurred_at=NOW,
+        )
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [FailureDisposition.PERMANENT, FailureDisposition.UNKNOWN_OUTCOME],
+)
+def test_workflow_failure_limits_provider_retry_minimum_to_retryable_failures(
+    disposition: FailureDisposition,
+) -> None:
+    with pytest.raises(ValidationError, match="retry requires a retryable failure"):
+        WorkflowFailure(
+            code=FailureCode.PROVIDER_UNAVAILABLE,
+            disposition=disposition,
+            safe_message="The provider is unavailable",
+            retry_after_seconds=1,
+            occurred_at=NOW,
+        )
