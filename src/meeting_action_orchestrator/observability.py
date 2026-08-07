@@ -9,20 +9,31 @@ from typing import Any
 REDACTED = "[redacted]"
 SENSITIVE_KEYS = frozenset(
     {
+        "actor_id",
         "api_key",
         "authorization",
         "audio",
+        "audio_asset_id",
         "content",
         "cookie",
         "credentials",
+        "email",
+        "external_id",
+        "external_url",
+        "filename",
         "mcp_auth_token",
+        "meeting_id",
         "openai_api_key",
+        "original_name",
         "password",
+        "path",
         "prompt",
+        "provider_request_id",
         "secret",
         "text",
         "token",
         "transcript",
+        "url",
     }
 )
 

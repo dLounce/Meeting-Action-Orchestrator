@@ -9,6 +9,11 @@ from meeting_action_orchestrator.observability import REDACTED, JsonFormatter, s
 def test_sanitize_redacts_nested_sensitive_values() -> None:
     value = {
         "job_id": "job-1",
+        "request_id": "request-1",
+        "meeting_id": "meeting-1",
+        "actor_id": "actor-1",
+        "email": "person@example.com",
+        "provider_request_id": "provider-1",
         "authorization": "Bearer secret",
         "nested": {
             "transcript": "private meeting",
@@ -20,6 +25,11 @@ def test_sanitize_redacts_nested_sensitive_values() -> None:
 
     assert result == {
         "job_id": "job-1",
+        "request_id": "request-1",
+        "meeting_id": REDACTED,
+        "actor_id": REDACTED,
+        "email": REDACTED,
+        "provider_request_id": REDACTED,
         "authorization": REDACTED,
         "nested": {"transcript": REDACTED, "service_token": REDACTED},
     }
@@ -33,7 +43,7 @@ def test_json_formatter_emits_safe_structured_record() -> None:
 
     assert result["level"] == "info"
     assert result["message"] == "processed"
-    assert result["fields"] == {"meeting_id": "meeting-1", "api_key": REDACTED}
+    assert result["fields"] == {"meeting_id": REDACTED, "api_key": REDACTED}
 
 
 def test_json_formatter_does_not_interpolate_log_arguments() -> None:
