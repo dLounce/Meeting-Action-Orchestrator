@@ -95,8 +95,11 @@ a ninth rotation.
   evidence that is checked against persisted segments.
 - The extraction, recap, and verification specialists have no external tools and run for
   one turn.
-- Request and output budgets bound semantic model execution; hidden SDK retries are
-  disabled.
+- Per-run checks and immutable per-job accounts bound semantic requests and Responses token
+  envelopes across automatic and manual retries; hidden SDK retries are disabled.
+- Every physical provider dispatch requires a durable reservation bound to the current
+  processing attempt, lease owner, and unique claim token. Missing or uncertain usage remains
+  charged at its full reservation.
 
 Prompt injection in a transcript can still influence semantic output. The protection is
 containment and human approval, not a claim that arbitrary meeting content is trustworthy.
@@ -142,10 +145,23 @@ The application does not encrypt recordings or SQLite at rest. Use encrypted dis
 restricted service accounts, private backups, and filesystem access controls in deployment.
 Do not treat `.gitignore` as an access-control mechanism.
 
-Semantic OpenAI requests use `store=False`. OpenAI agent tracing is disabled by default and
-sensitive trace payloads are excluded. The transcription provider and semantic models
+Semantic OpenAI requests use `store=False`. OpenAI agent tracing is disabled on the budgeted
+transport. The transcription provider and semantic models
 still receive meeting content required for their work; the operator is responsible for
 provider account policy, regional requirements, consent, and data-processing obligations.
+
+The provider ledger persists only policy values, bounded counters, model and operation names,
+UUIDs, and SHA-256 request, dispatch, and operation digests. It does not persist prompts,
+transcripts, recordings, raw request headers, API credentials, or provider response bodies.
+Reservations are conservative by design: a crash, cancellation, invalid usage payload, or
+uncertain settlement can consume more budget than the provider ultimately billed. This favors
+preventing untracked spend over maximizing remaining capacity.
+
+Responses input and output limits are preventative because input is counted before generation
+and the outbound maximum is reserved. Transcription token usage is not a preventative cap: the
+transcription API exposes neither an exact preflight count nor a maximum-output-token setting.
+The application instead limits transcription request count and cumulative persisted audio
+duration, and stores strict token-or-duration usage when supplied.
 
 Without an erasure request, recordings and derived records persist indefinitely. There is
 no automated retention policy. The authenticated meeting-erasure API removes one meeting
@@ -270,7 +286,7 @@ downstream target access.
 - Restrict filesystem permissions and encrypt disks and backups.
 - Use HTTPS and least-privilege credentials for remote MCP access.
 - Verify MCP idempotency and lookup behavior before enabling writes.
-- Keep OpenAI tracing disabled unless a reviewed operational need requires it.
+- Keep OpenAI tracing disabled; enabling it is rejected by the current budgeted runtime.
 - Review delivery receipts and reconcile every `unknown` intent.
 - Define retention schedules and backup, provider, connector, and incident-data erasure
   procedures.

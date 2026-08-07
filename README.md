@@ -23,7 +23,7 @@ application backend, including a portfolio backend-for-frontend.
   recording cleanup and database checkpointing.
 - Erasure persistence retains meeting, ingest, actor, and request identities only as
   scoped HMAC tokens needed for replay safety and resurrection prevention.
-- OpenAI agent storage is disabled and sensitive tracing is off by default.
+- OpenAI agent storage and tracing are disabled for budgeted provider requests.
 
 ## Workflow
 
@@ -111,7 +111,15 @@ Settings come from environment variables or a local `.env` file. The complete se
 | `OPENAI_RECAP_MODEL` | `gpt-5.6-terra` | Recap model |
 | `OPENAI_MAX_REQUESTS_PER_RUN` | `5` | Semantic request budget for one extraction run |
 | `OPENAI_MAX_OUTPUT_TOKENS_PER_RUN` | `12000` | Aggregate semantic output budget |
+| `OPENAI_TIMEOUT_SECONDS` | `120` | Per-request timeout and accepted maximum |
 | `OPENAI_MAX_RETRIES` | `0` | Hidden SDK retries; only zero is accepted |
+| `OPENAI_BUDGET_POLICY_VERSION` | `1` | Version persisted with each new processing-job budget |
+| `OPENAI_EXTRACTION_PREFLIGHT_REQUEST_LIMIT` | `6` | Lifetime Responses input-count calls per extraction job |
+| `OPENAI_EXTRACTION_PROVIDER_REQUEST_LIMIT` | `6` | Lifetime Responses generation calls per extraction job |
+| `OPENAI_EXTRACTION_INPUT_TOKEN_LIMIT` | `800000` | Lifetime counted or conservatively reserved input tokens |
+| `OPENAI_EXTRACTION_OUTPUT_TOKEN_LIMIT` | `24000` | Lifetime actual or conservatively reserved output tokens |
+| `OPENAI_TRANSCRIPTION_PROVIDER_REQUEST_LIMIT` | `3` | Lifetime transcription calls per transcription job |
+| `OPENAI_TRANSCRIPTION_AUDIO_DURATION_MS_LIMIT` | `21600000` | Lifetime reserved recording duration per transcription job |
 | `ERASURE_HMAC_ACTIVE_KEY_ID` | required | Key ID used for new erasure identity tokens |
 | `ERASURE_HMAC_KEYS` | required | JSON object of key IDs to base64url-encoded HMAC secrets |
 | `MEETING_ERASURE_BATCH_SIZE` | `20` | Erasure jobs handled per worker cycle |
@@ -123,6 +131,31 @@ Settings come from environment variables or a local `.env` file. The complete se
 
 The model aliases and per-specialist output limits are configurable. The service does not
 silently substitute another model.
+
+### Durable provider budgets
+
+Every new processing job receives an immutable budget-policy snapshot in the same SQLite
+transaction that creates the job. Before a physical provider request, the worker must still
+own the exact live processing lease and its unique claim token, then commits an append-only
+reservation. Automatic or manual retries reuse the same account, so retrying a job never
+restores spent capacity.
+
+Extraction reserves an input-count request first. It then sends the exact token-bearing
+Responses payload to `/v1/responses/input_tokens` and reserves the returned input count plus
+the outbound maximum output before generation. A valid success usage record replaces the
+reserved token envelope; missing, malformed, failed, cancelled, or crash-ambiguous usage
+keeps the full reservation charged. SDK retries, redirects, background responses, streaming,
+provider storage, and OpenAI tracing are disabled on this path.
+
+The transcription API has no preventative input-token count or maximum-output-token control.
+Transcription therefore enforces lifetime request count and the persisted recording duration;
+strict token-or-duration usage is stored when the provider returns it, but transcription token
+usage is telemetry rather than a claimed hard cap. The adapter revalidates the persisted
+recording byte size and SHA-256 before reserving or sending it.
+
+The V11 migration creates zero-limit locked accounts for processing jobs that predate durable
+accounting. Those jobs fail closed instead of spending against an invented historical budget.
+Resolve or erase and re-ingest that legacy work under a new processing job after an upgrade.
 
 ### Erasure key management
 

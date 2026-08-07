@@ -55,6 +55,15 @@ port or removes repeated policy.
 - Preserve evidence validation for model-derived content.
 - Require explicit approval of the current immutable review digest before delivery.
 - Keep OpenAI and MCP calls outside database transactions.
+- Create a provider-budget account in the same immediate unit of work as every processing
+  job. Automatic and manual retries must retain that account.
+- Reserve every physical OpenAI dispatch against the exact live attempt and claim token before
+  network I/O.
+  Keep reservations and settlements append-only, preserve conservative charge after
+  ambiguous outcomes, and never require a live lease to settle already-incurred usage.
+- Do not persist provider request bodies, prompts, content, headers, credentials, or raw
+  request IDs in the budget ledger. Persist only bounded policy, counters, identifiers, and
+  canonical digests.
 - Preserve idempotency bindings for ingest, approval, retry, reconciliation, and writes.
 - Never move an `unknown` write directly back to create; reconcile it first.
 - Keep meeting erasure fail closed around active or unknown work and inconsistent ownership.

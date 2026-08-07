@@ -112,6 +112,34 @@ Each specialist receives one turn and no tools. SDK retries are disabled. Per-ca
 limits and a shared request/output budget bound one semantic run. Agent requests use
 `store=False`, and sensitive trace data is disabled.
 
+### Provider accounting
+
+Each processing job owns one immutable provider-budget account. The account snapshots its
+policy version and stage-specific lifetime limits when the job is created. Append-only
+reservations bind every physical dispatch to the exact running attempt, lease owner, and
+unique claim token. Request identity and payload semantics enter the ledger only as dispatch
+and operation digests. Append-only settlements store strict usage when it is available. Usage
+aggregation charges actual successful usage by dimension and otherwise retains the reservation
+envelope, including crashes and uncertain provider outcomes. Manual processing retry does not
+replace the account or its ledger.
+
+The Responses transport reserves a preflight call before posting the exact token-bearing
+request projection to the input-token count endpoint. It then reserves the counted input and
+declared maximum output before generation. The response hook records usage before structured
+output parsing, so a paid response remains accounted even when later validation fails.
+The per-request timeout is capped at 120 seconds so the six-request extraction maximum retains
+margin inside the 15-minute processing lease without lengthening crash recovery.
+Transcription reserves its exact persisted audio duration and request count after verifying
+the same local file descriptor against the stored size and SHA-256. Its optional token or
+duration usage is persisted as telemetry; the provider API does not expose preventative
+transcription token controls.
+
+Reservations require the current claim token and a live processing lease, but settlements
+deliberately do not. A provider can incur cost immediately before lease expiry or worker loss,
+and that cost must remain recordable. Account, reservation, and settlement rows cascade only
+with their processing job during meeting erasure. Direct mutation and deletion are rejected
+while the meeting exists.
+
 ## Workflow audit ledger
 
 The application records a meeting-scoped workflow history for ingest, meeting status
@@ -317,9 +345,9 @@ Readiness does not call OpenAI and does not perform a connector write or lookup,
 cannot prove provider credentials, quota, model availability, or downstream target access.
 
 The CLI installs structured JSON logging. Known sensitive field names are redacted and long
-strings are bounded. OpenAI tracing is disabled by default. The repository does not include
-a metrics exporter, distributed tracing backend, log sink, external audit sink, or public
-or live audit-event stream.
+strings are bounded. OpenAI tracing is disabled for budgeted requests. The repository does
+not include a metrics exporter, distributed tracing backend, log sink, external audit sink,
+or public or live audit-event stream.
 
 ## Current limitations
 
