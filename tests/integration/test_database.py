@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from meeting_action_orchestrator.infrastructure import database as database_module
 from meeting_action_orchestrator.infrastructure.database import SCHEMA_V1, Database
 
 
@@ -42,6 +43,189 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     assert database.migrate() == 6
     assert database.migrate() == 6
     assert database.healthcheck()
+
+
+def test_migrate_executes_trigger_bodies_as_single_statements(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration = """
+    CREATE TABLE source_records (
+        id INTEGER PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+    CREATE TABLE source_record_audit (
+        source_id INTEGER NOT NULL,
+        value TEXT NOT NULL
+    );
+    CREATE TRIGGER audit_source_record_update
+    AFTER UPDATE ON source_records
+    BEGIN
+        INSERT INTO source_record_audit (source_id, value)
+        VALUES (NEW.id, OLD.value);
+        INSERT INTO source_record_audit (source_id, value)
+        VALUES (NEW.id, NEW.value);
+    END;
+    INSERT INTO source_records (id, value) VALUES (2, 'seed;value');
+    """
+    monkeypatch.setattr(database_module, "MIGRATIONS", ((1, migration),))
+    database = Database(tmp_path / "application.sqlite3")
+
+    assert database.migrate() == 1
+    with database.transaction() as connection:
+        connection.execute("INSERT INTO source_records (id, value) VALUES (?, ?)", (1, "before"))
+        connection.execute("UPDATE source_records SET value = ? WHERE id = ?", ("after", 1))
+    with database.connect() as connection:
+        values = connection.execute(
+            "SELECT value FROM source_record_audit ORDER BY rowid"
+        ).fetchall()
+        seed = connection.execute("SELECT value FROM source_records WHERE id = ?", (2,)).fetchone()
+
+    assert [row["value"] for row in values] == ["before", "after"]
+    assert seed["value"] == "seed;value"
+
+
+def test_migrate_does_not_repeat_trigger_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration = """
+    CREATE TABLE source_records (id INTEGER PRIMARY KEY);
+    CREATE TABLE source_record_audit (source_id INTEGER NOT NULL);
+    CREATE TRIGGER audit_source_record_insert
+    AFTER INSERT ON source_records
+    BEGIN
+        INSERT INTO source_record_audit (source_id) VALUES (NEW.id);
+    END;
+    """
+    monkeypatch.setattr(database_module, "MIGRATIONS", ((1, migration),))
+    database = Database(tmp_path / "application.sqlite3")
+
+    assert database.migrate() == 1
+    assert database.migrate() == 1
+    with database.transaction() as connection:
+        connection.execute("INSERT INTO source_records (id) VALUES (?)", (1,))
+    with database.connect() as connection:
+        trigger_count = connection.execute(
+            """
+            SELECT COUNT(*) FROM sqlite_master
+            WHERE type = 'trigger' AND name = 'audit_source_record_insert'
+            """
+        ).fetchone()[0]
+        audit_count = connection.execute("SELECT COUNT(*) FROM source_record_audit").fetchone()[0]
+
+    assert trigger_count == 1
+    assert audit_count == 1
+
+
+def test_migrate_rolls_back_trigger_migration_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration = """
+    CREATE TABLE source_records (id INTEGER PRIMARY KEY);
+    CREATE TABLE source_record_audit (source_id INTEGER NOT NULL);
+    CREATE TRIGGER audit_source_record_insert
+    AFTER INSERT ON source_records
+    BEGIN
+        INSERT INTO source_record_audit (source_id) VALUES (NEW.id);
+    END;
+    INSERT INTO missing_table (id) VALUES (1);
+    """
+    monkeypatch.setattr(database_module, "MIGRATIONS", ((1, migration),))
+    database = Database(tmp_path / "application.sqlite3")
+
+    with pytest.raises(sqlite3.OperationalError, match="missing_table"):
+        database.migrate()
+
+    with database.connect() as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        objects = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE name IN (
+                'source_records',
+                'source_record_audit',
+                'audit_source_record_insert'
+            )
+            """
+        ).fetchall()
+    assert version == 0
+    assert objects == []
+
+
+def test_migrate_rolls_back_incomplete_trailing_sql(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration = """
+    CREATE TABLE completed_records (id INTEGER PRIMARY KEY);
+    CREATE TABLE incomplete_records (
+    """
+    monkeypatch.setattr(database_module, "MIGRATIONS", ((1, migration),))
+    database = Database(tmp_path / "application.sqlite3")
+
+    with pytest.raises(sqlite3.OperationalError, match="incomplete input"):
+        database.migrate()
+
+    with database.connect() as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        completed_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'completed_records'
+            """
+        ).fetchone()
+    assert version == 0
+    assert completed_table is None
+
+
+@pytest.mark.parametrize(
+    "trailing",
+    ["-- trailing ; ' note", "/* trailing ; ' note */"],
+)
+def test_migrate_accepts_comment_only_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trailing: str,
+) -> None:
+    migration = f"""
+    CREATE TABLE completed_records (id INTEGER PRIMARY KEY);
+    {trailing}
+    """
+    monkeypatch.setattr(database_module, "MIGRATIONS", ((1, migration),))
+    database = Database(tmp_path / "application.sqlite3")
+
+    assert database.migrate() == 1
+    with database.connect() as connection:
+        completed_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'completed_records'
+            """
+        ).fetchone()
+    assert completed_table is not None
+
+
+def test_migrate_rejects_lexically_incomplete_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    migration = """
+    CREATE TABLE completed_records (id INTEGER PRIMARY KEY);
+    INSERT INTO completed_records (id) VALUES ('unterminated
+    """
+    monkeypatch.setattr(database_module, "MIGRATIONS", ((1, migration),))
+    database = Database(tmp_path / "application.sqlite3")
+
+    with pytest.raises(sqlite3.OperationalError, match="incomplete trailing SQL"):
+        database.migrate()
+
+    with database.connect() as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        completed_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'completed_records'
+            """
+        ).fetchone()
+    assert version == 0
+    assert completed_table is None
 
 
 def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:

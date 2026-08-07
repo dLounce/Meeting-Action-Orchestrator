@@ -294,9 +294,8 @@ class Database:
             for version, sql in MIGRATIONS:
                 if version <= current:
                     continue
-                for statement in sql.split(";"):
-                    if statement.strip():
-                        connection.execute(statement)
+                for statement in _migration_statements(sql):
+                    connection.execute(statement)
                 connection.execute(f"PRAGMA user_version = {version}")
                 current = version
         return current
@@ -310,3 +309,22 @@ class Database:
 def _restrict_permissions(path: Path, mode: int) -> None:
     with suppress(OSError):
         path.chmod(mode)
+
+
+def _migration_statements(sql: str) -> Iterator[str]:
+    pending: list[str] = []
+    for character in sql:
+        pending.append(character)
+        if character != ";":
+            continue
+        statement = "".join(pending)
+        if not sqlite3.complete_statement(statement):
+            continue
+        if statement.strip():
+            yield statement
+        pending.clear()
+    trailing = "".join(pending).strip()
+    if trailing:
+        if not sqlite3.complete_statement(f"{trailing}\n;"):
+            raise sqlite3.OperationalError("migration contains incomplete trailing SQL")
+        yield trailing
