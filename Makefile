@@ -1,4 +1,4 @@
-.PHONY: install format lint typecheck test check run
+.PHONY: install format lint typecheck test check migrate run
 
 install:
 	uv sync --group dev
@@ -18,6 +18,9 @@ test:
 	uv run pytest
 
 check: lint typecheck test
+
+migrate:
+	uv run meeting-orchestrator database migrate
 
 run:
 	uv run meeting-orchestrator serve
