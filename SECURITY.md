@@ -11,9 +11,10 @@ Rotate any credential that may have been exposed before sharing a redacted repor
 ## Trust model
 
 Recordings, filenames, transcript text, model output, HTTP input, review edits, and MCP
-responses are untrusted. `OPENAI_API_KEY`, `API_BEARER_TOKEN`, and `MCP_AUTH_TOKEN` are
-operator-managed secrets. Configured MCP endpoints, tools, and resource identifiers are
-privileged deployment inputs and must be reviewed before use.
+responses are untrusted. `OPENAI_API_KEY`, `API_BEARER_TOKEN`, `MCP_AUTH_TOKEN`, and every
+secret in `ERASURE_HMAC_KEYS` are operator-managed secrets. Configured MCP endpoints,
+tools, resource identifiers, and erasure key IDs are privileged deployment inputs and must
+be reviewed before use.
 
 The service assumes a trusted operator and a trusted server-side API caller. It is not a
 multi-tenant identity or authorization system.
@@ -39,6 +40,46 @@ Do not expose the token to a browser. A portfolio or other frontend must call it
 server-side route, which authenticates the user and injects the orchestrator token from a
 private environment variable. Never place the token in public JavaScript, HTML, browser
 storage, source control, or a public environment-variable prefix.
+
+The server-side route must authorize ownership independently for deletion, erasure-status
+polling, and remediation. Possession of the orchestrator bearer token grants access to all
+meetings and erasure jobs in this single-operator deployment.
+
+## Erasure key management
+
+Meeting erasure uses purpose-scoped HMAC-SHA-256 tokens to preserve idempotency and prevent
+an erased ingest identity from being recreated without retaining that raw identity. These
+tokens are pseudonymous, not anonymous. Disclosure of a key permits offline testing of
+candidate meeting IDs, ingest keys, actor IDs, request keys, and erasure job IDs.
+
+`ERASURE_HMAC_ACTIVE_KEY_ID` and `ERASURE_HMAC_KEYS` are mandatory at service startup. The
+keyring accepts one to eight unique base64url-encoded secrets, each decoding to 32 through
+64 bytes. Keep the JSON value in a secret manager or protected environment file. Generate
+a 32-byte base64url value with:
+
+```bash
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
+```
+
+Do not derive an erasure key from the API bearer token, an OpenAI key, a password, or
+another deployment's key. Do not log, commit, transmit, or include key material in support
+records. Database key-verifier rows are non-secret integrity checks; they are not a backup
+of the keys.
+
+Rotate keys only in a maintenance window with API writes and all workers stopped:
+
+1. Generate a new secret and a never-before-used key ID.
+2. Add the new entry while retaining every existing key unchanged.
+3. Set the new key ID as active.
+4. Run `uv run meeting-orchestrator erasure verify-keyring` against the target database.
+5. Restart traffic only after verification succeeds.
+
+The verifier command applies migrations and prints only the verified key count. Startup
+and readiness fail closed if a configured secret changes, a referenced key is missing, or
+a persisted verifier does not match. Never remove a historical key while a tombstone,
+erasure job, or operation binding references it. The current service does not migrate
+historical tokens, so the eight-key limit requires an explicit engineering change before
+a ninth rotation.
 
 ## Input and prompt safety
 
@@ -87,10 +128,11 @@ connections require HTTPS even without `MCP_AUTH_TOKEN`. URL credentials are not
 
 ## Data handling
 
-Recordings are stored outside the HTTP static surface under generated digest-based names.
-The upload directory and files receive restrictive permissions where the operating system
-supports them. SQLite stores transcript text, participant details, reviews, approvals,
-intents, and receipts.
+Recordings are stored outside the HTTP static surface under unique generated per-upload
+names. The upload directory and files receive restrictive permissions where the operating
+system supports them. SQLite stores transcript text, participant details, reviews,
+approvals, intents, and receipts. SHA-256-based database ownership may reuse an existing
+audio asset; the unselected upload is durably scheduled for identity-verified cleanup.
 
 The application does not encrypt recordings or SQLite at rest. Use encrypted disks,
 restricted service accounts, private backups, and filesystem access controls in deployment.
@@ -101,9 +143,55 @@ sensitive trace payloads are excluded. The transcription provider and semantic m
 still receive meeting content required for their work; the operator is responsible for
 provider account policy, regional requirements, consent, and data-processing obligations.
 
-Recordings and derived records currently persist indefinitely. There is no automated
-retention, per-meeting deletion, or purge API. Define deployment-level retention and backup
-procedures before processing production personal data.
+Without an erasure request, recordings and derived records persist indefinitely. There is
+no automated retention policy. The authenticated meeting-erasure API removes one meeting
+on request, but operators must schedule those requests and define backup disposal
+separately.
+
+## Meeting erasure boundary
+
+`DELETE /v1/meetings/{meeting_id}` requires the current meeting ETag and a durable
+idempotency key. The application refuses deletion while it observes running processing, a
+live delivery operation, an in-flight or unknown write outcome, an unrecognized work
+status, or an inconsistent ownership graph. This fail-closed behavior avoids deleting the
+local evidence needed to reconcile an external side effect.
+
+An accepted request serializes writes with `BEGIN IMMEDIATE` and atomically removes the
+database-known meeting graph, creates HMAC tombstones and idempotency bindings, and
+schedules recording cleanup when the meeting owns the last reference. The graph includes
+the meeting, ingest binding, transcripts, review revisions, approvals, recap artifacts,
+processing state, write intents and receipts, delivery-operation bindings, and
+meeting-control bindings. The retained erasure resource contains bounded status, failure,
+counter, version, and timestamp fields; durable HMAC records do not contain the raw
+meeting, ingest, actor, or request identities.
+
+Recording deletion is identity-bound. Before unlinking, the local adapter verifies the
+generated storage key, expected byte size, and full SHA-256. Shared content is retained
+until its final database owner is erased. A mismatch fails cleanup instead of deleting an
+unexpected file. Failed cleanup can be retried only through bounded, versioned,
+idempotent remediation.
+
+SQLite connections require foreign keys, WAL mode, `secure_delete=ON`, and
+`synchronous=FULL`. The erasure worker requires WAL truncation after the relational purge;
+successful recording cleanup rearms that checkpoint before the job becomes `completed`.
+These controls reduce residual data in the live database files, but they are not a claim
+of forensic sanitization.
+
+The erasure guarantee is snapshot-bounded and covers only copies known to the serialized
+SQLite transaction and the managed recording under `UPLOAD_DIRECTORY`. It does not erase:
+
+- database backups, point-in-time recovery data, replicas, exports, or volume snapshots;
+- copied recordings, desktop or cloud synchronization history, filesystem journals, swap,
+  crash dumps, or application-external logs;
+- flash translation layers, SSD wear-leveling remnants, discarded blocks, or other device
+  remanence;
+- data retained by OpenAI under the operator's provider agreement or account settings;
+- MCP server logs or task and calendar resources already created in downstream systems;
+- data manually exported, forwarded, or otherwise stored outside this service's managed
+  database and upload directory.
+
+An erasure completion must therefore trigger the operator's separate backup, provider,
+connector, and incident-data procedures when those systems hold the same personal data.
 
 ## HTTP deployment
 
@@ -135,13 +223,18 @@ not validate OpenAI credentials, quota, model availability, or downstream target
 
 - Store all credentials in a secret manager or protected environment file.
 - Use a unique 32-byte-or-longer API bearer token per deployment.
+- Use a separate randomly generated erasure HMAC keyring and verify it before startup.
+- Retain every referenced historical erasure key and rotate only during no-write
+  maintenance.
 - Keep the API private and expose only a separately authenticated server-side proxy.
 - Restrict filesystem permissions and encrypt disks and backups.
 - Use HTTPS and least-privilege credentials for remote MCP access.
 - Verify MCP idempotency and lookup behavior before enabling writes.
 - Keep OpenAI tracing disabled unless a reviewed operational need requires it.
 - Review delivery receipts and reconcile every `unknown` intent.
-- Define retention, deletion, backup, and incident-response procedures.
+- Define retention schedules and backup, provider, connector, and incident-data erasure
+  procedures.
+- Poll accepted erasure jobs to a terminal state and remediate failed recording cleanup.
 - Rotate exposed credentials immediately.
 
 ## Supported versions

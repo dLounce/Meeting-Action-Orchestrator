@@ -11,13 +11,21 @@ cp .env.example .env
 ```
 
 The offline test suite does not need provider credentials. Running the service requires
-`OPENAI_API_KEY` and an `API_BEARER_TOKEN` containing at least 32 UTF-8 bytes.
+`OPENAI_API_KEY`, an `API_BEARER_TOKEN` containing at least 32 UTF-8 bytes, and a dedicated
+erasure HMAC keyring.
 
 ```bash
 openssl rand -hex 32
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
 uv run meeting-orchestrator database migrate
+uv run meeting-orchestrator erasure verify-keyring
 uv run meeting-orchestrator serve
 ```
+
+Use the base64url value from the second command as a 32-byte secret in
+`ERASURE_HMAC_KEYS`, and set its key ID in `ERASURE_HMAC_ACTIVE_KEY_ID`. Never reuse the
+API token or a provider credential as an erasure key. See
+[README.md](README.md#erasure-key-management) for the keyring format and rotation process.
 
 MCP is optional. Leave `MCP_TASK_RESOURCE_ID` and `MCP_CALENDAR_RESOURCE_ID` empty unless a
 reviewed Streamable HTTP MCP server is available. A resource ID requires
@@ -47,6 +55,11 @@ port or removes repeated policy.
 - Keep OpenAI and MCP calls outside database transactions.
 - Preserve idempotency bindings for ingest, approval, retry, reconciliation, and writes.
 - Never move an `unknown` write directly back to create; reconcile it first.
+- Keep meeting erasure fail closed around active or unknown work and inconsistent ownership.
+- Never persist raw meeting, ingest, actor, or request identities in erasure tombstones or
+  operation bindings.
+- Preserve last-owner recording cleanup, identity verification, bounded remediation, and
+  the WAL-checkpoint gate on erasure completion.
 - Keep blocking filesystem and SQLite work off the async event loop.
 - Return safe public failures without provider payloads or internal exception detail.
 - Do not add a frontend to this repository; the supported integration surface is JSON HTTP.
@@ -61,6 +74,11 @@ Repository writes must participate in a unit of work. Avoid network calls while 
 transaction is open. Add integration coverage for migrations, repository round trips,
 claim behavior, and optimistic concurrency when those contracts change.
 
+An erasure migration must account for every meeting-owned table in graph validation and
+deletion. New references that cannot cascade safely must be deleted explicitly in the same
+immediate transaction. Preserve `secure_delete=ON`, `synchronous=FULL`, key-verifier
+integrity, immutable tombstones, and terminal-state triggers.
+
 ## API changes
 
 Treat route paths, status codes, schemas, `ETag`, `If-Match`, `Idempotency-Key`,
@@ -68,8 +86,10 @@ Treat route paths, status codes, schemas, `ETag`, `If-Match`, `Idempotency-Key`,
 contracts.
 
 New `/v1/*` routes must use bearer authentication and document every non-success response
-as `application/problem+json`. Mutations of review content must use the strong review ETag,
-and replayable commands must have a durable idempotency design before implementation.
+as `application/problem+json`. Mutations of review content must use the strong review ETag;
+meeting control and deletion use a meeting-version ETag; erasure remediation uses an
+erasure-version ETag. Replayable commands must have a durable idempotency design before
+implementation.
 
 Update `README.md`, OpenAPI assertions, and API tests in the same change. Do not expose the
 static API bearer token through browser code or add permissive CORS as a substitute for a
@@ -108,14 +128,21 @@ Use fakes at provider boundaries and real SQLite temporary databases for persist
 behavior. Scale coverage with risk: domain invariants need focused unit tests, while
 transactions, leases, migrations, and HTTP contracts need integration or contract tests.
 
+Erasure changes require coverage for stale versions, idempotent replay, active-work
+blocking, malformed ownership, shared recordings, exact-file preflight, cleanup failure
+and group remediation, WAL checkpoint retries, historical key validation, tombstone ingest
+conflicts, privacy-safe responses, and restart recovery.
+
 ## Security and data
 
 Never add credentials, `.env` files, recordings, transcripts, runtime databases, logs, or
 provider response captures to Git. Use synthetic meeting text in tests and documentation.
 Before committing, inspect staged changes for secrets and personal data.
 
-Changes that introduce retention, deletion, authentication, external writes, or sensitive
-logging need an explicit security review and corresponding updates to `SECURITY.md`.
+Changes that introduce retention, deletion, authentication, external writes, key rotation,
+or sensitive logging need an explicit security review and corresponding updates to
+`SECURITY.md`. Do not broaden an erasure claim beyond the local SQLite snapshot and managed
+recording store without an implementation and test for every additional copy.
 
 ## Commit style
 

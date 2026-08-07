@@ -17,6 +17,8 @@ Portfolio backend or API client
       -> OpenAI adapters
     -> In-process runtime supervisor
       -> Processing worker
+      -> Recording cleanup and orphan-discovery workers
+      -> Meeting-erasure worker
       -> Optional delivery worker
         -> Guarded MCP gateway
           -> Task or calendar provider
@@ -35,8 +37,9 @@ database dependency.
 and execution budgets. Specialists are tool-less and do not call one another.
 
 `application` contains ports and use cases for ingest, processing, review revision,
-approval, delivery control, and outbox execution. It depends on domain and typed agent
-contracts, not on FastAPI, SQLite, OpenAI, or MCP implementations.
+approval, delivery control, outbox execution, recording cleanup, and meeting erasure. It
+depends on domain and typed agent contracts, not on FastAPI, SQLite, OpenAI, or MCP
+implementations.
 
 `infrastructure` implements the application ports for SQLite, local audio, OpenAI
 transcription, OpenAI Agents SDK execution, Streamable HTTP MCP, and the guarded MCP
@@ -47,7 +50,8 @@ middleware, and routes. Adapters move blocking application and SQLite calls off 
 loop.
 
 `bootstrap.py` is the composition root. It constructs adapters, use cases, worker loops,
-and API dependencies. `cli.py` exposes database migration and service startup commands.
+and API dependencies. `cli.py` exposes database migration, erasure-key verification, and
+service startup commands.
 
 Dependency direction points inward. Provider-specific exceptions are translated to
 application-level failure categories before workflow policy evaluates them.
@@ -57,13 +61,15 @@ application-level failure categories before workflow policy evaluates them.
 The FastAPI lifespan owns the runtime supervisor:
 
 1. Apply SQLite migrations in a worker thread.
-2. Start the transcription and extraction polling loop.
-3. Start the delivery loop when an MCP endpoint and at least one delivery target exist.
-4. Close the MCP session and OpenAI clients during shutdown.
+2. Register and validate the complete erasure HMAC keyring.
+3. Preflight the private recording store.
+4. Start processing, recording-cleanup, orphan-discovery, and meeting-erasure loops.
+5. Start the delivery loop when an MCP endpoint and at least one delivery target exist.
+6. Close the MCP session and OpenAI clients during shutdown.
 
 Ingest automatically creates the transcription job. The
-`POST /v1/meetings/{meeting_id}/processing` endpoint only returns current meeting state;
-it does not execute provider calls or create another job.
+`GET /v1/meetings/{meeting_id}/processing` endpoint reads persisted jobs; it does not
+execute provider calls or create another job.
 
 ## Meeting lifecycle
 
@@ -104,6 +110,63 @@ three isolated semantic steps against typed contracts:
 Each specialist receives one turn and no tools. SDK retries are disabled. Per-call output
 limits and a shared request/output budget bound one semantic run. Agent requests use
 `store=False`, and sensitive trace data is disabled.
+
+## Meeting erasure
+
+Meeting erasure is an authenticated, idempotent workflow rather than a synchronous file
+unlink. `DELETE /v1/meetings/{meeting_id}` requires the current quoted meeting version and
+an idempotency key. A default immediate unit of work acquires a SQLite write reservation
+before it validates and changes the graph.
+
+The deletion transaction fails closed when it finds running processing, live delivery
+control work, an in-flight or unknown write, an unrecognized work status, malformed
+ownership, or an inconsistent relational graph. When validation succeeds, one transaction:
+
+- deletes delivery-operation bindings and the meeting-owned relational graph;
+- deletes the audio-asset row only when the recording has no other owner;
+- creates recording cleanup work for the last owner, or records that the job is waiting on
+  a shared asset;
+- creates a durable erasure job, immutable tombstone, and operation binding.
+
+Foreign-key cascades remove transcripts, review revisions, approvals, recap artifacts,
+processing jobs, write intents, receipts, ingest bindings, and meeting-operation records.
+The tombstone prevents the erased ingest identity from recreating the meeting. It stores
+purpose-scoped HMAC-SHA-256 tokens instead of raw meeting, ingest, actor, or request
+identities. The application checks candidates under every configured historical key so
+rotation does not make old tombstones invisible.
+
+Recording cleanup is asynchronous because SHA-based database ownership can make one
+recording asset serve multiple meetings. The last owner schedules one identity-bound
+cleanup job; earlier erasure jobs move from `waiting_shared` to the same cleanup group. The
+filesystem adapter verifies the expected storage key, byte size, and SHA-256 before
+quarantining and unlinking. A mismatch is a permanent failure, not permission to delete a
+different file.
+
+```text
+active / waiting_shared
+  -> active / cleanup_pending
+  -> active / removed
+  -> completed / removed
+
+active / cleanup_pending
+  -> active / failed
+  -> failed / failed
+  -> operator remediation -> active / cleanup_pending
+```
+
+The erasure worker uses leases and bounded retry scheduling. It requires a successful
+`PRAGMA wal_checkpoint(TRUNCATE)` after relational deletion. Successful recording cleanup
+removes its detail row and rearms the checkpoint before the job can become `completed`. A
+busy or malformed checkpoint result is retryable. Failed cleanup can be remediated only
+with the latest erasure ETag and a new idempotency key; every job linked to the shared
+cleanup is reactivated atomically and each job has a bounded remediation counter.
+
+The durable residue is intentionally narrow but not anonymous: the erasure job and its
+safe status fields, HMAC tokens, key verifiers, tombstone, and idempotency bindings remain.
+Anyone with an HMAC key and a candidate identity can test that candidate, so key material
+is a high-value secret. The guarantee covers the database-known graph in the serialized
+transaction snapshot and the managed local recording. It does not cover backups, copied
+files, storage-device remanence, provider retention, or external MCP resources.
 
 ## Review and approval
 
@@ -166,25 +229,31 @@ or selection is rejected.
 
 ## Persistence and concurrency
 
-SQLite uses foreign keys, WAL mode, a busy timeout, and explicit migrations. Write units of
-work use immediate transactions; read-only API queries use deferred transactions. Meeting
-and write-intent updates use optimistic versions. Processing jobs and write intents use
-leases so abandoned work can be classified and recovered.
+SQLite uses foreign keys, WAL mode, `secure_delete=ON`, `synchronous=FULL`, a busy timeout,
+and explicit migrations. Write units of work use immediate transactions; read-only API
+queries use deferred transactions. Meeting and write-intent updates use optimistic
+versions. Processing jobs, cleanup jobs, write intents, and erasure jobs use leases so
+abandoned work can be classified and recovered.
 
-Recordings are streamed to generated, content-addressed filenames with restrictive local
-permissions. File type is detected from bytes and confirmed with `ffprobe` before an audio
-asset is committed. A failed ingest deletes its newly stored file when no database asset
-references the same digest.
+Each upload is streamed to a unique generated storage key with restrictive local
+permissions. File type is detected from bytes and confirmed with `ffprobe`, and SHA-256 is
+computed before the database chooses whether to create an audio asset or reuse an existing
+asset with the same digest. A newly stored file that is not selected as the owned asset is
+durably scheduled for identity-verified abandoned-ingest cleanup; it is not deleted inline
+with ingest failure handling.
 
 SQLite stores transcripts, immutable review revisions, approvals, recap artifacts,
-processing jobs, write intents, receipts, and delivery-operation bindings. It is the
-business source of truth; OpenAI continuation state is not used as workflow state.
+processing jobs, write intents, receipts, delivery-operation bindings, erasure key
+verifiers, HMAC tombstones, and erasure-operation bindings. It is the business source of
+truth; OpenAI continuation state is not used as workflow state.
 
 ## HTTP boundary
 
 Health and OpenAPI routes are public. Every `/v1/*` route uses one static bearer token and
-maps it to the configured actor subject. Review mutations use strong digest ETags.
-Side-effecting or replayable commands use explicit `Idempotency-Key` headers.
+maps it to the configured actor subject. Review mutations use strong digest ETags;
+meeting-control and deletion mutations use meeting-version ETags; erasure remediation
+uses erasure-version ETags. Side-effecting or replayable commands use explicit
+`Idempotency-Key` headers.
 
 Request middleware bounds declared and streamed bodies. Domain and application failures
 are converted to `application/problem+json`; unknown exceptions receive a generic problem
@@ -199,7 +268,9 @@ browser sessions, user-level authorization, or tenant isolation.
 Liveness confirms that the HTTP process can respond. Readiness checks:
 
 - SQLite connectivity;
-- whether the runtime worker tasks are alive;
+- recording-storage access;
+- whether all registered and referenced erasure HMAC keys still validate;
+- whether the runtime worker tasks and dedicated erasure worker are alive;
 - MCP initialization when delivery is configured, or the explicit disabled mode.
 
 Readiness does not call OpenAI and does not perform a connector write or lookup, so it
@@ -212,8 +283,12 @@ a metrics exporter, distributed tracing backend, log sink, or public audit-event
 ## Current limitations
 
 - No frontend is included.
-- No meeting collection, delete, purge, or event-stream endpoint is implemented.
-- No automated retention or per-record erasure workflow is implemented.
+- No event-stream endpoint is implemented.
+- No automated retention scheduler or policy is implemented; erasure is requested per
+  meeting.
+- Erasure is bounded to the local transaction snapshot and managed recording store; it
+  cannot sanitize backups, replicas, device remanence, provider systems, or MCP-created
+  resources.
 - Data is not encrypted at rest by the application.
 - SQLite and local uploads are not a high-availability storage design.
 - Provider health, backup, restore, metrics, alerting, and deployment hardening remain
@@ -222,3 +297,4 @@ a metrics exporter, distributed tracing backend, log sink, or public audit-event
 ## Decision records
 
 - [ADR 0001: Deterministic workflow coordination](docs/decisions/0001-deterministic-workflow.md)
+- [ADR 0002: Bounded meeting erasure](docs/decisions/0002-bounded-meeting-erasure.md)
