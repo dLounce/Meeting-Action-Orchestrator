@@ -260,7 +260,7 @@ class McpGateway:
         try:
             permitted = await self._authorizer.permits(validated)
         except Exception:
-            raise _permanent(FailureCode.INTERNAL, _SAFE_INTENT_MESSAGE) from None
+            raise _retryable(FailureCode.PROVIDER_UNAVAILABLE, _SAFE_RETRYABLE_MESSAGE) from None
         if permitted is not True:
             raise _permanent(FailureCode.INVALID_INPUT, _SAFE_INTENT_MESSAGE)
         return validated

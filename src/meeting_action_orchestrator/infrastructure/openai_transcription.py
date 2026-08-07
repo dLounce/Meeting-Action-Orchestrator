@@ -10,6 +10,7 @@ from meeting_action_orchestrator.application.errors import (
     ProviderConfigurationError,
     ProviderError,
     ProviderInputError,
+    ProviderOutputError,
     ProviderTransientError,
 )
 
@@ -38,6 +39,11 @@ class OpenAITranscriptionInputError(OpenAITranscriptionError, ProviderInputError
 class OpenAITranscriptionTransientError(OpenAITranscriptionError, ProviderTransientError):
     def __init__(self) -> None:
         super().__init__("transient_error")
+
+
+class OpenAITranscriptionOutputError(OpenAITranscriptionError, ProviderOutputError):
+    def __init__(self) -> None:
+        super().__init__("invalid_output")
 
 
 @dataclass(frozen=True)
@@ -148,7 +154,7 @@ class OpenAITranscriber:
         data = self._as_mapping(response)
         text = self._string_value(data.get("text"))
         if not text:
-            raise OpenAITranscriptionError("empty_output")
+            raise OpenAITranscriptionOutputError
         duration = self._float_value(data.get("duration"))
         segments = self._map_segments(data.get("segments"), text, duration)
         usage = self._map_usage(data.get("usage"))
@@ -197,7 +203,7 @@ class OpenAITranscriber:
                 )
             )
         if not segments:
-            raise OpenAITranscriptionError("empty_segments")
+            raise OpenAITranscriptionOutputError
         return tuple(segments)
 
     def _map_usage(self, raw_usage: object) -> TranscriptionUsage:

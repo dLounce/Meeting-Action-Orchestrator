@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -372,6 +373,59 @@ async def test_extraction_failures_preserve_provider_category(
     meeting = service.get_meeting(meeting_id)
     assert meeting.failure is not None
     assert meeting.failure.code is expected_code
+
+
+async def test_transcription_completion_fault_is_scheduled_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock)
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+
+    def fail_completion(*_arguments: object) -> None:
+        raise sqlite3.OperationalError("database is busy")
+
+    monkeypatch.setattr(service, "_complete_transcription", fail_completion)
+
+    result = await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    assert result[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
+    assert result[0].job is not None
+    assert result[0].job.last_failure is not None
+    assert result[0].job.last_failure.code is FailureCode.INTERNAL
+    assert result[0].job.last_failure.disposition is FailureDisposition.RETRYABLE
+    meeting = service.get_meeting(meeting_id)
+    assert meeting.status is MeetingStatus.TRANSCRIPTION_FAILED
+    assert meeting.failure == result[0].job.last_failure
+
+
+async def test_extraction_completion_fault_is_scheduled_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock)
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    def fail_completion(*_arguments: object) -> None:
+        raise sqlite3.OperationalError("database is busy")
+
+    monkeypatch.setattr(service, "_complete_extraction", fail_completion)
+
+    result = await worker.run_once(ProcessingStage.EXTRACTION)
+
+    assert result[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
+    assert result[0].job is not None
+    assert result[0].job.last_failure is not None
+    assert result[0].job.last_failure.code is FailureCode.INTERNAL
+    assert result[0].job.last_failure.disposition is FailureDisposition.RETRYABLE
+    meeting = service.get_meeting(meeting_id)
+    assert meeting.status is MeetingStatus.EXTRACTION_FAILED
+    assert meeting.failure == result[0].job.last_failure
 
 
 async def test_expired_handler_cannot_commit_stage_output(tmp_path: Path) -> None:

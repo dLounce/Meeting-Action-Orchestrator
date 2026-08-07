@@ -690,6 +690,19 @@ async def test_persisted_authorizer_requires_the_exact_active_approved_snapshot(
     assert get_ident() not in database.persistence_threads
 
 
+@pytest.mark.asyncio
+async def test_persisted_authorizer_propagates_indeterminate_storage_failure() -> None:
+    claimed = make_intent(status=WriteStatus.IN_FLIGHT, attempt_count=1)
+
+    def unavailable_unit_of_work() -> FakeUnitOfWork:
+        raise RuntimeError("database unavailable")
+
+    authorizer = PersistedApprovalAuthorizer(unavailable_unit_of_work, MutableClock())
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await authorizer.permits(claimed)
+
+
 def test_full_jitter_scheduler_uses_exponential_ceiling_and_positive_delay() -> None:
     scheduler = FullJitterRetryScheduler(
         base_delay=timedelta(seconds=2),

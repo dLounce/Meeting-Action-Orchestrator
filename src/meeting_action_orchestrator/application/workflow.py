@@ -250,7 +250,15 @@ class MeetingWorkflow:
         try:
             await self._transcribe(meeting, job=job)
         except Exception as error:
-            return _transcription_failure(error, self._clock.now())
+            failure = _transcription_failure(error, self._clock.now())
+            await asyncio.to_thread(
+                self._fail_stage,
+                meeting.id,
+                MeetingStatus.TRANSCRIPTION_FAILED,
+                failure,
+                job=job,
+            )
+            return failure
         return None
 
     async def execute_extraction_job(
@@ -277,7 +285,15 @@ class MeetingWorkflow:
         try:
             await self._extract(meeting, job=job)
         except Exception as error:
-            return _extraction_failure(error, self._clock.now())
+            failure = _extraction_failure(error, self._clock.now())
+            await asyncio.to_thread(
+                self._fail_stage,
+                meeting.id,
+                MeetingStatus.EXTRACTION_FAILED,
+                failure,
+                job=job,
+            )
+            return failure
         return None
 
     def approve(
@@ -671,6 +687,14 @@ class MeetingWorkflow:
                 now,
             )
             current = _required(uow.meetings.get(meeting_id), "Meeting")
+            if current.status is target:
+                return
+            not_started = {
+                MeetingStatus.TRANSCRIPTION_FAILED: MeetingStatus.INGESTED,
+                MeetingStatus.EXTRACTION_FAILED: MeetingStatus.TRANSCRIBED,
+            }
+            if current.status is not_started[target]:
+                return
             failed = transition_meeting(current, target, now, failure=failure)
             uow.meetings.save(failed, current.version)
             uow.commit()
@@ -778,10 +802,18 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
             "The transcription provider is temporarily unavailable",
             occurred_at,
         )
+    if isinstance(error, ProviderOutputError):
+        return _failure(
+            error,
+            FailureCode.INVALID_MODEL_OUTPUT,
+            FailureDisposition.RETRYABLE,
+            "The transcription provider returned invalid output",
+            occurred_at,
+        )
     return _failure(
         error,
         FailureCode.INTERNAL,
-        FailureDisposition.PERMANENT,
+        FailureDisposition.RETRYABLE,
         "Transcription could not be completed",
         occurred_at,
     )
@@ -815,7 +847,7 @@ def _extraction_failure(error: Exception, occurred_at: datetime) -> WorkflowFail
     return _failure(
         error,
         FailureCode.INTERNAL,
-        FailureDisposition.PERMANENT,
+        FailureDisposition.RETRYABLE,
         "Meeting analysis could not be completed",
         occurred_at,
     )

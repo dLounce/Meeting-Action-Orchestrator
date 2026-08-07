@@ -31,6 +31,7 @@ from meeting_action_orchestrator.infrastructure.openai_agents import (
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriptionConfigurationError,
     OpenAITranscriptionInputError,
+    OpenAITranscriptionOutputError,
     OpenAITranscriptionTransientError,
 )
 
@@ -61,6 +62,7 @@ def test_audio_contracts_remain_available_from_the_infrastructure_module() -> No
         (OpenAITranscriptionConfigurationError, ProviderConfigurationError),
         (OpenAITranscriptionInputError, ProviderInputError),
         (OpenAITranscriptionTransientError, ProviderTransientError),
+        (OpenAITranscriptionOutputError, ProviderOutputError),
     ],
 )
 def test_openai_errors_implement_application_provider_contracts(

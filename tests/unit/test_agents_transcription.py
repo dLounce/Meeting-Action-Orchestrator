@@ -7,12 +7,14 @@ import pytest
 from meeting_action_orchestrator.application.errors import (
     ProviderConfigurationError,
     ProviderInputError,
+    ProviderOutputError,
     ProviderTransientError,
 )
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriber,
     OpenAITranscriptionConfigurationError,
     OpenAITranscriptionInputError,
+    OpenAITranscriptionOutputError,
     OpenAITranscriptionTransientError,
 )
 
@@ -65,6 +67,7 @@ def test_transcription_errors_implement_provider_failure_contracts() -> None:
     assert isinstance(OpenAITranscriptionConfigurationError(), ProviderConfigurationError)
     assert isinstance(OpenAITranscriptionInputError(), ProviderInputError)
     assert isinstance(OpenAITranscriptionTransientError(), ProviderTransientError)
+    assert isinstance(OpenAITranscriptionOutputError(), ProviderOutputError)
 
 
 @pytest.mark.asyncio
@@ -173,6 +176,20 @@ async def test_plain_transcription_builds_fallback_segment(tmp_path: Path) -> No
     assert result.segments[0].id == "segment_0001"
     assert result.segments[0].text == "Ship it"
     assert result.usage.seconds == usage_seconds
+
+
+@pytest.mark.asyncio
+async def test_transcription_rejects_empty_provider_output(tmp_path: Path) -> None:
+    audio_path = tmp_path / "meeting.wav"
+    audio_path.write_bytes(b"audio")
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        client=FakeClient({"text": ""}),
+    )
+
+    with pytest.raises(OpenAITranscriptionOutputError):
+        await transcriber.transcribe(audio_path)
 
 
 @pytest.mark.asyncio

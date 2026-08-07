@@ -188,15 +188,12 @@ class PersistedApprovalAuthorizer:
         return await asyncio.to_thread(self._permits, intent)
 
     def _permits(self, intent: WriteIntent) -> bool:
-        try:
-            now = self._clock.now()
-            with self._unit_of_work() as uow:
-                persisted = uow.write_intents.get(intent.id)
-                if persisted != intent:
-                    return False
-                return _is_executable(uow, persisted, now)
-        except Exception:
-            return False
+        now = self._clock.now()
+        with self._unit_of_work() as uow:
+            persisted = uow.write_intents.get(intent.id)
+            if persisted != intent:
+                return False
+            return _is_executable(uow, persisted, now)
 
 
 class ApprovedOutboxExecutor:

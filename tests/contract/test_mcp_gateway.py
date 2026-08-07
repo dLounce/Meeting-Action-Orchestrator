@@ -81,6 +81,12 @@ class ApprovedRegistry:
         return self.intents.get(intent.id) == intent
 
 
+class UnavailableRegistry:
+    async def permits(self, intent: WriteIntent) -> bool:
+        del intent
+        raise RuntimeError("database unavailable")
+
+
 def task_intent(
     *,
     status: WriteStatus = WriteStatus.IN_FLIGHT,
@@ -330,6 +336,26 @@ async def test_unclaimed_or_unapproved_intents_never_reach_mcp(
 
     assert captured.value.code is FailureCode.INVALID_INPUT
     assert captured.value.disposition is FailureDisposition.PERMANENT
+    assert not client.calls
+
+
+@pytest.mark.asyncio
+async def test_indeterminate_authorization_is_retryable_before_dispatch() -> None:
+    intent = task_intent()
+    client = FakeMcpClient(success(intent))
+    adapter = McpGateway(
+        client,
+        TOOLS,
+        UnavailableRegistry(),
+        provider="trusted-mcp",
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RetryableMcpError) as captured:
+        await adapter.ensure_task(intent)
+
+    assert captured.value.code is FailureCode.PROVIDER_UNAVAILABLE
+    assert captured.value.disposition is FailureDisposition.RETRYABLE
     assert not client.calls
 
 
