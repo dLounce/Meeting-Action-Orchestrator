@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -176,13 +177,17 @@ class ProcessingWorker:
     ) -> tuple[ProcessingResult, ...]:
         if stage not in self._handlers:
             raise ValueError(f"No handler is registered for {stage.value}")
-        claimed = self._claim(stage, limit)
         results = []
-        for job in claimed:
+        for _ in range(max(0, limit)):
+            claimed = await asyncio.to_thread(self._claim, stage, 1)
+            if not claimed:
+                break
+            job = claimed[0]
             failure = await self._execute(job)
-            persisted = (
-                self._finish_success(job) if failure is None else self._finish_failure(job, failure)
-            )
+            if failure is None:
+                persisted = await asyncio.to_thread(self._finish_success, job)
+            else:
+                persisted = await asyncio.to_thread(self._finish_failure, job, failure)
             if persisted is None:
                 results.append(
                     ProcessingResult(

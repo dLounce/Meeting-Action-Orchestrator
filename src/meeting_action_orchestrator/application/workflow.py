@@ -1,25 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import BinaryIO, Protocol, TypeVar
 from uuid import UUID, uuid4
 
 from meeting_action_orchestrator.agents.contracts import (
     AgentBudget,
-    AgentResult,
     AgentRunContext,
-    ExtractionRequest,
-    MeetingExtraction,
-    RecapDraft,
     RecapRequest,
-    VerificationReport,
     VerificationRequest,
 )
 from meeting_action_orchestrator.application.errors import (
+    ProviderConfigurationError,
+    ProviderInputError,
+    ProviderOutputError,
+    ProviderTransientError,
     ResourceNotFoundError,
     ReviewDigestMismatchError,
     StaleWorkflowVersionError,
@@ -27,7 +26,6 @@ from meeting_action_orchestrator.application.errors import (
 )
 from meeting_action_orchestrator.application.mapping import (
     DeliveryTargets,
-    TranscriptionOutputLike,
     build_canonical_record,
     build_extraction_request,
     map_review_package,
@@ -35,7 +33,13 @@ from meeting_action_orchestrator.application.mapping import (
     render_recap,
     transcript_input,
 )
-from meeting_action_orchestrator.application.ports import UnitOfWork
+from meeting_action_orchestrator.application.ports import (
+    RecordingStore,
+    SpecialistProvider,
+    StoredAudio,
+    TranscriptionProvider,
+    UnitOfWork,
+)
 from meeting_action_orchestrator.application.processing import (
     ProcessingHandler,
     ProcessingScheduler,
@@ -72,6 +76,7 @@ from meeting_action_orchestrator.domain.models import (
     ProcessingJob,
     RecapArtifact,
     ReviewRevision,
+    Transcript,
     WorkflowFailure,
     WriteIntent,
 )
@@ -81,57 +86,10 @@ from meeting_action_orchestrator.domain.services import (
     project_write_intents,
     validate_review_evidence,
 )
-from meeting_action_orchestrator.infrastructure.audio import StoredAudio
-from meeting_action_orchestrator.infrastructure.openai_agents import (
-    OpenAIAgentConfigurationError,
-    OpenAIAgentOutputError,
-    OpenAIAgentTransientError,
-)
-from meeting_action_orchestrator.infrastructure.openai_transcription import (
-    OpenAITranscriptionConfigurationError,
-    OpenAITranscriptionInputError,
-    OpenAITranscriptionTransientError,
-)
 
 
 class Clock(Protocol):
     def now(self) -> datetime: ...
-
-
-class RecordingStore(Protocol):
-    def put(self, stream: BinaryIO, original_name: str) -> StoredAudio: ...
-
-    def path(self, storage_key: str) -> Path: ...
-
-    def delete(self, storage_key: str) -> None: ...
-
-
-class TranscriptionProvider(Protocol):
-    async def transcribe(
-        self,
-        audio_path: Path,
-        language: str | None = None,
-    ) -> TranscriptionOutputLike: ...
-
-
-class SpecialistProvider(Protocol):
-    async def extract(
-        self,
-        request: ExtractionRequest,
-        context: AgentRunContext,
-    ) -> AgentResult[MeetingExtraction]: ...
-
-    async def write_recap(
-        self,
-        request: RecapRequest,
-        context: AgentRunContext,
-    ) -> AgentResult[RecapDraft]: ...
-
-    async def verify(
-        self,
-        request: VerificationRequest,
-        context: AgentRunContext,
-    ) -> AgentResult[VerificationReport]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,7 +206,7 @@ class MeetingWorkflow:
                 self._recording_store.delete(stored.storage_key)
 
     async def process(self, meeting_id: UUID) -> Meeting:
-        meeting = self.get_meeting(meeting_id)
+        meeting = await asyncio.to_thread(self.get_meeting, meeting_id)
         if meeting.status in {MeetingStatus.INGESTED, MeetingStatus.TRANSCRIPTION_FAILED}:
             meeting = await self._transcribe(meeting)
         if meeting.status in {MeetingStatus.TRANSCRIBED, MeetingStatus.EXTRACTION_FAILED}:
@@ -272,10 +230,14 @@ class MeetingWorkflow:
         self,
         job: ProcessingJob,
     ) -> WorkflowFailure | None:
-        invalid = self._validate_job(job, ProcessingStage.TRANSCRIPTION)
+        invalid = await asyncio.to_thread(
+            self._validate_job,
+            job,
+            ProcessingStage.TRANSCRIPTION,
+        )
         if invalid is not None:
             return invalid
-        meeting = self.get_meeting(job.meeting_id)
+        meeting = await asyncio.to_thread(self.get_meeting, job.meeting_id)
         if meeting.current_transcript_id is not None:
             return None
         allowed = {
@@ -295,10 +257,14 @@ class MeetingWorkflow:
         self,
         job: ProcessingJob,
     ) -> WorkflowFailure | None:
-        invalid = self._validate_job(job, ProcessingStage.EXTRACTION)
+        invalid = await asyncio.to_thread(
+            self._validate_job,
+            job,
+            ProcessingStage.EXTRACTION,
+        )
         if invalid is not None:
             return invalid
-        meeting = self.get_meeting(job.meeting_id)
+        meeting = await asyncio.to_thread(self.get_meeting, job.meeting_id)
         if meeting.current_review_id is not None:
             return None
         allowed = {
@@ -494,46 +460,33 @@ class MeetingWorkflow:
         *,
         job: ProcessingJob | None = None,
     ) -> Meeting:
-        meeting = self._start_stage(
+        meeting = await asyncio.to_thread(
+            self._start_stage,
             meeting,
             MeetingStatus.TRANSCRIBING,
             job=job,
         )
-        with self._unit_of_work() as uow:
-            asset = _required(uow.audio_assets.get(meeting.audio_asset_id), "Audio asset")
+        asset = await asyncio.to_thread(self._load_audio_asset, meeting.audio_asset_id)
         try:
             output = await self._transcriber.transcribe(
                 self._recording_store.path(asset.storage_key)
             )
             transcript = map_transcription(meeting, output, self._clock.now())
         except Exception as error:
-            self._fail_stage(
+            await asyncio.to_thread(
+                self._fail_stage,
                 meeting.id,
                 MeetingStatus.TRANSCRIPTION_FAILED,
                 _transcription_failure(error, self._clock.now()),
                 job=job,
             )
             raise
-        now = self._clock.now()
-        with self._unit_of_work() as uow:
-            self._require_active_job(uow, job, ProcessingStage.TRANSCRIPTION, now)
-            current = _required(uow.meetings.get(meeting.id), "Meeting")
-            completed = transition_meeting(
-                current,
-                MeetingStatus.TRANSCRIBED,
-                now,
-                transcript_id=transcript.id,
-            )
-            uow.transcripts.add(transcript)
-            uow.meetings.save(completed, current.version)
-            self._processing_scheduler.enqueue_in(
-                uow,
-                meeting.id,
-                ProcessingStage.EXTRACTION,
-                scheduled_at=now,
-            )
-            uow.commit()
-        return completed
+        return await asyncio.to_thread(
+            self._complete_transcription,
+            meeting.id,
+            transcript,
+            job,
+        )
 
     async def _extract(
         self,
@@ -541,15 +494,16 @@ class MeetingWorkflow:
         *,
         job: ProcessingJob | None = None,
     ) -> Meeting:
-        meeting = self._start_stage(
+        meeting = await asyncio.to_thread(
+            self._start_stage,
             meeting,
             MeetingStatus.EXTRACTING,
             job=job,
         )
-        with self._unit_of_work() as uow:
-            transcript = _required(uow.transcripts.latest_for_meeting(meeting.id), "Transcript")
-            latest_review = uow.reviews.latest_for_meeting(meeting.id)
-        revision_number = latest_review.revision_number + 1 if latest_review else 1
+        transcript, revision_number = await asyncio.to_thread(
+            self._load_extraction_inputs,
+            meeting.id,
+        )
         budget = AgentBudget(self._max_agent_requests, self._max_agent_output_tokens)
         try:
             extraction = await self._specialists.extract(
@@ -582,29 +536,85 @@ class MeetingWorkflow:
             )
             validate_review_evidence(package.review, transcript)
         except Exception as error:
-            self._fail_stage(
+            await asyncio.to_thread(
+                self._fail_stage,
                 meeting.id,
                 MeetingStatus.EXTRACTION_FAILED,
                 _extraction_failure(error, self._clock.now()),
                 job=job,
             )
             raise
+        return await asyncio.to_thread(
+            self._complete_extraction,
+            meeting.id,
+            package.review,
+            package.participants,
+            extraction.output.suggested_title,
+            job,
+        )
+
+    def _load_audio_asset(self, audio_asset_id: UUID) -> AudioAsset:
+        with self._unit_of_work() as uow:
+            return _required(uow.audio_assets.get(audio_asset_id), "Audio asset")
+
+    def _complete_transcription(
+        self,
+        meeting_id: UUID,
+        transcript: Transcript,
+        job: ProcessingJob | None,
+    ) -> Meeting:
+        now = self._clock.now()
+        with self._unit_of_work() as uow:
+            self._require_active_job(uow, job, ProcessingStage.TRANSCRIPTION, now)
+            current = _required(uow.meetings.get(meeting_id), "Meeting")
+            completed = transition_meeting(
+                current,
+                MeetingStatus.TRANSCRIBED,
+                now,
+                transcript_id=transcript.id,
+            )
+            uow.transcripts.add(transcript)
+            uow.meetings.save(completed, current.version)
+            self._processing_scheduler.enqueue_in(
+                uow,
+                meeting_id,
+                ProcessingStage.EXTRACTION,
+                scheduled_at=now,
+            )
+            uow.commit()
+        return completed
+
+    def _load_extraction_inputs(self, meeting_id: UUID) -> tuple[Transcript, int]:
+        with self._unit_of_work() as uow:
+            transcript = _required(uow.transcripts.latest_for_meeting(meeting_id), "Transcript")
+            latest_review = uow.reviews.latest_for_meeting(meeting_id)
+        revision_number = latest_review.revision_number + 1 if latest_review else 1
+        return transcript, revision_number
+
+    def _complete_extraction(
+        self,
+        meeting_id: UUID,
+        review: ReviewRevision,
+        participants: tuple[PersonRef, ...],
+        suggested_title: str,
+        job: ProcessingJob | None,
+    ) -> Meeting:
         now = self._clock.now()
         with self._unit_of_work() as uow:
             self._require_active_job(uow, job, ProcessingStage.EXTRACTION, now)
-            current = _required(uow.meetings.get(meeting.id), "Meeting")
+            current = _required(uow.meetings.get(meeting_id), "Meeting")
             updated_payload = current.model_dump(mode="python") | {
-                "participants": package.participants or current.participants,
-                "title": extraction.output.suggested_title[:200],
+                "participants": participants or current.participants,
+                "title": suggested_title[:200],
             }
             updated = Meeting.model_validate(updated_payload)
             completed = transition_meeting(
                 updated,
                 MeetingStatus.AWAITING_APPROVAL,
                 now,
-                review_id=package.review.id,
+                review_id=review.id,
             )
-            uow.reviews.add(package.review)
+            uow.reviews.add(review)
             uow.meetings.save(completed, current.version)
             uow.commit()
         return completed
@@ -744,7 +754,7 @@ def _request_id(error: Exception) -> str | None:
 
 
 def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowFailure:
-    if isinstance(error, OpenAITranscriptionConfigurationError):
+    if isinstance(error, ProviderConfigurationError):
         return _failure(
             error,
             FailureCode.PROVIDER_AUTH,
@@ -752,7 +762,7 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
             "The transcription provider is not configured",
             occurred_at,
         )
-    if isinstance(error, OpenAITranscriptionInputError):
+    if isinstance(error, ProviderInputError):
         return _failure(
             error,
             FailureCode.INVALID_INPUT,
@@ -760,7 +770,7 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
             "The recording was rejected by the transcription provider",
             occurred_at,
         )
-    if isinstance(error, OpenAITranscriptionTransientError):
+    if isinstance(error, ProviderTransientError):
         return _failure(
             error,
             FailureCode.PROVIDER_UNAVAILABLE,
@@ -778,7 +788,7 @@ def _transcription_failure(error: Exception, occurred_at: datetime) -> WorkflowF
 
 
 def _extraction_failure(error: Exception, occurred_at: datetime) -> WorkflowFailure:
-    if isinstance(error, OpenAIAgentConfigurationError):
+    if isinstance(error, ProviderConfigurationError):
         return _failure(
             error,
             FailureCode.PROVIDER_AUTH,
@@ -786,7 +796,15 @@ def _extraction_failure(error: Exception, occurred_at: datetime) -> WorkflowFail
             "The analysis provider is not configured",
             occurred_at,
         )
-    if isinstance(error, (OpenAIAgentTransientError, OpenAIAgentOutputError)):
+    if isinstance(error, ProviderTransientError):
+        return _failure(
+            error,
+            FailureCode.PROVIDER_UNAVAILABLE,
+            FailureDisposition.RETRYABLE,
+            "The analysis provider is temporarily unavailable",
+            occurred_at,
+        )
+    if isinstance(error, ProviderOutputError):
         return _failure(
             error,
             FailureCode.INVALID_MODEL_OUTPUT,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
 
@@ -25,6 +24,7 @@ from meeting_action_orchestrator.agents.contracts import (
 from meeting_action_orchestrator.agents.contracts import (
     EvidenceRef as AgentEvidenceRef,
 )
+from meeting_action_orchestrator.application.ports import TranscriptionOutputLike
 from meeting_action_orchestrator.domain.enums import (
     DeadlineResolution,
     IssueSeverity,
@@ -51,23 +51,6 @@ from meeting_action_orchestrator.domain.models import (
     Transcript,
     TranscriptSegment,
 )
-
-
-class TranscriptionSegmentLike(Protocol):
-    id: str
-    start_ms: int
-    end_ms: int | None
-    speaker: str | None
-    text: str
-
-
-class TranscriptionOutputLike(Protocol):
-    model: str
-    provider_request_id: str | None
-    language: str | None
-    text: str
-    duration_seconds: float | None
-    segments: tuple[TranscriptionSegmentLike, ...]
 
 
 @dataclass(frozen=True, slots=True)

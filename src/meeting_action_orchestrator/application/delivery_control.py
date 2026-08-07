@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -138,7 +139,8 @@ class DeliveryControlService:
         actor_id: str,
     ) -> DeliveryControlResult:
         _validate_operation_identity(request_key, actor_id)
-        before = self._select_and_bind(
+        before = await asyncio.to_thread(
+            self._select_and_bind,
             meeting_id,
             intent_ids,
             request_key,
@@ -153,8 +155,14 @@ class DeliveryControlService:
                 intent.status is WriteStatus.PERMANENT_FAILED
                 and intent.attempt_count < self._max_attempts
             ):
-                self._queue_retry(meeting_id, before.approval.id, intent.id)
-        return self._snapshot(
+                await asyncio.to_thread(
+                    self._queue_retry,
+                    meeting_id,
+                    before.approval.id,
+                    intent.id,
+                )
+        return await asyncio.to_thread(
+            self._snapshot,
             meeting_id,
             versions,
             before.meeting.version,
@@ -169,7 +177,8 @@ class DeliveryControlService:
         actor_id: str,
     ) -> DeliveryControlResult:
         _validate_operation_identity(request_key, actor_id)
-        before = self._select_and_bind(
+        before = await asyncio.to_thread(
+            self._select_and_bind,
             meeting_id,
             intent_ids,
             request_key,
@@ -180,7 +189,8 @@ class DeliveryControlService:
         for intent in before.selected:
             if intent.status is WriteStatus.UNKNOWN:
                 await self._reconciler.reconcile_intent(intent.id)
-        return self._snapshot(
+        return await asyncio.to_thread(
+            self._snapshot,
             meeting_id,
             versions,
             before.meeting.version,

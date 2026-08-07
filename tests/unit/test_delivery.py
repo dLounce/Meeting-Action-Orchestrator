@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
+from threading import get_ident
 from types import TracebackType
 from uuid import UUID
 
@@ -201,6 +202,7 @@ class FakeDatabase:
         self.receipts: dict[UUID, WriteReceipt] = {}
         self.transaction_depth = 0
         self.commits = 0
+        self.persistence_threads: set[int] = set()
 
     def unit_of_work(self) -> FakeUnitOfWork:
         return FakeUnitOfWork(self)
@@ -343,6 +345,7 @@ class FakeUnitOfWork:
         self.write_receipts = FakeReceiptRepository(database)
 
     def __enter__(self) -> FakeUnitOfWork:
+        self.database.persistence_threads.add(get_ident())
         self.database.transaction_depth += 1
         return self
 
@@ -403,6 +406,23 @@ class FakeGateway:
         return result
 
 
+class AdvancingGateway(FakeGateway):
+    def __init__(self, database: FakeDatabase, clock: MutableClock) -> None:
+        super().__init__(database)
+        self.clock = clock
+        self.provider_threads: list[int] = []
+        self.lease_expirations: list[datetime] = []
+
+    async def ensure_task(self, intent: WriteIntent) -> WriteReceipt:
+        assert intent.lease_expires_at is not None
+        self.calls.append("ensure_task")
+        self.seen_intents.append(intent)
+        self.provider_threads.append(get_ident())
+        self.lease_expirations.append(intent.lease_expires_at)
+        self.clock.current += timedelta(seconds=25)
+        return make_receipt(intent)
+
+
 def executor(
     database: FakeDatabase,
     gateway: FakeGateway,
@@ -434,6 +454,25 @@ async def test_claim_reloads_the_persisted_intent_and_writes_outside_the_transac
     assert delivered.status is WriteStatus.SUCCEEDED
     assert database.meetings[MEETING_ID].status is MeetingStatus.COMPLETED
     assert batch.results[0].status is WriteStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_delivery_claims_each_intent_with_a_fresh_lease() -> None:
+    pending = tuple(make_intent(value) for value in range(10, 16))
+    database = FakeDatabase(*pending)
+    clock = MutableClock()
+    gateway = AdvancingGateway(database, clock)
+    event_loop_thread = get_ident()
+
+    batch = await executor(database, gateway, clock=clock).run_once(limit=len(pending))
+
+    assert [result.status for result in batch.results] == [WriteStatus.SUCCEEDED] * len(pending)
+    assert gateway.lease_expirations == [
+        NOW + timedelta(seconds=120 + 25 * index) for index in range(len(pending))
+    ]
+    assert gateway.provider_threads == [event_loop_thread] * len(pending)
+    assert database.persistence_threads
+    assert event_loop_thread not in database.persistence_threads
 
 
 @pytest.mark.asyncio
@@ -637,16 +676,18 @@ async def test_filing_status_reduces_to_partial_when_only_some_writes_succeed() 
     assert meeting.failure.code is FailureCode.CONNECTOR_REJECTED
 
 
-def test_persisted_authorizer_requires_the_exact_active_approved_snapshot() -> None:
+@pytest.mark.asyncio
+async def test_persisted_authorizer_requires_the_exact_active_approved_snapshot() -> None:
     claimed = make_intent(status=WriteStatus.IN_FLIGHT, attempt_count=1)
     database = FakeDatabase(claimed)
     authorizer = PersistedApprovalAuthorizer(database.unit_of_work, MutableClock())
 
-    assert authorizer.permits(claimed) is True
-    assert authorizer.permits(claimed.model_copy(update={"version": 99})) is False
+    assert await authorizer.permits(claimed) is True
+    assert await authorizer.permits(claimed.model_copy(update={"version": 99})) is False
     database.meetings[MEETING_ID] = make_meeting(approved_review_id=uid(999))
-    assert authorizer.permits(claimed) is False
+    assert await authorizer.permits(claimed) is False
     assert database.transaction_depth == 0
+    assert get_ident() not in database.persistence_threads
 
 
 def test_full_jitter_scheduler_uses_exponential_ceiling_and_positive_delay() -> None:

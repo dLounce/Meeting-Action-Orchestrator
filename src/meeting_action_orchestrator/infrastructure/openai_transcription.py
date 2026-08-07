@@ -6,8 +6,15 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
+from meeting_action_orchestrator.application.errors import (
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderInputError,
+    ProviderTransientError,
+)
 
-class OpenAITranscriptionError(RuntimeError):
+
+class OpenAITranscriptionError(ProviderError):
     def __init__(self, error_type: str | None = None) -> None:
         message = "OpenAI transcription failed"
         if error_type is not None:
@@ -15,17 +22,20 @@ class OpenAITranscriptionError(RuntimeError):
         super().__init__(message)
 
 
-class OpenAITranscriptionConfigurationError(OpenAITranscriptionError):
+class OpenAITranscriptionConfigurationError(
+    OpenAITranscriptionError,
+    ProviderConfigurationError,
+):
     def __init__(self) -> None:
         super().__init__("configuration_error")
 
 
-class OpenAITranscriptionInputError(OpenAITranscriptionError):
+class OpenAITranscriptionInputError(OpenAITranscriptionError, ProviderInputError):
     def __init__(self) -> None:
         super().__init__("invalid_input")
 
 
-class OpenAITranscriptionTransientError(OpenAITranscriptionError):
+class OpenAITranscriptionTransientError(OpenAITranscriptionError, ProviderTransientError):
     def __init__(self) -> None:
         super().__init__("transient_error")
 
@@ -79,6 +89,16 @@ class OpenAITranscriber:
         self._max_retries = max_retries
         self._client = client
         self._openai: Any = None
+        self._owns_client = False
+
+    async def close(self) -> None:
+        if not self._owns_client:
+            return
+        client = self._client
+        self._client = None
+        self._owns_client = False
+        if client is not None:
+            await client.close()
 
     async def transcribe(
         self,
@@ -112,12 +132,14 @@ class OpenAITranscriber:
         if self._client is not None:
             return self._client
         try:
-            self._openai = import_module("openai")
+            if self._openai is None:
+                self._openai = import_module("openai")
             self._client = self._openai.AsyncOpenAI(
                 api_key=self._api_key,
                 timeout=self._timeout_seconds,
                 max_retries=self._max_retries,
             )
+            self._owns_client = True
         except (AttributeError, ImportError) as error:
             raise OpenAITranscriptionConfigurationError from error
         return self._client

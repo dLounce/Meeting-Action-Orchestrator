@@ -6,33 +6,15 @@ import os
 import subprocess
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, ClassVar, Protocol
 from uuid import uuid4
 
+from meeting_action_orchestrator.application.ports import AudioMetadata, StoredAudio
+
 
 class AudioValidationError(ValueError):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class AudioMetadata:
-    media_type: str
-    duration_ms: int
-    codec: str
-    sample_rate_hz: int
-    channels: int
-
-
-@dataclass(frozen=True, slots=True)
-class StoredAudio:
-    storage_key: str
-    original_name: str
-    path: Path
-    size_bytes: int
-    sha256: str
-    metadata: AudioMetadata
 
 
 class AudioInspector(Protocol):

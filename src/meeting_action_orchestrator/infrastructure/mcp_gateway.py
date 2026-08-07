@@ -20,6 +20,12 @@ from pydantic import (
     model_validator,
 )
 
+from meeting_action_orchestrator.application.errors import (
+    DeliveryGatewayError,
+    PermanentDeliveryError,
+    RetryableDeliveryError,
+    UnknownDeliveryOutcomeError,
+)
 from meeting_action_orchestrator.domain.enums import (
     FailureCode,
     FailureDisposition,
@@ -52,31 +58,19 @@ Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 _HTTP_URL_ADAPTER = TypeAdapter(AnyHttpUrl)
 
 
-class McpGatewayError(RuntimeError):
-    def __init__(
-        self,
-        code: FailureCode,
-        disposition: FailureDisposition,
-        safe_message: str,
-        provider_request_id: str | None = None,
-    ) -> None:
-        self.code = code
-        self.disposition = disposition
-        self.safe_message = safe_message
-        self.provider_request_id = provider_request_id
-        self.request_id = provider_request_id
-        super().__init__(safe_message)
-
-
-class RetryableMcpError(McpGatewayError):
+class McpGatewayError(DeliveryGatewayError):
     pass
 
 
-class PermanentMcpError(McpGatewayError):
+class RetryableMcpError(McpGatewayError, RetryableDeliveryError):
     pass
 
 
-class UnknownMcpOutcomeError(McpGatewayError):
+class PermanentMcpError(McpGatewayError, PermanentDeliveryError):
+    pass
+
+
+class UnknownMcpOutcomeError(McpGatewayError, UnknownDeliveryOutcomeError):
     pass
 
 
@@ -95,7 +89,7 @@ class McpToolNames(BaseModel):
 
 
 class ApprovedIntentAuthorizer(Protocol):
-    def permits(self, intent: WriteIntent) -> bool: ...
+    async def permits(self, intent: WriteIntent) -> bool: ...
 
 
 class McpToolClient(Protocol):
@@ -202,7 +196,7 @@ class McpGateway:
         return self._allowed_tools
 
     async def ensure_task(self, intent: WriteIntent) -> WriteReceipt:
-        approved = self._approved_intent(intent, WriteKind.TASK)
+        approved = await self._approved_intent(intent, WriteKind.TASK)
         proposal = cast(TaskProposal, approved.proposal)
         arguments = {
             "schema_version": 1,
@@ -225,7 +219,7 @@ class McpGateway:
         return self._receipt(approved, result, reconciled=False)
 
     async def ensure_event(self, intent: WriteIntent) -> WriteReceipt:
-        approved = self._approved_intent(intent, WriteKind.CALENDAR_EVENT)
+        approved = await self._approved_intent(intent, WriteKind.CALENDAR_EVENT)
         proposal = cast(CalendarEventProposal, approved.proposal)
         arguments = {
             "schema_version": 1,
@@ -252,7 +246,7 @@ class McpGateway:
     async def find_event(self, idempotency_key: str) -> WriteReceipt | None:
         return await self._find(WriteKind.CALENDAR_EVENT, idempotency_key)
 
-    def _approved_intent(self, intent: WriteIntent, kind: WriteKind) -> WriteIntent:
+    async def _approved_intent(self, intent: WriteIntent, kind: WriteKind) -> WriteIntent:
         if not isinstance(intent, WriteIntent):
             raise _permanent(FailureCode.INVALID_INPUT, _SAFE_INTENT_MESSAGE)
         try:
@@ -264,7 +258,7 @@ class McpGateway:
         if canonical_sha256(validated.proposal) != validated.payload_digest:
             raise _permanent(FailureCode.INVALID_INPUT, _SAFE_INTENT_MESSAGE)
         try:
-            permitted = self._authorizer.permits(validated)
+            permitted = await self._authorizer.permits(validated)
         except Exception:
             raise _permanent(FailureCode.INTERNAL, _SAFE_INTENT_MESSAGE) from None
         if permitted is not True:

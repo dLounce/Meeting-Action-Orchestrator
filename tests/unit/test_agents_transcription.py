@@ -1,12 +1,19 @@
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from meeting_action_orchestrator.application.errors import (
+    ProviderConfigurationError,
+    ProviderInputError,
+    ProviderTransientError,
+)
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriber,
     OpenAITranscriptionConfigurationError,
     OpenAITranscriptionInputError,
+    OpenAITranscriptionTransientError,
 )
 
 
@@ -29,6 +36,10 @@ class FakeClient:
     def __init__(self, response: object) -> None:
         self.transcriptions = FakeTranscriptions(response)
         self.audio = FakeAudio(self.transcriptions)
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 class FakeResponse:
@@ -48,6 +59,47 @@ def test_transcriber_rejects_hidden_sdk_retries() -> None:
             model="gpt-4o-transcribe",
             max_retries=1,
         )
+
+
+def test_transcription_errors_implement_provider_failure_contracts() -> None:
+    assert isinstance(OpenAITranscriptionConfigurationError(), ProviderConfigurationError)
+    assert isinstance(OpenAITranscriptionInputError(), ProviderInputError)
+    assert isinstance(OpenAITranscriptionTransientError(), ProviderTransientError)
+
+
+@pytest.mark.asyncio
+async def test_transcriber_closes_and_recreates_its_owned_client() -> None:
+    first = FakeClient({})
+    second = FakeClient({})
+    clients = iter((first, second))
+
+    def create_client(**_arguments: object) -> FakeClient:
+        return next(clients)
+
+    transcriber = OpenAITranscriber(api_key="test", model="gpt-4o-transcribe")
+    transcriber._openai = SimpleNamespace(AsyncOpenAI=create_client)
+
+    assert transcriber._get_client() is first
+    await transcriber.close()
+    await transcriber.close()
+
+    assert first.close_calls == 1
+    assert transcriber._get_client() is second
+
+
+@pytest.mark.asyncio
+async def test_transcriber_does_not_close_an_injected_client() -> None:
+    client = FakeClient({})
+    transcriber = OpenAITranscriber(
+        api_key="",
+        model="gpt-4o-transcribe",
+        client=client,
+    )
+
+    await transcriber.close()
+
+    assert client.close_calls == 0
+    assert transcriber._get_client() is client
 
 
 @pytest.mark.asyncio

@@ -12,9 +12,15 @@ from meeting_action_orchestrator.agents.contracts import (
     OutputT,
     StrictModel,
 )
+from meeting_action_orchestrator.application.errors import (
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderOutputError,
+    ProviderTransientError,
+)
 
 
-class OpenAIAgentError(RuntimeError):
+class OpenAIAgentError(ProviderError):
     def __init__(self, error_type: str | None = None) -> None:
         message = "OpenAI agent request failed"
         if error_type is not None:
@@ -22,17 +28,17 @@ class OpenAIAgentError(RuntimeError):
         super().__init__(message)
 
 
-class OpenAIAgentConfigurationError(OpenAIAgentError):
+class OpenAIAgentConfigurationError(OpenAIAgentError, ProviderConfigurationError):
     def __init__(self) -> None:
         super().__init__("configuration_error")
 
 
-class OpenAIAgentTransientError(OpenAIAgentError):
+class OpenAIAgentTransientError(OpenAIAgentError, ProviderTransientError):
     def __init__(self) -> None:
         super().__init__("transient_error")
 
 
-class OpenAIAgentOutputError(OpenAIAgentError):
+class OpenAIAgentOutputError(OpenAIAgentError, ProviderOutputError):
     def __init__(self) -> None:
         super().__init__("invalid_output")
 
@@ -68,6 +74,12 @@ class OpenAIAgentsRunner:
         self._exceptions: Any = None
         self._reasoning_type: type[Any] | None = None
         self._client: Any = None
+
+    async def close(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.close()
 
     async def run(
         self,

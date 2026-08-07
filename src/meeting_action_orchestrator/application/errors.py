@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from meeting_action_orchestrator.domain.enums import FailureCode, FailureDisposition
+
 
 class ApplicationError(RuntimeError):
     pass
@@ -38,4 +40,52 @@ class TransientWriteError(ApplicationError):
 
 
 class PermanentWriteError(ApplicationError):
+    pass
+
+
+class ProviderError(RuntimeError):
+    pass
+
+
+class ProviderConfigurationError(ProviderError):
+    pass
+
+
+class ProviderInputError(ProviderError):
+    pass
+
+
+class ProviderTransientError(ProviderError):
+    pass
+
+
+class ProviderOutputError(ProviderError):
+    pass
+
+
+class DeliveryGatewayError(RuntimeError):
+    def __init__(
+        self,
+        code: FailureCode,
+        disposition: FailureDisposition,
+        safe_message: str,
+        provider_request_id: str | None = None,
+    ) -> None:
+        self.code = code
+        self.disposition = disposition
+        self.safe_message = safe_message
+        self.provider_request_id = provider_request_id
+        self.request_id = provider_request_id
+        super().__init__(safe_message)
+
+
+class RetryableDeliveryError(DeliveryGatewayError):
+    pass
+
+
+class PermanentDeliveryError(DeliveryGatewayError):
+    pass
+
+
+class UnknownDeliveryOutcomeError(DeliveryGatewayError):
     pass

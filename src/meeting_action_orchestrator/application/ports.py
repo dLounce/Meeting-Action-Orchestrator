@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from types import TracebackType
-from typing import Protocol
+from typing import BinaryIO, Protocol
 from uuid import UUID
 
+from meeting_action_orchestrator.agents.contracts import (
+    AgentResult,
+    AgentRunContext,
+    ExtractionRequest,
+    MeetingExtraction,
+    RecapDraft,
+    RecapRequest,
+    VerificationReport,
+    VerificationRequest,
+)
 from meeting_action_orchestrator.domain.enums import (
     ProcessingJobStatus,
     ProcessingStage,
@@ -25,36 +37,76 @@ from meeting_action_orchestrator.domain.models import (
 )
 
 
-class AudioStore(Protocol):
-    def put(self, key: str, content: bytes) -> None: ...
-
-    def read(self, key: str) -> bytes: ...
-
-    def delete(self, key: str) -> None: ...
-
-
-class Transcriber(Protocol):
-    async def transcribe(self, meeting: Meeting, asset: AudioAsset) -> Transcript: ...
+@dataclass(frozen=True, slots=True)
+class AudioMetadata:
+    media_type: str
+    duration_ms: int
+    codec: str
+    sample_rate_hz: int
+    channels: int
 
 
-class Extractor(Protocol):
-    async def extract(self, meeting: Meeting, transcript: Transcript) -> ReviewRevision: ...
+@dataclass(frozen=True, slots=True)
+class StoredAudio:
+    storage_key: str
+    original_name: str
+    path: Path
+    size_bytes: int
+    sha256: str
+    metadata: AudioMetadata
 
 
-class RecapWriter(Protocol):
-    async def write(self, meeting: Meeting, review: ReviewRevision) -> str: ...
+class TranscriptionSegmentLike(Protocol):
+    id: str
+    start_ms: int
+    end_ms: int | None
+    speaker: str | None
+    text: str
 
 
-class TaskGateway(Protocol):
-    async def ensure_task(self, intent: WriteIntent) -> WriteReceipt: ...
+class TranscriptionOutputLike(Protocol):
+    model: str
+    provider_request_id: str | None
+    language: str | None
+    text: str
+    duration_seconds: float | None
+    segments: tuple[TranscriptionSegmentLike, ...]
 
-    async def find_task(self, idempotency_key: str) -> WriteReceipt | None: ...
+
+class RecordingStore(Protocol):
+    def put(self, stream: BinaryIO, original_name: str) -> StoredAudio: ...
+
+    def path(self, storage_key: str) -> Path: ...
+
+    def delete(self, storage_key: str) -> None: ...
 
 
-class CalendarGateway(Protocol):
-    async def ensure_event(self, intent: WriteIntent) -> WriteReceipt: ...
+class TranscriptionProvider(Protocol):
+    async def transcribe(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+    ) -> TranscriptionOutputLike: ...
 
-    async def find_event(self, idempotency_key: str) -> WriteReceipt | None: ...
+
+class SpecialistProvider(Protocol):
+    async def extract(
+        self,
+        request: ExtractionRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[MeetingExtraction]: ...
+
+    async def write_recap(
+        self,
+        request: RecapRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[RecapDraft]: ...
+
+    async def verify(
+        self,
+        request: VerificationRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[VerificationReport]: ...
 
 
 class MeetingRepository(Protocol):

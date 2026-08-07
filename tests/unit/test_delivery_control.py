@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
+from threading import get_ident
 from types import TracebackType
 from uuid import UUID
 
@@ -168,6 +169,7 @@ class Database:
         self.bindings: dict[str, DeliveryOperationBinding] = {}
         self.depth = 0
         self.commits = 0
+        self.persistence_threads: set[int] = set()
 
     def unit_of_work(self) -> UnitOfWork:
         return UnitOfWork(self)
@@ -247,6 +249,7 @@ class UnitOfWork:
         self.delivery_operations = DeliveryOperationRepository(database)
 
     def __enter__(self) -> UnitOfWork:
+        self.database.persistence_threads.add(get_ident())
         self.database.depth += 1
         return self
 
@@ -338,6 +341,8 @@ async def test_retry_queues_a_selected_permanent_failure_and_is_state_idempotent
     assert second.replayed is True
     assert scheduler.attempts == [2]
     assert not reconciler.calls
+    assert database.persistence_threads
+    assert get_ident() not in database.persistence_threads
 
 
 @pytest.mark.asyncio

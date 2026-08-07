@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import get_ident
 from uuid import UUID
 
 from meeting_action_orchestrator.application.processing import (
@@ -30,6 +31,8 @@ NOW = datetime(2026, 8, 7, 9, 0, tzinfo=timezone.utc)
 ASSET_ID = UUID("0bb1da7c-589a-4e06-a69c-73c10cbec648")
 MEETING_ID = UUID("1040ddb5-cf1d-4e17-9a7f-b988457ef460")
 JOB_ID = UUID("7be498ba-698d-492a-9f45-2483a7966af7")
+SECOND_MEETING_ID = UUID("45ad5a89-ce5f-48f0-b943-554b96a980b4")
+SECOND_JOB_ID = UUID("d91c9f62-3314-4144-ac77-986388a65ab2")
 
 
 @dataclass
@@ -207,6 +210,69 @@ async def test_worker_releases_claim_transaction_before_handler(tmp_path: Path) 
     assert second[0].outcome is ProcessingOutcome.SUCCEEDED
     assert second[0].job is not None
     assert second[0].job.attempt_count == 2
+
+
+async def test_worker_claims_each_job_with_a_fresh_lease(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = FrozenClock()
+    with SqliteUnitOfWork(database) as uow:
+        uow.meetings.add(
+            Meeting(
+                id=SECOND_MEETING_ID,
+                ingest_key="processing-test-two",
+                title="Second processing test",
+                audio_asset_id=ASSET_ID,
+                occurred_at=NOW,
+                timezone="UTC",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        uow.commit()
+    create_scheduler(database, clock).enqueue(MEETING_ID, ProcessingStage.TRANSCRIPTION)
+    ProcessingScheduler(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        clock=clock,
+        id_factory=lambda: SECOND_JOB_ID,
+    ).enqueue(SECOND_MEETING_ID, ProcessingStage.TRANSCRIPTION)
+    lease_expirations: list[datetime] = []
+    provider_threads: list[int] = []
+    persistence_threads: set[int] = set()
+    event_loop_thread = get_ident()
+
+    async def handler(job: ProcessingJob) -> WorkflowFailure | None:
+        assert job.lease_expires_at is not None
+        lease_expirations.append(job.lease_expires_at)
+        provider_threads.append(get_ident())
+        clock.current += timedelta(seconds=9)
+        return None
+
+    def unit_of_work() -> SqliteUnitOfWork:
+        persistence_threads.add(get_ident())
+        return SqliteUnitOfWork(database)
+
+    worker = ProcessingWorker(
+        unit_of_work=unit_of_work,
+        handlers={ProcessingStage.TRANSCRIPTION: handler},
+        clock=clock,
+        retry_scheduler=FixedRetryScheduler(),
+        worker_id="worker-a",
+        lease_duration=timedelta(seconds=10),
+    )
+
+    results = await worker.run_once(ProcessingStage.TRANSCRIPTION, limit=2)
+
+    assert [result.outcome for result in results] == [
+        ProcessingOutcome.SUCCEEDED,
+        ProcessingOutcome.SUCCEEDED,
+    ]
+    assert lease_expirations == [
+        NOW + timedelta(seconds=10),
+        NOW + timedelta(seconds=19),
+    ]
+    assert provider_threads == [event_loop_thread, event_loop_thread]
+    assert persistence_threads
+    assert event_loop_thread not in persistence_threads
 
 
 async def test_worker_does_not_retry_permanent_failure(tmp_path: Path) -> None:

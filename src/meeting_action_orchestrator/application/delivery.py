@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -8,6 +9,12 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID
 
+from meeting_action_orchestrator.application.errors import (
+    DeliveryGatewayError,
+    PermanentDeliveryError,
+    RetryableDeliveryError,
+    UnknownDeliveryOutcomeError,
+)
 from meeting_action_orchestrator.application.state_machine import (
     derive_filing_status,
     transition_meeting,
@@ -33,12 +40,6 @@ from meeting_action_orchestrator.domain.models import (
     WriteReceipt,
 )
 from meeting_action_orchestrator.domain.services import validate_write_receipt
-from meeting_action_orchestrator.infrastructure.mcp_gateway import (
-    McpGatewayError,
-    PermanentMcpError,
-    RetryableMcpError,
-    UnknownMcpOutcomeError,
-)
 
 _RETRYABLE_MESSAGE = "The connector is temporarily unavailable"
 _PERMANENT_MESSAGE = "The connector rejected the approved action"
@@ -183,7 +184,10 @@ class PersistedApprovalAuthorizer:
         self._unit_of_work = unit_of_work
         self._clock = clock
 
-    def permits(self, intent: WriteIntent) -> bool:
+    async def permits(self, intent: WriteIntent) -> bool:
+        return await asyncio.to_thread(self._permits, intent)
+
+    def _permits(self, intent: WriteIntent) -> bool:
         try:
             now = self._clock.now()
             with self._unit_of_work() as uow:
@@ -224,19 +228,30 @@ class ApprovedOutboxExecutor:
     async def run_once(self, limit: int = 20) -> DeliveryBatch:
         if limit <= 0:
             return DeliveryBatch(recovered=(), results=())
-        recovered = self._recover_expired(limit)
-        unknown_ids = self._unknown_ids(limit)
+        recovered = await asyncio.to_thread(self._recover_expired, limit)
+        unknown_ids = await asyncio.to_thread(self._unknown_ids, limit)
         reconciliation_ids = tuple(dict.fromkeys((*recovered, *unknown_ids)))[:limit]
         results = [await self.reconcile_intent(intent_id) for intent_id in reconciliation_ids]
         remaining = limit - len(reconciliation_ids)
-        claimed = self._claim_due(remaining) if remaining > 0 else ()
-        results.extend([await self.deliver_intent(intent_id) for intent_id in claimed])
+        for _ in range(remaining):
+            claimed = await asyncio.to_thread(self._claim_due, 1)
+            if not claimed:
+                break
+            results.append(await self.deliver_intent(claimed[0]))
         return DeliveryBatch(recovered=recovered, results=tuple(results))
 
     async def deliver_intent(self, intent_id: UUID) -> DeliveryResult:
-        snapshot, receipt, executable = self._load_execution_snapshot(intent_id)
+        snapshot, receipt, executable = await asyncio.to_thread(
+            self._load_execution_snapshot,
+            intent_id,
+        )
         if receipt is not None:
-            return self._record_success(snapshot, receipt, replayed=True)
+            return await asyncio.to_thread(
+                self._record_success,
+                snapshot,
+                receipt,
+                replayed=True,
+            )
         if not executable:
             return DeliveryResult(snapshot.id, snapshot.status)
         try:
@@ -245,32 +260,42 @@ class ApprovedOutboxExecutor:
             else:
                 created = await self._gateway.ensure_event(snapshot)
             validate_write_receipt(snapshot, created)
-        except RetryableMcpError as error:
-            return self._record_gateway_failure(snapshot, error)
-        except PermanentMcpError as error:
-            return self._record_gateway_failure(snapshot, error)
-        except UnknownMcpOutcomeError as error:
-            return self._record_gateway_failure(snapshot, error)
+        except RetryableDeliveryError as error:
+            return await asyncio.to_thread(self._record_gateway_failure, snapshot, error)
+        except PermanentDeliveryError as error:
+            return await asyncio.to_thread(self._record_gateway_failure, snapshot, error)
+        except UnknownDeliveryOutcomeError as error:
+            return await asyncio.to_thread(self._record_gateway_failure, snapshot, error)
         except (DomainInvariantError, IdempotencyConflictError):
-            return self._record_failure(
+            return await asyncio.to_thread(
+                self._record_failure,
                 snapshot,
                 FailureCode.IDEMPOTENCY_CONFLICT,
                 FailureDisposition.PERMANENT,
                 _INVALID_RECEIPT_MESSAGE,
             )
         except Exception:
-            return self._record_failure(
+            return await asyncio.to_thread(
+                self._record_failure,
                 snapshot,
                 FailureCode.UNKNOWN_REMOTE_OUTCOME,
                 FailureDisposition.UNKNOWN_OUTCOME,
                 _UNKNOWN_MESSAGE,
             )
-        return self._record_success(snapshot, created)
+        return await asyncio.to_thread(self._record_success, snapshot, created)
 
     async def reconcile_intent(self, intent_id: UUID) -> DeliveryResult:
-        snapshot, receipt = self._load_reconciliation_snapshot(intent_id)
+        snapshot, receipt = await asyncio.to_thread(
+            self._load_reconciliation_snapshot,
+            intent_id,
+        )
         if receipt is not None:
-            return self._record_success(snapshot, receipt, replayed=True)
+            return await asyncio.to_thread(
+                self._record_success,
+                snapshot,
+                receipt,
+                replayed=True,
+            )
         if snapshot.status is not WriteStatus.UNKNOWN:
             return DeliveryResult(snapshot.id, snapshot.status)
         try:
@@ -279,22 +304,23 @@ class ApprovedOutboxExecutor:
             else:
                 found = await self._gateway.find_event(snapshot.idempotency_key)
             if found is None:
-                return self._record_confirmed_absence(snapshot)
+                return await asyncio.to_thread(self._record_confirmed_absence, snapshot)
             validate_write_receipt(snapshot, found)
-        except PermanentMcpError as error:
-            return self._record_gateway_failure(snapshot, error)
-        except (RetryableMcpError, UnknownMcpOutcomeError):
-            return self._refresh_unknown(snapshot)
+        except PermanentDeliveryError as error:
+            return await asyncio.to_thread(self._record_gateway_failure, snapshot, error)
+        except (RetryableDeliveryError, UnknownDeliveryOutcomeError):
+            return await asyncio.to_thread(self._refresh_unknown, snapshot)
         except (DomainInvariantError, IdempotencyConflictError):
-            return self._record_failure(
+            return await asyncio.to_thread(
+                self._record_failure,
                 snapshot,
                 FailureCode.IDEMPOTENCY_CONFLICT,
                 FailureDisposition.PERMANENT,
                 _INVALID_RECEIPT_MESSAGE,
             )
         except Exception:
-            return self._refresh_unknown(snapshot)
-        return self._record_success(snapshot, found)
+            return await asyncio.to_thread(self._refresh_unknown, snapshot)
+        return await asyncio.to_thread(self._record_success, snapshot, found)
 
     def _recover_expired(self, limit: int) -> tuple[UUID, ...]:
         now = self._now()
@@ -356,7 +382,7 @@ class ApprovedOutboxExecutor:
     def _record_gateway_failure(
         self,
         snapshot: WriteIntent,
-        error: McpGatewayError,
+        error: DeliveryGatewayError,
     ) -> DeliveryResult:
         message = {
             FailureDisposition.RETRYABLE: _RETRYABLE_MESSAGE,

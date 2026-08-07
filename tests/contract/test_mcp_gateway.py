@@ -77,7 +77,7 @@ class ApprovedRegistry:
     def __init__(self, *intents: WriteIntent) -> None:
         self.intents = {intent.id: intent for intent in intents}
 
-    def permits(self, intent: WriteIntent) -> bool:
+    async def permits(self, intent: WriteIntent) -> bool:
         return self.intents.get(intent.id) == intent
 
 
