@@ -18,7 +18,7 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 4
+    assert version == 5
     assert {
         "approvals",
         "audio_assets",
@@ -39,8 +39,8 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 4
-    assert database.migrate() == 4
+    assert database.migrate() == 5
+    assert database.migrate() == 5
     assert database.healthcheck()
 
 
@@ -48,10 +48,28 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
     path = tmp_path / "application.sqlite3"
     with sqlite3.connect(path) as connection:
         connection.executescript(SCHEMA_V1)
+        connection.execute(
+            """
+            INSERT INTO audio_assets (
+                id, storage_key, original_name, media_type, size_bytes,
+                duration_ms, sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "20000000-0000-4000-8000-000000000001",
+                "legacy.wav",
+                "customer-private-name.wav",
+                "audio/wav",
+                128,
+                1000,
+                "a" * 64,
+                "2026-08-07 09:00:00+00:00",
+            ),
+        )
         connection.execute("PRAGMA user_version = 1")
     database = Database(path)
 
-    assert database.migrate() == 4
+    assert database.migrate() == 5
     with database.connect() as connection:
         tables = connection.execute(
             """
@@ -61,10 +79,15 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
             )
             """
         ).fetchall()
+        original_name = connection.execute(
+            "SELECT original_name FROM audio_assets WHERE id = ?",
+            ("20000000-0000-4000-8000-000000000001",),
+        ).fetchone()["original_name"]
     assert {row["name"] for row in tables} == {
         "delivery_operation_bindings",
         "meeting_operation_bindings",
     }
+    assert original_name == "recording.wav"
 
 
 def test_migrate_adds_meeting_keyset_indexes(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import subprocess
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -40,6 +41,8 @@ def test_store_hashes_and_uses_safe_generated_name(tmp_path: Path) -> None:
 
     assert stored.original_name == "meeting.wav"
     assert stored.storage_key.endswith(".wav")
+    assert UUID(Path(stored.storage_key).stem).version == 4
+    assert not stored.storage_key.startswith(stored.sha256)
     assert stored.path.read_bytes() == b"RIFF\x00\x00\x00\x00WAVEdata"
     assert len(stored.sha256) == 64
 
@@ -53,15 +56,16 @@ def test_store_rejects_oversized_content_without_leaving_partial_file(tmp_path: 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_store_deduplicates_identical_content(tmp_path: Path) -> None:
+def test_store_stages_identical_content_under_unique_keys(tmp_path: Path) -> None:
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
     content = b"RIFF\x00\x00\x00\x00WAVEdata"
 
     first = store.put(io.BytesIO(content), "first.wav")
     second = store.put(io.BytesIO(content), "second.wav")
 
-    assert first.storage_key == second.storage_key
-    assert len(list(tmp_path.iterdir())) == 1
+    assert first.storage_key != second.storage_key
+    assert first.sha256 == second.sha256
+    assert len(list(tmp_path.iterdir())) == 2
 
 
 def test_ffprobe_inspector_rejects_multiple_audio_streams(tmp_path: Path) -> None:

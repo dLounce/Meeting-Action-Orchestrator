@@ -87,6 +87,14 @@ from meeting_action_orchestrator.domain.services import (
     validate_review_evidence,
 )
 
+_NEUTRAL_AUDIO_NAMES = {
+    AudioMediaType.MP3: "recording.mp3",
+    AudioMediaType.MP4: "recording.m4a",
+    AudioMediaType.M4A: "recording.m4a",
+    AudioMediaType.WAV: "recording.wav",
+    AudioMediaType.X_WAV: "recording.wav",
+}
+
 
 class Clock(Protocol):
     def now(self) -> datetime: ...
@@ -152,57 +160,91 @@ class MeetingWorkflow:
         if command.occurred_at.tzinfo is None or command.occurred_at.utcoffset() is None:
             raise ValueError("Meeting time must include a UTC offset")
         stored = self._recording_store.put(stream, command.original_name)
+        committed_storage_key: str | None = None
+        staged_commit_attempted = False
         try:
             now = self._clock.now()
             with self._unit_of_work() as uow:
                 existing = uow.meetings.find_by_ingest_key(command.ingest_key)
                 if existing is not None:
                     asset = _required(uow.audio_assets.get(existing.audio_asset_id), "Audio asset")
+                    committed_storage_key = asset.storage_key
                     if asset.sha256 != stored.sha256:
                         raise IdempotencyConflictError(command.ingest_key)
-                    return existing
-                asset = uow.audio_assets.find_by_sha256(stored.sha256)
-                if asset is None:
-                    asset = AudioAsset(
+                    meeting = existing
+                else:
+                    asset = uow.audio_assets.find_by_sha256(stored.sha256)
+                    if asset is None:
+                        media_type = AudioMediaType(stored.metadata.media_type)
+                        asset = AudioAsset(
+                            id=uuid4(),
+                            storage_key=stored.storage_key,
+                            original_name=_NEUTRAL_AUDIO_NAMES[media_type],
+                            detected_media_type=media_type,
+                            size_bytes=stored.size_bytes,
+                            duration_ms=stored.metadata.duration_ms,
+                            sha256=stored.sha256,
+                            created_at=now,
+                        )
+                        uow.audio_assets.add(asset)
+                    else:
+                        committed_storage_key = asset.storage_key
+                    meeting = Meeting(
                         id=uuid4(),
-                        storage_key=stored.storage_key,
-                        original_name=stored.original_name,
-                        detected_media_type=AudioMediaType(stored.metadata.media_type),
-                        size_bytes=stored.size_bytes,
-                        duration_ms=stored.metadata.duration_ms,
-                        sha256=stored.sha256,
+                        ingest_key=command.ingest_key,
+                        title=command.title,
+                        audio_asset_id=asset.id,
+                        occurred_at=command.occurred_at,
+                        timezone=command.timezone,
+                        participants=command.participants,
                         created_at=now,
+                        updated_at=now,
                     )
-                    uow.audio_assets.add(asset)
-                meeting = Meeting(
-                    id=uuid4(),
-                    ingest_key=command.ingest_key,
-                    title=command.title,
-                    audio_asset_id=asset.id,
-                    occurred_at=command.occurred_at,
-                    timezone=command.timezone,
-                    participants=command.participants,
-                    created_at=now,
-                    updated_at=now,
-                )
-                uow.meetings.add(meeting)
-                self._processing_scheduler.enqueue_in(
-                    uow,
-                    meeting.id,
-                    ProcessingStage.TRANSCRIPTION,
-                    scheduled_at=now,
-                )
-                uow.commit()
+                    uow.meetings.add(meeting)
+                    self._processing_scheduler.enqueue_in(
+                        uow,
+                        meeting.id,
+                        ProcessingStage.TRANSCRIPTION,
+                        scheduled_at=now,
+                    )
+                    staged_commit_attempted = asset.storage_key == stored.storage_key
+                    uow.commit()
+                    committed_storage_key = asset.storage_key
         except BaseException:
-            self._discard_unreferenced_recording(stored)
+            self._discard_failed_recording(
+                stored,
+                committed_storage_key,
+                staged_commit_attempted,
+            )
             raise
+        self._discard_staged_recording(stored, committed_storage_key)
         return meeting
 
-    def _discard_unreferenced_recording(self, stored: StoredAudio) -> None:
+    def _discard_staged_recording(
+        self,
+        stored: StoredAudio,
+        committed_storage_key: str | None,
+    ) -> None:
+        if stored.storage_key == committed_storage_key:
+            return
+        with suppress(Exception):
+            self._recording_store.delete(stored.storage_key)
+
+    def _discard_failed_recording(
+        self,
+        stored: StoredAudio,
+        committed_storage_key: str | None,
+        staged_commit_attempted: bool,
+    ) -> None:
+        if stored.storage_key == committed_storage_key:
+            return
+        if not staged_commit_attempted:
+            self._discard_staged_recording(stored, committed_storage_key)
+            return
         with suppress(Exception):
             with self._unit_of_work() as uow:
                 referenced = uow.audio_assets.find_by_sha256(stored.sha256)
-            if referenced is None:
+            if referenced is None or referenced.storage_key != stored.storage_key:
                 self._recording_store.delete(stored.storage_key)
 
     async def process(self, meeting_id: UUID) -> Meeting:
@@ -564,8 +606,6 @@ class MeetingWorkflow:
             self._complete_extraction,
             meeting.id,
             package.review,
-            package.participants,
-            extraction.output.suggested_title,
             job,
         )
 
@@ -611,21 +651,14 @@ class MeetingWorkflow:
         self,
         meeting_id: UUID,
         review: ReviewRevision,
-        participants: tuple[PersonRef, ...],
-        suggested_title: str,
         job: ProcessingJob | None,
     ) -> Meeting:
         now = self._clock.now()
         with self._unit_of_work() as uow:
             self._require_active_job(uow, job, ProcessingStage.EXTRACTION, now)
             current = _required(uow.meetings.get(meeting_id), "Meeting")
-            updated_payload = current.model_dump(mode="python") | {
-                "participants": participants or current.participants,
-                "title": suggested_title[:200],
-            }
-            updated = Meeting.model_validate(updated_payload)
             completed = transition_meeting(
-                updated,
+                current,
                 MeetingStatus.AWAITING_APPROVAL,
                 now,
                 review_id=review.id,

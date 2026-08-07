@@ -207,7 +207,23 @@ CREATE INDEX idx_meeting_operation_bindings_meeting
 ON meeting_operation_bindings (meeting_id, created_at);
 """
 
-MIGRATIONS = ((1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3), (4, SCHEMA_V4))
+SCHEMA_V5 = """
+UPDATE audio_assets
+SET original_name = CASE media_type
+    WHEN 'audio/mpeg' THEN 'recording.mp3'
+    WHEN 'audio/mp4' THEN 'recording.m4a'
+    WHEN 'audio/x-m4a' THEN 'recording.m4a'
+    ELSE 'recording.wav'
+END;
+"""
+
+MIGRATIONS = (
+    (1, SCHEMA_V1),
+    (2, SCHEMA_V2),
+    (3, SCHEMA_V3),
+    (4, SCHEMA_V4),
+    (5, SCHEMA_V5),
+)
 
 
 class Database:

@@ -102,7 +102,8 @@ class LocalAudioStore:
         safe_name = Path(original_name.replace("\\", "/")).name
         if not safe_name:
             raise AudioValidationError("A filename is required")
-        temporary_path = self._root / f".{uuid4().hex}.part"
+        storage_id = uuid4().hex
+        temporary_path = self._root / f".{storage_id}.part"
         digest = hashlib.sha256()
         size_bytes = 0
         header = b""
@@ -128,12 +129,9 @@ class LocalAudioStore:
             media_type = detect_audio_type(header)
             suffix = self._suffixes[media_type]
             file_digest = digest.hexdigest()
-            final_path = self._root / f"{file_digest}{suffix}"
+            final_path = self._root / f"{storage_id}{suffix}"
             metadata = self._inspector.inspect(temporary_path, media_type)
-            if final_path.exists():
-                temporary_path.unlink()
-            else:
-                temporary_path.replace(final_path)
+            temporary_path.replace(final_path)
             return StoredAudio(
                 storage_key=final_path.name,
                 original_name=safe_name,
