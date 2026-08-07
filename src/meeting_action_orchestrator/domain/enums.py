@@ -86,6 +86,7 @@ class FailureCode(str, Enum):
     PROVIDER_TIMEOUT = "provider_timeout"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     INVALID_MODEL_OUTPUT = "invalid_model_output"
+    PROVIDER_AUTH = "provider_auth"
     CONNECTOR_AUTH = "connector_auth"
     CONNECTOR_TARGET_MISSING = "connector_target_missing"
     CONNECTOR_REJECTED = "connector_rejected"

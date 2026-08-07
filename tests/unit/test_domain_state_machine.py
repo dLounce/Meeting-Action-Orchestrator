@@ -213,7 +213,7 @@ def test_unknown_write_requires_reconciliation_before_retry() -> None:
             MeetingStatus.PARTIALLY_FILED,
         ),
         ((WriteStatus.PERMANENT_FAILED,), MeetingStatus.FILING_FAILED),
-        ((WriteStatus.UNKNOWN,), MeetingStatus.FILING_FAILED),
+        ((WriteStatus.UNKNOWN,), MeetingStatus.FILING),
     ],
 )
 def test_filing_status_is_derived_from_intents(

@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid5
 
-from meeting_action_orchestrator.domain.enums import IssueSeverity, IssueStatus, MeetingStatus
+from meeting_action_orchestrator.domain.enums import (
+    IssueSeverity,
+    IssueStatus,
+    MeetingStatus,
+    WriteKind,
+)
 from meeting_action_orchestrator.domain.errors import (
     DomainInvariantError,
     IdempotencyConflictError,
@@ -181,7 +186,15 @@ def project_write_intents(
                 duration_minutes=directive.calendar_event_duration_minutes,
             )
             intents.append(_build_intent(meeting, approval, review, event, created_at))
-    return tuple(intents)
+    return tuple(
+        sorted(
+            intents,
+            key=lambda item: (
+                str(item.proposal.source_action_id),
+                0 if item.proposal.kind is WriteKind.TASK else 1,
+            ),
+        )
+    )
 
 
 def validate_write_receipt(intent: WriteIntent, receipt: WriteReceipt) -> None:

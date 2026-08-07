@@ -413,7 +413,12 @@ class SqliteWriteIntentRepository:
 
     def list_for_approval(self, approval_id: UUID) -> Sequence[WriteIntent]:
         rows = self._connection.execute(
-            "SELECT * FROM write_intents WHERE approval_id = ? ORDER BY created_at, id",
+            """
+            SELECT * FROM write_intents WHERE approval_id = ?
+            ORDER BY source_action_id,
+                CASE kind WHEN 'task' THEN 0 ELSE 1 END,
+                id
+            """,
             (str(approval_id),),
         ).fetchall()
         return tuple(self._from_row(row) for row in rows)

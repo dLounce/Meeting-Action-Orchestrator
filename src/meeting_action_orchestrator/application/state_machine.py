@@ -161,6 +161,7 @@ def derive_filing_status(
         WriteStatus.PENDING,
         WriteStatus.IN_FLIGHT,
         WriteStatus.RETRY_WAIT,
+        WriteStatus.UNKNOWN,
     }
     if statuses & active:
         return MeetingStatus.FILING
