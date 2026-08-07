@@ -8,6 +8,11 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from meeting_action_orchestrator.application.auditing import (
+    WorkflowEventSink,
+    append_delivery_transition,
+    append_meeting_transition,
+)
 from meeting_action_orchestrator.application.errors import (
     OperationConflictError,
     ResourceNotFoundError,
@@ -55,7 +60,11 @@ class RetryScheduler(Protocol):
 
 
 class IntentReconciler(Protocol):
-    async def reconcile_intent(self, intent_id: UUID) -> object: ...
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> object: ...
 
 
 class ControlMeetingRepository(Protocol):
@@ -125,6 +134,7 @@ class ControlUnitOfWork(Protocol):
     write_intents: ControlIntentRepository
     write_receipts: ControlReceiptRepository
     delivery_operations: ControlDeliveryOperationRepository
+    workflow_events: WorkflowEventSink
 
     def __enter__(self) -> ControlUnitOfWork: ...
 
@@ -202,22 +212,27 @@ class DeliveryControlService:
             for intent in before.selected:
                 binding = await asyncio.to_thread(self._renew_operation, binding)
                 if intent.status is WriteStatus.UNKNOWN:
-                    await self._reconciler.reconcile_intent(intent.id)
+                    await self._reconciler.reconcile_intent(intent.id, actor_id=actor_id)
                 elif _requires_reconciliation(intent):
                     prepared = await asyncio.to_thread(
                         self._prepare_reconciliation,
                         meeting_id,
                         before.approval.id,
                         intent.id,
+                        actor_id,
                     )
                     if prepared:
-                        await self._reconciler.reconcile_intent(intent.id)
+                        await self._reconciler.reconcile_intent(
+                            intent.id,
+                            actor_id=actor_id,
+                        )
                 elif _can_direct_retry(intent, self._max_attempts):
                     await asyncio.to_thread(
                         self._queue_retry,
                         meeting_id,
                         before.approval.id,
                         intent.id,
+                        actor_id,
                     )
             await asyncio.to_thread(self._complete_operation, binding)
         except asyncio.CancelledError:
@@ -251,7 +266,7 @@ class DeliveryControlService:
             for intent in before.selected:
                 binding = await asyncio.to_thread(self._renew_operation, binding)
                 if intent.status is WriteStatus.UNKNOWN:
-                    await self._reconciler.reconcile_intent(intent.id)
+                    await self._reconciler.reconcile_intent(intent.id, actor_id=actor_id)
             await asyncio.to_thread(self._complete_operation, binding)
         except asyncio.CancelledError:
             raise
@@ -328,7 +343,13 @@ class DeliveryControlService:
             replayed=False,
         )
 
-    def _queue_retry(self, meeting_id: UUID, approval_id: UUID, intent_id: UUID) -> None:
+    def _queue_retry(
+        self,
+        meeting_id: UUID,
+        approval_id: UUID,
+        intent_id: UUID,
+        actor_id: str,
+    ) -> None:
         now = self._now()
         with self._unit_of_work() as uow:
             meeting = uow.meetings.get(meeting_id)
@@ -359,12 +380,26 @@ class DeliveryControlService:
                 ),
             )
             uow.write_intents.save(updated, intent.version)
+            append_delivery_transition(
+                uow.workflow_events,
+                intent,
+                updated,
+                now,
+                actor_id=actor_id,
+            )
             if meeting.status in {
                 MeetingStatus.PARTIALLY_FILED,
                 MeetingStatus.FILING_FAILED,
             }:
                 filing = transition_meeting(meeting, MeetingStatus.FILING, now)
                 uow.meetings.save(filing, meeting.version)
+                append_meeting_transition(
+                    uow.workflow_events,
+                    meeting,
+                    filing,
+                    now,
+                    actor_id=actor_id,
+                )
             uow.commit()
 
     def _prepare_reconciliation(
@@ -372,6 +407,7 @@ class DeliveryControlService:
         meeting_id: UUID,
         approval_id: UUID,
         intent_id: UUID,
+        actor_id: str,
     ) -> bool:
         now = self._now()
         with self._unit_of_work() as uow:
@@ -404,12 +440,26 @@ class DeliveryControlService:
                 next_reconcile_at=now,
             )
             uow.write_intents.save(updated, intent.version)
+            append_delivery_transition(
+                uow.workflow_events,
+                intent,
+                updated,
+                now,
+                actor_id=actor_id,
+            )
             if meeting.status in {
                 MeetingStatus.PARTIALLY_FILED,
                 MeetingStatus.FILING_FAILED,
             }:
                 filing = transition_meeting(meeting, MeetingStatus.FILING, now)
                 uow.meetings.save(filing, meeting.version)
+                append_meeting_transition(
+                    uow.workflow_events,
+                    meeting,
+                    filing,
+                    now,
+                    actor_id=actor_id,
+                )
             uow.commit()
         return True
 

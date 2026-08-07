@@ -198,7 +198,7 @@ class AgentResult(Generic[OutputT]):
     output: OutputT
     usage: AgentUsage
     model: str
-    provider_request_ids: tuple[str, ...]
+    workflow_request_ids: tuple[str, ...]
 
 
 class AgentBudgetExceededError(RuntimeError):

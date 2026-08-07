@@ -11,12 +11,19 @@ from uuid import UUID
 import pytest
 
 from meeting_action_orchestrator.application.ports import WorkflowEventCursor
-from meeting_action_orchestrator.domain.enums import AudioMediaType, MeetingStatus
+from meeting_action_orchestrator.domain.enums import (
+    AudioMediaType,
+    MeetingStatus,
+    ProcessingStage,
+)
 from meeting_action_orchestrator.domain.hashing import canonical_json
 from meeting_action_orchestrator.domain.models import AudioAsset, Meeting
 from meeting_action_orchestrator.domain.workflow_events import (
     MeetingIngestedMetadata,
     MeetingTransitionMetadata,
+    ProcessingAttemptMetadata,
+    ProcessingAuditOutcome,
+    ProcessingRetryRequestedMetadata,
     WorkflowEvent,
     WorkflowEventDraft,
     WorkflowEventType,
@@ -145,6 +152,112 @@ def test_event_round_trips_with_canonical_safe_metadata(tmp_path: Path) -> None:
     assert "private-original.wav" not in row["safe_metadata_json"]
     assert "recording.wav" not in row["safe_metadata_json"]
     assert row["occurred_at"] == UTC_NOW
+
+
+def test_latest_processing_event_is_stage_scoped_and_returns_retry_epoch(
+    tmp_path: Path,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    append(
+        database,
+        WorkflowEventDraft(
+            meeting_id=MEETING_ID,
+            type=WorkflowEventType.PROCESSING_ATTEMPTED,
+            safe_metadata=ProcessingAttemptMetadata(
+                stage=ProcessingStage.TRANSCRIPTION,
+                attempt_number=1,
+                outcome=ProcessingAuditOutcome.STARTED,
+                input_digest="b" * 64,
+            ),
+            occurred_at=NOW,
+        ),
+    )
+    extraction = append(
+        database,
+        WorkflowEventDraft(
+            meeting_id=MEETING_ID,
+            type=WorkflowEventType.PROCESSING_ATTEMPTED,
+            safe_metadata=ProcessingAttemptMetadata(
+                stage=ProcessingStage.EXTRACTION,
+                attempt_number=1,
+                outcome=ProcessingAuditOutcome.STARTED,
+                input_digest="c" * 64,
+            ),
+            occurred_at=NOW,
+        ),
+    )
+    retry = append(
+        database,
+        WorkflowEventDraft(
+            meeting_id=MEETING_ID,
+            type=WorkflowEventType.PROCESSING_RETRY_REQUESTED,
+            actor_id="portfolio-owner",
+            safe_metadata=ProcessingRetryRequestedMetadata(
+                stage=ProcessingStage.TRANSCRIPTION,
+                previous_attempt_count=1,
+                meeting_version=3,
+            ),
+            occurred_at=NOW,
+        ),
+    )
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        latest_transcription = uow.workflow_events.latest_processing_event(
+            MEETING_ID,
+            ProcessingStage.TRANSCRIPTION,
+        )
+        latest_extraction = uow.workflow_events.latest_processing_event(
+            MEETING_ID,
+            ProcessingStage.EXTRACTION,
+        )
+        missing = uow.workflow_events.latest_processing_event(
+            SECOND_MEETING_ID,
+            ProcessingStage.TRANSCRIPTION,
+        )
+
+    assert latest_transcription == retry
+    assert latest_extraction == extraction
+    assert missing is None
+
+
+def test_latest_processing_event_rejects_corrupted_selected_row(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    event = append(
+        database,
+        WorkflowEventDraft(
+            meeting_id=MEETING_ID,
+            type=WorkflowEventType.PROCESSING_ATTEMPTED,
+            safe_metadata=ProcessingAttemptMetadata(
+                stage=ProcessingStage.TRANSCRIPTION,
+                attempt_number=1,
+                outcome=ProcessingAuditOutcome.STARTED,
+                input_digest="b" * 64,
+            ),
+            occurred_at=NOW,
+        ),
+    )
+    with database.transaction(immediate=True) as connection:
+        connection.execute("DROP TRIGGER workflow_events_reject_update")
+        connection.execute(
+            """
+            UPDATE workflow_events
+            SET safe_metadata_json = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(event.safe_metadata.model_dump(mode="json"), indent=2),
+                str(event.id),
+            ),
+        )
+
+    with (
+        SqliteUnitOfWork(database, immediate=False) as uow,
+        pytest.raises(WorkflowEventIntegrityError),
+    ):
+        uow.workflow_events.latest_processing_event(
+            MEETING_ID,
+            ProcessingStage.TRANSCRIPTION,
+        )
 
 
 def test_event_append_normalizes_offset_timestamp_before_return(tmp_path: Path) -> None:

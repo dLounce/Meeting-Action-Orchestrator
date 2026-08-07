@@ -188,6 +188,51 @@ def test_claim_ids_are_exclusive_and_expired_writes_become_unknown(tmp_path: Pat
     assert intent.version == 2
 
 
+@pytest.mark.parametrize(
+    ("previous_status", "attempt_count", "next_attempt_at"),
+    [
+        (WriteStatus.PENDING, 2, None),
+        (WriteStatus.RETRY_WAIT, 0, NOW),
+    ],
+)
+def test_claim_carries_the_raw_previous_status(
+    tmp_path: Path,
+    previous_status: WriteStatus,
+    attempt_count: int,
+    next_attempt_at: datetime | None,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    with database.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            UPDATE write_intents
+            SET status = ?, attempt_count = ?, next_attempt_at = ?
+            WHERE id = ?
+            """,
+            (
+                previous_status.value,
+                attempt_count,
+                str(next_attempt_at) if next_attempt_at is not None else None,
+                str(INTENT_ID),
+            ),
+        )
+
+    with SqliteUnitOfWork(database) as uow:
+        claimed = uow.write_intents.claim_due_with_previous_statuses(
+            "worker-a",
+            NOW,
+            NOW + timedelta(seconds=30),
+            1,
+        )
+        current = uow.write_intents.get(INTENT_ID)
+        uow.commit()
+
+    assert claimed == ((INTENT_ID, previous_status),)
+    assert current is not None
+    assert current.status is WriteStatus.IN_FLIGHT
+    assert current.attempt_count == attempt_count + 1
+
+
 def test_expired_write_recovery_requires_unknown_disposition(tmp_path: Path) -> None:
     database = create_database(tmp_path / "application.sqlite3")
     failure = WorkflowFailure(

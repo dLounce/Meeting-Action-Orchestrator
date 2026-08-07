@@ -71,6 +71,7 @@ class ThreadAwareWorkflow:
     def ingest(self, command: IngestMeeting, stream: BinaryIO) -> Meeting:
         self.sync_thread_ids.append(threading.get_ident())
         assert command.ingest_key == "upload-one"
+        assert command.actor_id == "portfolio-owner"
         assert stream.read() == b"audio"
         return versioned_meeting()
 
@@ -162,6 +163,7 @@ async def test_workflow_facade_offloads_ingest_and_status_reads() -> None:
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="portfolio-owner",
     )
 
     await facade.ingest(command, io.BytesIO(b"audio"))

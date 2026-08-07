@@ -93,6 +93,7 @@ def command() -> IngestMeeting:
         timezone="UTC",
         original_name="private-recording.wav",
         ingest_key=INGEST_KEY,
+        actor_id="test-actor",
     )
 
 

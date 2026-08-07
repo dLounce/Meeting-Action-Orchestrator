@@ -23,6 +23,7 @@ from meeting_action_orchestrator.domain.enums import (
     ProcessingJobStatus,
     ProcessingStage,
     RecordingCleanupStatus,
+    WriteStatus,
 )
 from meeting_action_orchestrator.domain.models import (
     Approval,
@@ -500,6 +501,14 @@ class WriteIntentRepository(Protocol):
         limit: int,
     ) -> Sequence[UUID]: ...
 
+    def claim_due_with_previous_statuses(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[tuple[UUID, WriteStatus]]: ...
+
     def recover_expired_ids(
         self,
         now: datetime,
@@ -540,6 +549,12 @@ class WriteReceiptRepository(Protocol):
 
 class WorkflowEventRepository(Protocol):
     def append(self, draft: WorkflowEventDraft) -> WorkflowEvent: ...
+
+    def latest_processing_event(
+        self,
+        meeting_id: UUID,
+        stage: ProcessingStage,
+    ) -> WorkflowEvent | None: ...
 
     def list_page(
         self,

@@ -7,6 +7,10 @@ from datetime import datetime
 from typing import TypeVar
 from uuid import UUID
 
+from meeting_action_orchestrator.application.auditing import (
+    append_meeting_transition,
+    append_processing_retry_requested,
+)
 from meeting_action_orchestrator.application.errors import (
     OperationConflictError,
     ResourceNotFoundError,
@@ -160,6 +164,13 @@ class ProcessingControlService:
             )
             uow.meetings.save(updated, meeting.version)
             uow.meeting_operations.add(binding)
+            append_processing_retry_requested(
+                uow.workflow_events,
+                job,
+                updated,
+                now,
+                actor_id,
+            )
             result = _snapshot(uow, meeting_id, stage, replayed=False)
             uow.commit()
             return result
@@ -214,6 +225,13 @@ class ProcessingControlService:
                 )
             uow.meetings.save(cancelled, meeting.version)
             uow.meeting_operations.add(binding)
+            append_meeting_transition(
+                uow.workflow_events,
+                meeting,
+                cancelled,
+                now,
+                actor_id=actor_id,
+            )
             result = _snapshot(uow, meeting_id, None, replayed=False)
             uow.commit()
             return result

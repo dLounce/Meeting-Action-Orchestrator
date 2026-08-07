@@ -263,7 +263,7 @@ def test_openai_adapter_maps_usage_details() -> None:
     assert mapped.reasoning_tokens == usage.output_tokens_details.reasoning_tokens
 
 
-def test_openai_adapter_collects_unique_provider_request_ids() -> None:
+def test_openai_adapter_collects_unique_workflow_request_ids() -> None:
     response_object = SimpleNamespace(response_id="resp_1", id="resp_1")
     first = SimpleNamespace(request_id="req_1")
     duplicate = SimpleNamespace(_request_id="req_1")
@@ -278,7 +278,7 @@ def test_openai_adapter_collects_unique_provider_request_ids() -> None:
         client_request_id,
     )
 
-    assert request_ids == ("req_1", "req_2")
+    assert request_ids == (client_request_id, "req_1", "req_2")
     assert fallback == (client_request_id,)
 
 
@@ -333,8 +333,8 @@ async def test_openai_adapter_sends_a_unique_client_request_id_per_run() -> None
     )
     assert len(set(client_request_ids)) == 2
     assert all(str(UUID(value)) == value for value in client_request_ids)
-    assert first.provider_request_ids == (client_request_ids[0],)
-    assert second.provider_request_ids == (client_request_ids[1],)
+    assert first.workflow_request_ids == (client_request_ids[0],)
+    assert second.workflow_request_ids == (client_request_ids[1],)
 
 
 @pytest.mark.parametrize(

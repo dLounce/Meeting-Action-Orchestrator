@@ -9,6 +9,11 @@ from types import TracebackType
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from meeting_action_orchestrator.application.auditing import (
+    WorkflowEventSink,
+    append_delivery_transition,
+    append_meeting_transition,
+)
 from meeting_action_orchestrator.application.errors import (
     DeliveryGatewayError,
     OperationConflictError,
@@ -41,6 +46,7 @@ from meeting_action_orchestrator.domain.models import (
     WriteReceipt,
 )
 from meeting_action_orchestrator.domain.services import validate_write_receipt
+from meeting_action_orchestrator.domain.workflow_events import DeliveryChangeKind
 
 _RETRYABLE_MESSAGE = "The connector is temporarily unavailable"
 _PERMANENT_MESSAGE = "The connector rejected the approved action"
@@ -96,6 +102,14 @@ class DeliveryIntentRepository(Protocol):
         limit: int,
     ) -> Sequence[UUID]: ...
 
+    def claim_due_with_previous_statuses(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[tuple[UUID, WriteStatus]]: ...
+
     def recover_expired_ids(
         self,
         now: datetime,
@@ -138,6 +152,7 @@ class DeliveryUnitOfWork(Protocol):
     recaps: DeliveryRecapRepository
     write_intents: DeliveryIntentRepository
     write_receipts: DeliveryReceiptRepository
+    workflow_events: WorkflowEventSink
 
     def __enter__(self) -> DeliveryUnitOfWork: ...
 
@@ -168,6 +183,7 @@ class DeliveryBatch:
 class _ReconciliationClaim:
     intent_id: UUID
     owner: str
+    actor_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,8 +329,12 @@ class ApprovedOutboxExecutor:
             )
         return await asyncio.to_thread(self._record_success, snapshot, created)
 
-    async def reconcile_intent(self, intent_id: UUID) -> DeliveryResult:
-        claim = await asyncio.to_thread(self._claim_unknown, intent_id, True)
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> DeliveryResult:
+        claim = await asyncio.to_thread(self._claim_unknown, intent_id, True, actor_id)
         if claim is None:
             snapshot = await asyncio.to_thread(self._load_intent, intent_id)
             if snapshot.status is WriteStatus.UNKNOWN:
@@ -335,6 +355,7 @@ class ApprovedOutboxExecutor:
                 receipt,
                 replayed=True,
                 reconciliation_owner=claim.owner,
+                actor_id=claim.actor_id,
             )
         if snapshot.status is not WriteStatus.UNKNOWN:
             return DeliveryResult(snapshot.id, snapshot.status)
@@ -348,6 +369,7 @@ class ApprovedOutboxExecutor:
                     self._record_confirmed_absence,
                     snapshot,
                     claim.owner,
+                    claim.actor_id,
                 )
             validate_write_receipt(snapshot, found)
         except (
@@ -361,6 +383,7 @@ class ApprovedOutboxExecutor:
                 claim.owner,
                 error.code,
                 _safe_request_id(error.provider_request_id),
+                claim.actor_id,
             )
         except (DomainInvariantError, IdempotencyConflictError):
             return await asyncio.to_thread(
@@ -368,14 +391,21 @@ class ApprovedOutboxExecutor:
                 snapshot,
                 claim.owner,
                 FailureCode.IDEMPOTENCY_CONFLICT,
+                actor_id=claim.actor_id,
             )
         except Exception:
-            return await asyncio.to_thread(self._refresh_unknown, snapshot, claim.owner)
+            return await asyncio.to_thread(
+                self._refresh_unknown,
+                snapshot,
+                claim.owner,
+                actor_id=claim.actor_id,
+            )
         return await asyncio.to_thread(
             self._record_success,
             snapshot,
             found,
             reconciliation_owner=claim.owner,
+            actor_id=claim.actor_id,
         )
 
     def _recover_expired(self, limit: int) -> tuple[UUID, ...]:
@@ -388,6 +418,14 @@ class ApprovedOutboxExecutor:
         )
         with self._unit_of_work() as uow:
             recovered = tuple(uow.write_intents.recover_expired_ids(now, failure, limit))
+            for intent_id in recovered:
+                current = _required_intent(uow.write_intents.get(intent_id))
+                append_delivery_transition(
+                    uow.workflow_events,
+                    WriteStatus.IN_FLIGHT,
+                    current,
+                    now,
+                )
             uow.commit()
         return recovered
 
@@ -412,6 +450,7 @@ class ApprovedOutboxExecutor:
         self,
         intent_id: UUID,
         force: bool,
+        actor_id: str | None = None,
     ) -> _ReconciliationClaim | None:
         now = self._now()
         owner = f"reconcile:{uuid4().hex}"
@@ -424,21 +463,29 @@ class ApprovedOutboxExecutor:
                 force=force,
             )
             uow.commit()
-        return _ReconciliationClaim(intent_id, owner) if claimed is not None else None
+        return _ReconciliationClaim(intent_id, owner, actor_id) if claimed is not None else None
 
     def _claim_due(self, limit: int) -> tuple[UUID, ...]:
         now = self._now()
         with self._unit_of_work() as uow:
             claimed = tuple(
-                uow.write_intents.claim_due_ids(
+                uow.write_intents.claim_due_with_previous_statuses(
                     self._worker_id,
                     now,
                     now + self._lease_duration,
                     limit,
                 )
             )
+            for intent_id, previous_status in claimed:
+                current = _required_intent(uow.write_intents.get(intent_id))
+                append_delivery_transition(
+                    uow.workflow_events,
+                    previous_status,
+                    current,
+                    now,
+                )
             uow.commit()
-        return claimed
+        return tuple(intent_id for intent_id, _ in claimed)
 
     def _load_execution_snapshot(
         self,
@@ -545,6 +592,7 @@ class ApprovedOutboxExecutor:
                     failure=failure,
                 )
             uow.write_intents.save(updated, current.version)
+            append_delivery_transition(uow.workflow_events, current, updated, now)
             self._reduce_meeting(uow, updated.approval_id, now)
             uow.commit()
         return DeliveryResult(updated.id, updated.status)
@@ -553,6 +601,7 @@ class ApprovedOutboxExecutor:
         self,
         snapshot: WriteIntent,
         owner: str,
+        actor_id: str | None = None,
     ) -> DeliveryResult:
         now = self._now()
         with self._unit_of_work() as uow:
@@ -590,7 +639,14 @@ class ApprovedOutboxExecutor:
                     ),
                 )
             uow.write_intents.save(updated, current.version)
-            self._reduce_meeting(uow, updated.approval_id, now)
+            append_delivery_transition(
+                uow.workflow_events,
+                current,
+                updated,
+                now,
+                actor_id=actor_id,
+            )
+            self._reduce_meeting(uow, updated.approval_id, now, actor_id=actor_id)
             uow.commit()
         return DeliveryResult(updated.id, updated.status)
 
@@ -600,6 +656,7 @@ class ApprovedOutboxExecutor:
         owner: str,
         code: FailureCode = FailureCode.UNKNOWN_REMOTE_OUTCOME,
         provider_request_id: str | None = None,
+        actor_id: str | None = None,
     ) -> DeliveryResult:
         now = self._now()
         failure = _failure(
@@ -630,7 +687,15 @@ class ApprovedOutboxExecutor:
                 }
             )
             uow.write_intents.save(updated, current.version)
-            self._reduce_meeting(uow, updated.approval_id, now)
+            append_delivery_transition(
+                uow.workflow_events,
+                current,
+                updated,
+                now,
+                change_kind=DeliveryChangeKind.RECONCILIATION_REFRESH,
+                actor_id=actor_id,
+            )
+            self._reduce_meeting(uow, updated.approval_id, now, actor_id=actor_id)
             uow.commit()
         return DeliveryResult(updated.id, updated.status)
 
@@ -641,6 +706,7 @@ class ApprovedOutboxExecutor:
         *,
         replayed: bool = False,
         reconciliation_owner: str | None = None,
+        actor_id: str | None = None,
     ) -> DeliveryResult:
         validate_write_receipt(snapshot, receipt)
         now = self._now()
@@ -658,14 +724,25 @@ class ApprovedOutboxExecutor:
                 return DeliveryResult(current.id, current.status)
             if existing is not None:
                 validate_write_receipt(current, existing)
-                return self._commit_success(uow, current, replayed=True)
+                return self._commit_success(
+                    uow,
+                    current,
+                    replayed=True,
+                    actor_id=actor_id,
+                )
             if current != snapshot and not _same_binding(current, snapshot):
                 return DeliveryResult(current.id, current.status)
             validate_write_receipt(current, receipt)
             if current.status not in {WriteStatus.IN_FLIGHT, WriteStatus.UNKNOWN}:
                 return DeliveryResult(current.id, current.status)
             uow.write_receipts.add(receipt)
-            return self._commit_success(uow, current, now=now, replayed=replayed)
+            return self._commit_success(
+                uow,
+                current,
+                now=now,
+                replayed=replayed,
+                actor_id=actor_id,
+            )
 
     def _load_intent(self, intent_id: UUID) -> WriteIntent:
         with self._unit_of_work() as uow:
@@ -678,13 +755,26 @@ class ApprovedOutboxExecutor:
         *,
         now: datetime | None = None,
         replayed: bool,
+        actor_id: str | None = None,
     ) -> DeliveryResult:
         if current.status is WriteStatus.SUCCEEDED:
             return DeliveryResult(current.id, current.status, replayed=True)
         recorded_at = now or self._now()
         updated = transition_write_intent(current, WriteStatus.SUCCEEDED, recorded_at)
         uow.write_intents.save(updated, current.version)
-        self._reduce_meeting(uow, updated.approval_id, recorded_at)
+        append_delivery_transition(
+            uow.workflow_events,
+            current,
+            updated,
+            recorded_at,
+            actor_id=actor_id,
+        )
+        self._reduce_meeting(
+            uow,
+            updated.approval_id,
+            recorded_at,
+            actor_id=actor_id,
+        )
         uow.commit()
         return DeliveryResult(updated.id, updated.status, replayed=replayed)
 
@@ -693,6 +783,8 @@ class ApprovedOutboxExecutor:
         uow: DeliveryUnitOfWork,
         approval_id: UUID,
         now: datetime,
+        *,
+        actor_id: str | None = None,
     ) -> None:
         approval = _required_approval(uow.approvals.get(approval_id))
         meeting = _required_meeting(uow.meetings.get(approval.meeting_id))
@@ -712,6 +804,13 @@ class ApprovedOutboxExecutor:
         )
         updated = transition_meeting(meeting, target, now, failure=failure)
         uow.meetings.save(updated, meeting.version)
+        append_meeting_transition(
+            uow.workflow_events,
+            meeting,
+            updated,
+            now,
+            actor_id=actor_id,
+        )
 
     def _now(self) -> datetime:
         now = self._clock.now()

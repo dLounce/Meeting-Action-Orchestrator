@@ -34,6 +34,13 @@ from meeting_action_orchestrator.domain.models import (
     WriteIntent,
     WriteReceipt,
 )
+from meeting_action_orchestrator.domain.workflow_events import (
+    DeliveryChangeKind,
+    DeliveryTransitionMetadata,
+    MeetingTransitionMetadata,
+    WorkflowEventDraft,
+    WorkflowEventType,
+)
 from meeting_action_orchestrator.infrastructure.mcp_gateway import (
     PermanentMcpError,
     RetryableMcpError,
@@ -208,9 +215,26 @@ class FakeDatabase:
         self.transaction_depth = 0
         self.commits = 0
         self.persistence_threads: set[int] = set()
+        self.events: list[WorkflowEventDraft] = []
 
     def unit_of_work(self) -> FakeUnitOfWork:
         return FakeUnitOfWork(self)
+
+
+def delivery_events(database: FakeDatabase) -> tuple[DeliveryTransitionMetadata, ...]:
+    return tuple(
+        event.safe_metadata
+        for event in database.events
+        if isinstance(event.safe_metadata, DeliveryTransitionMetadata)
+    )
+
+
+def meeting_events(database: FakeDatabase) -> tuple[MeetingTransitionMetadata, ...]:
+    return tuple(
+        event.safe_metadata
+        for event in database.events
+        if isinstance(event.safe_metadata, MeetingTransitionMetadata)
+    )
 
 
 class FakeMeetingRepository:
@@ -268,8 +292,25 @@ class FakeIntentRepository:
         lease_until: datetime,
         limit: int,
     ) -> Sequence[UUID]:
+        return tuple(
+            intent_id
+            for intent_id, _ in self.claim_due_with_previous_statuses(
+                worker_id,
+                now,
+                lease_until,
+                limit,
+            )
+        )
+
+    def claim_due_with_previous_statuses(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[tuple[UUID, WriteStatus]]:
         candidates = sorted(self.database.intents.values(), key=lambda item: str(item.id))
-        claimed: list[UUID] = []
+        claimed: list[tuple[UUID, WriteStatus]] = []
         for intent in candidates:
             due = intent.status is WriteStatus.PENDING or (
                 intent.status is WriteStatus.RETRY_WAIT
@@ -286,7 +327,7 @@ class FakeIntentRepository:
                 lease_expires_at=lease_until,
             )
             self.database.intents[intent.id] = updated
-            claimed.append(intent.id)
+            claimed.append((intent.id, intent.status))
         return tuple(claimed)
 
     def recover_expired_ids(
@@ -405,6 +446,15 @@ class FakeReceiptRepository:
         return self.database.receipts.get(intent_id)
 
 
+class FakeEventRepository:
+    def __init__(self, database: FakeDatabase) -> None:
+        self.database = database
+
+    def append(self, draft: WorkflowEventDraft) -> object:
+        self.database.events.append(draft)
+        return draft
+
+
 class FakeUnitOfWork:
     def __init__(self, database: FakeDatabase) -> None:
         self.database = database
@@ -413,6 +463,7 @@ class FakeUnitOfWork:
         self.recaps = FakeRecapRepository(database)
         self.write_intents = FakeIntentRepository(database)
         self.write_receipts = FakeReceiptRepository(database)
+        self.workflow_events = FakeEventRepository(database)
 
     def __enter__(self) -> FakeUnitOfWork:
         self.database.persistence_threads.add(get_ident())
@@ -538,6 +589,44 @@ async def test_claim_reloads_the_persisted_intent_and_writes_outside_the_transac
     assert delivered.status is WriteStatus.SUCCEEDED
     assert database.meetings[MEETING_ID].status is MeetingStatus.COMPLETED
     assert batch.results[0].status is WriteStatus.SUCCEEDED
+    assert [event.type for event in database.events] == [
+        WorkflowEventType.DELIVERY_TRANSITIONED,
+        WorkflowEventType.DELIVERY_TRANSITIONED,
+        WorkflowEventType.MEETING_TRANSITIONED,
+    ]
+    assert [
+        (event.previous_status, event.current_status) for event in delivery_events(database)
+    ] == [
+        (WriteStatus.PENDING, WriteStatus.IN_FLIGHT),
+        (WriteStatus.IN_FLIGHT, WriteStatus.SUCCEEDED),
+    ]
+    assert [
+        (event.previous_status, event.current_status) for event in meeting_events(database)
+    ] == [(MeetingStatus.FILING, MeetingStatus.COMPLETED)]
+    assert all(event.actor_id is None for event in database.events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_status", "attempt_count"),
+    [
+        (WriteStatus.PENDING, 2),
+        (WriteStatus.RETRY_WAIT, 0),
+    ],
+)
+async def test_claim_audit_uses_the_persisted_previous_status(
+    previous_status: WriteStatus,
+    attempt_count: int,
+) -> None:
+    due = make_intent(status=previous_status, attempt_count=attempt_count)
+    database = FakeDatabase(due)
+    gateway = FakeGateway(database, writes=(make_receipt(due),))
+
+    await executor(database, gateway).run_once()
+
+    claimed = delivery_events(database)[0]
+    assert claimed.previous_status is previous_status
+    assert claimed.current_status is WriteStatus.IN_FLIGHT
 
 
 @pytest.mark.asyncio
@@ -557,6 +646,13 @@ async def test_delivery_claims_each_intent_with_a_fresh_lease() -> None:
     assert gateway.provider_threads == [event_loop_thread] * len(pending)
     assert database.persistence_threads
     assert event_loop_thread not in database.persistence_threads
+    metadata = delivery_events(database)
+    digests = {event.write_intent_digest for event in metadata}
+    assert len(metadata) == len(pending) * 2
+    assert len(digests) == len(pending)
+    assert all(event.write_kind is pending[0].proposal.kind for event in metadata)
+    serialized = "\n".join(event.model_dump_json() for event in metadata)
+    assert all(str(intent.id) not in serialized for intent in pending)
 
 
 @pytest.mark.asyncio
@@ -571,6 +667,9 @@ async def test_existing_receipt_is_replayed_without_an_external_call() -> None:
     assert result.replayed is True
     assert database.intents[claimed.id].status is WriteStatus.SUCCEEDED
     assert not gateway.calls
+    assert [
+        (event.previous_status, event.current_status) for event in delivery_events(database)
+    ] == [(WriteStatus.IN_FLIGHT, WriteStatus.SUCCEEDED)]
 
 
 @pytest.mark.asyncio
@@ -596,6 +695,12 @@ async def test_retryable_failure_uses_full_jitter_schedule_and_sanitized_metadat
     assert updated.last_failure.provider_request_id is None
     assert "private-token" not in updated.model_dump_json()
     assert scheduler.attempts == [1]
+    final_event = delivery_events(database)[-1]
+    assert final_event.previous_status is WriteStatus.IN_FLIGHT
+    assert final_event.current_status is WriteStatus.RETRY_WAIT
+    assert final_event.failure_code is FailureCode.RATE_LIMITED
+    assert final_event.failure_disposition is FailureDisposition.RETRYABLE
+    assert "private-token" not in final_event.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -620,6 +725,13 @@ async def test_fifth_retryable_failure_becomes_permanent() -> None:
     assert updated.last_failure is not None
     assert updated.last_failure.disposition is FailureDisposition.PERMANENT
     assert database.meetings[MEETING_ID].status is MeetingStatus.FILING_FAILED
+    final_event = delivery_events(database)[-1]
+    assert final_event.previous_status is WriteStatus.IN_FLIGHT
+    assert final_event.current_status is WriteStatus.PERMANENT_FAILED
+    assert final_event.failure_disposition is FailureDisposition.PERMANENT
+    assert [
+        (event.previous_status, event.current_status) for event in meeting_events(database)
+    ] == [(MeetingStatus.FILING, MeetingStatus.FILING_FAILED)]
 
 
 @pytest.mark.asyncio
@@ -655,6 +767,16 @@ async def test_gateway_failures_enter_the_matching_delivery_state(
     await executor(database, gateway).run_once()
 
     assert database.intents[pending.id].status is expected
+    final_event = delivery_events(database)[-1]
+    assert final_event.previous_status is WriteStatus.IN_FLIGHT
+    assert final_event.current_status is expected
+    assert (
+        final_event.failure_disposition
+        is {
+            WriteStatus.PERMANENT_FAILED: FailureDisposition.PERMANENT,
+            WriteStatus.UNKNOWN: FailureDisposition.UNKNOWN_OUTCOME,
+        }[expected]
+    )
 
 
 @pytest.mark.asyncio
@@ -675,6 +797,10 @@ async def test_unknown_outcome_is_reconciled_before_another_create() -> None:
     assert gateway.calls == ["find_task"]
     assert first.results[0].status is WriteStatus.RETRY_WAIT
     assert database.intents[unknown.id].next_attempt_at == NOW + timedelta(seconds=37)
+    absence = delivery_events(database)[-1]
+    assert absence.previous_status is WriteStatus.UNKNOWN
+    assert absence.current_status is WriteStatus.RETRY_WAIT
+    assert absence.failure_disposition is FailureDisposition.RETRYABLE
     clock.current = NOW + timedelta(seconds=38)
 
     await service.run_once()
@@ -705,6 +831,12 @@ async def test_lookup_failure_keeps_an_unknown_intent_out_of_create_path() -> No
     )
     assert updated.reconcile_attempt_count == 1
     assert updated.next_reconcile_at == NOW + timedelta(seconds=37)
+    refreshed = delivery_events(database)[-1]
+    assert refreshed.change_kind is DeliveryChangeKind.RECONCILIATION_REFRESH
+    assert refreshed.previous_status is WriteStatus.UNKNOWN
+    assert refreshed.current_status is WriteStatus.UNKNOWN
+    assert refreshed.reconciliation_count == 1
+    assert refreshed.failure_disposition is FailureDisposition.UNKNOWN_OUTCOME
 
 
 @pytest.mark.asyncio
@@ -751,10 +883,12 @@ async def test_unknown_lookup_is_not_repeated_before_its_durable_schedule() -> N
     service = executor(database, gateway, clock=clock, scheduler=scheduler)
 
     await service.run_once(1)
+    event_count = len(database.events)
     await service.run_once(1)
 
     assert gateway.calls == ["find_task"]
     assert database.intents[unknown.id].reconcile_attempt_count == 1
+    assert len(database.events) == event_count
     clock.current = NOW + timedelta(seconds=38)
 
     await service.run_once(1)
@@ -777,6 +911,7 @@ async def test_background_and_manual_reconciliation_cannot_share_a_lookup() -> N
     with pytest.raises(OperationConflictError, match="already being reconciled"):
         await manual.reconcile_intent(unknown.id)
 
+    assert not database.events
     gateway.release.set()
     batch = await running
     assert gateway.calls == ["find_task"]
@@ -793,12 +928,19 @@ async def test_manual_reconciliation_force_claims_a_future_unknown_schedule() ->
     database = FakeDatabase(unknown)
     gateway = FakeGateway(database, lookups=(None,))
 
-    result = await executor(database, gateway).reconcile_intent(unknown.id)
+    result = await executor(database, gateway).reconcile_intent(
+        unknown.id,
+        actor_id="portfolio-owner",
+    )
 
     assert result.status is WriteStatus.RETRY_WAIT
     assert gateway.calls == ["find_task"]
     assert database.intents[unknown.id].next_attempt_at == NOW + timedelta(seconds=37)
     assert database.intents[unknown.id].reconcile_lease_owner is None
+    assert database.events[-1].actor_id == "portfolio-owner"
+    transition = delivery_events(database)[-1]
+    assert transition.previous_status is WriteStatus.UNKNOWN
+    assert transition.current_status is WriteStatus.RETRY_WAIT
 
 
 @pytest.mark.asyncio
@@ -838,6 +980,12 @@ async def test_expired_in_flight_write_is_recovered_through_lookup() -> None:
     assert gateway.calls == ["find_task"]
     assert database.intents[expired.id].status is WriteStatus.SUCCEEDED
     assert database.receipts[expired.id].reconciled is True
+    assert [
+        (event.previous_status, event.current_status) for event in delivery_events(database)
+    ] == [
+        (WriteStatus.IN_FLIGHT, WriteStatus.UNKNOWN),
+        (WriteStatus.UNKNOWN, WriteStatus.SUCCEEDED),
+    ]
 
 
 @pytest.mark.asyncio
@@ -890,6 +1038,9 @@ async def test_filing_status_reduces_to_partial_when_only_some_writes_succeed() 
     assert meeting.status is MeetingStatus.PARTIALLY_FILED
     assert meeting.failure is not None
     assert meeting.failure.code is FailureCode.CONNECTOR_REJECTED
+    assert [
+        (event.previous_status, event.current_status) for event in meeting_events(database)
+    ] == [(MeetingStatus.FILING, MeetingStatus.PARTIALLY_FILED)]
 
 
 @pytest.mark.asyncio

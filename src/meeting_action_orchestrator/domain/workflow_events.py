@@ -57,6 +57,7 @@ class WorkflowEventType(str, Enum):
     MEETING_INGESTED = "meeting_ingested"
     MEETING_TRANSITIONED = "meeting_transitioned"
     PROCESSING_ATTEMPTED = "processing_attempted"
+    PROCESSING_RETRY_REQUESTED = "processing_retry_requested"
     SPECIALIST_HANDOFF_COMPLETED = "specialist_handoff_completed"
     REVIEW_REVISED = "review_revised"
     REVIEW_APPROVED = "review_approved"
@@ -134,7 +135,7 @@ class ProcessingAttemptMetadata(SafeWorkflowEventMetadata):
     stage: ProcessingStage
     attempt_number: int = Field(gt=0, le=AUDIT_COUNTER_MAX)
     outcome: ProcessingAuditOutcome
-    input_digest: AuditDigest
+    input_digest: AuditDigest | None = None
     output_digest: AuditDigest | None = None
     failure_code: FailureCode | None = None
     failure_disposition: FailureDisposition | None = None
@@ -151,7 +152,7 @@ class ProcessingAttemptMetadata(SafeWorkflowEventMetadata):
             raise ValueError("Processing audit outcome has inconsistent failure metadata")
         if (self.failure_code is None) != (self.failure_disposition is None):
             raise ValueError("Processing audit failure metadata must be paired")
-        if (self.outcome is ProcessingAuditOutcome.SUCCEEDED) != (self.output_digest is not None):
+        if self.outcome is not ProcessingAuditOutcome.SUCCEEDED and self.output_digest is not None:
             raise ValueError("Only successful processing audit events carry an output digest")
         retry = self.outcome is ProcessingAuditOutcome.RETRY_SCHEDULED
         if retry != (self.retry_delay_ms is not None):
@@ -175,6 +176,13 @@ class ProcessingAttemptMetadata(SafeWorkflowEventMetadata):
         ):
             raise ValueError("Terminal processing audit events require a terminal failure")
         return self
+
+
+class ProcessingRetryRequestedMetadata(SafeWorkflowEventMetadata):
+    kind: Literal["processing-retry-requested/v1"] = "processing-retry-requested/v1"
+    stage: ProcessingStage
+    previous_attempt_count: int = Field(gt=0, le=AUDIT_COUNTER_MAX)
+    meeting_version: int = Field(gt=0, le=_AUDIT_INTEGER_MAX)
 
 
 class SpecialistHandoffMetadata(SafeWorkflowEventMetadata):
@@ -294,6 +302,7 @@ WorkflowEventMetadata: TypeAlias = Annotated[
     MeetingIngestedMetadata
     | MeetingTransitionMetadata
     | ProcessingAttemptMetadata
+    | ProcessingRetryRequestedMetadata
     | SpecialistHandoffMetadata
     | ReviewRevisionMetadata
     | ReviewApprovedMetadata
@@ -305,6 +314,7 @@ _METADATA_TYPES: dict[WorkflowEventType, type[SafeWorkflowEventMetadata]] = {
     WorkflowEventType.MEETING_INGESTED: MeetingIngestedMetadata,
     WorkflowEventType.MEETING_TRANSITIONED: MeetingTransitionMetadata,
     WorkflowEventType.PROCESSING_ATTEMPTED: ProcessingAttemptMetadata,
+    WorkflowEventType.PROCESSING_RETRY_REQUESTED: ProcessingRetryRequestedMetadata,
     WorkflowEventType.SPECIALIST_HANDOFF_COMPLETED: SpecialistHandoffMetadata,
     WorkflowEventType.REVIEW_REVISED: ReviewRevisionMetadata,
     WorkflowEventType.REVIEW_APPROVED: ReviewApprovedMetadata,

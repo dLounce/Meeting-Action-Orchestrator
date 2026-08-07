@@ -2040,11 +2040,26 @@ class SqliteWriteIntentRepository:
         lease_until: datetime,
         limit: int,
     ) -> Sequence[WriteIntent]:
+        claimed = self.claim_due_with_previous_statuses(
+            worker_id,
+            now,
+            lease_until,
+            limit,
+        )
+        return tuple(item for intent_id, _ in claimed if (item := self.get(intent_id)) is not None)
+
+    def claim_due_with_previous_statuses(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[tuple[UUID, WriteStatus]]:
         if limit <= 0:
             return ()
         rows = self._connection.execute(
             """
-            SELECT id FROM write_intents
+            SELECT id, status FROM write_intents
             WHERE status IN (?, ?)
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
               AND lease_owner IS NULL
@@ -2052,7 +2067,6 @@ class SqliteWriteIntentRepository:
             """,
             (WriteStatus.PENDING.value, WriteStatus.RETRY_WAIT.value, str(now), limit),
         ).fetchall()
-        claimed: list[WriteIntent] = []
         for row in rows:
             self._connection.execute(
                 """
@@ -2072,10 +2086,7 @@ class SqliteWriteIntentRepository:
                     row["id"],
                 ),
             )
-            item = self.get(UUID(row["id"]))
-            if item is not None:
-                claimed.append(item)
-        return tuple(claimed)
+        return tuple((UUID(row["id"]), WriteStatus(row["status"])) for row in rows)
 
     def claim_due_ids(
         self,

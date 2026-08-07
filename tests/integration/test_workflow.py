@@ -32,11 +32,16 @@ from meeting_action_orchestrator.application.errors import (
     StaleWorkflowVersionError,
 )
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
+from meeting_action_orchestrator.application.processing import (
+    FullJitterRetryScheduler,
+    ProcessingWorker,
+)
 from meeting_action_orchestrator.application.recording_cleanup import RecordingCleanupScheduler
 from meeting_action_orchestrator.application.reviewing import ActionEdit
 from meeting_action_orchestrator.application.workflow import IngestMeeting, MeetingWorkflow
 from meeting_action_orchestrator.domain.enums import (
     MeetingStatus,
+    ProcessingStage,
     RecordingCleanupReason,
     ReviewOrigin,
     WriteKind,
@@ -248,7 +253,7 @@ def result(output: OutputT) -> AgentResult[OutputT]:
         output=output,
         usage=AgentUsage(requests=1, input_tokens=10, output_tokens=10, total_tokens=20),
         model="test",
-        provider_request_ids=("request",),
+        workflow_request_ids=("request",),
     )
 
 
@@ -284,6 +289,23 @@ def workflow(
     return service, database
 
 
+async def process_meeting(
+    service: MeetingWorkflow,
+    database: Database,
+    meeting_id: UUID,
+) -> Meeting:
+    worker = ProcessingWorker(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        handlers=service.processing_handlers(),
+        clock=FrozenClock(),
+        retry_scheduler=FullJitterRetryScheduler(random_value=lambda: 0.0),
+        worker_id="test-worker",
+    )
+    await worker.run_once(ProcessingStage.TRANSCRIPTION)
+    await worker.run_once(ProcessingStage.EXTRACTION)
+    return service.get_meeting(meeting_id)
+
+
 def test_exact_ingest_replay_uses_normalized_metadata_and_ignores_filename(
     tmp_path: Path,
 ) -> None:
@@ -296,6 +318,7 @@ def test_exact_ingest_replay_uses_normalized_metadata_and_ignores_filename(
         timezone="UTC",
         original_name="private-first-name.wav",
         ingest_key=" upload-one ",
+        actor_id="test-actor",
         participants=(
             PersonRef(display_name=" Mira ", email=" Mira@example.com "),
             PersonRef(display_name=" Dev ", email=None),
@@ -307,6 +330,7 @@ def test_exact_ingest_replay_uses_normalized_metadata_and_ignores_filename(
         timezone="UTC",
         original_name="unrelated-second-name.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
         participants=PARTICIPANTS,
     )
 
@@ -376,6 +400,7 @@ def test_changed_ingest_metadata_conflicts_and_schedules_the_staged_recording(
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
         participants=PARTICIPANTS,
     )
     changed = IngestMeeting(
@@ -384,6 +409,7 @@ def test_changed_ingest_metadata_conflicts_and_schedules_the_staged_recording(
         timezone=timezone_name,
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
         participants=participants,
     )
     service.ingest(original, io.BytesIO(content))
@@ -408,6 +434,7 @@ def test_invalid_direct_ingest_metadata_is_rejected_before_recording_storage(
         timezone="Mars/Olympus",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
 
     with pytest.raises(ValueError, match="IANA timezone"):
@@ -424,6 +451,7 @@ def test_conflicting_ingest_schedules_the_unreferenced_recording(tmp_path: Path)
         timezone="Asia/Calcutta",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEfirst"))
 
@@ -447,6 +475,7 @@ def test_duplicate_content_schedules_only_the_unowned_recording(tmp_path: Path) 
         timezone="UTC",
         original_name="first.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     second = IngestMeeting(
         title="Second meeting",
@@ -454,6 +483,7 @@ def test_duplicate_content_schedules_only_the_unowned_recording(tmp_path: Path) 
         timezone="UTC",
         original_name="second.wav",
         ingest_key="upload-two",
+        actor_id="test-actor",
     )
 
     first_meeting = service.ingest(first, io.BytesIO(content))
@@ -481,6 +511,7 @@ def test_failed_duplicate_ingest_schedules_its_staged_recording(
         timezone="UTC",
         original_name="private-first-name.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     second = IngestMeeting(
         title="Second meeting",
@@ -488,6 +519,7 @@ def test_failed_duplicate_ingest_schedules_its_staged_recording(
         timezone="UTC",
         original_name="private-second-name.wav",
         ingest_key="upload-two",
+        actor_id="test-actor",
     )
     retained = service.ingest(first, io.BytesIO(content))
 
@@ -525,6 +557,7 @@ def test_ambiguous_committed_ingest_retains_its_referenced_recording(tmp_path: P
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
 
     with pytest.raises(RuntimeError, match="commit outcome unavailable"):
@@ -565,6 +598,7 @@ def test_ambiguous_cleanup_commit_replays_the_ingest_and_keeps_the_job(
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     content = b"RIFF\x00\x00\x00\x00WAVEpersisted"
     original = service.ingest(command, io.BytesIO(content))
@@ -606,6 +640,7 @@ def test_failed_precommit_ingest_schedules_its_unique_recording(tmp_path: Path) 
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
 
     with pytest.raises(RuntimeError, match="commit did not persist"):
@@ -637,6 +672,7 @@ def test_legacy_meeting_without_binding_fails_closed_on_replay(tmp_path: Path) -
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
         participants=PARTICIPANTS,
     )
     content = b"RIFF\x00\x00\x00\x00WAVElegacy"
@@ -665,6 +701,7 @@ def test_unsupported_persisted_fingerprint_version_fails_closed(tmp_path: Path) 
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     content = b"RIFF\x00\x00\x00\x00WAVEfuture"
     service.ingest(command, io.BytesIO(content))
@@ -701,6 +738,7 @@ def test_deduplicated_audio_size_mismatch_fails_without_binding_new_key(
         timezone="UTC",
         original_name="first.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     second = IngestMeeting(
         title="Second",
@@ -708,6 +746,7 @@ def test_deduplicated_audio_size_mismatch_fails_without_binding_new_key(
         timezone="UTC",
         original_name="second.wav",
         ingest_key="upload-two",
+        actor_id="test-actor",
     )
     retained = service.ingest(first, io.BytesIO(content))
     with database.transaction(immediate=True) as connection:
@@ -736,6 +775,7 @@ def test_exact_replay_rejects_tampered_persisted_audio_identity(tmp_path: Path) 
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
     retained = service.ingest(command, io.BytesIO(content))
     with database.transaction(immediate=True) as connection:
@@ -768,6 +808,7 @@ def test_concurrent_same_content_ingests_assign_exact_storage_key_ownership(
             timezone="UTC",
             original_name="first.wav",
             ingest_key="concurrent-one",
+            actor_id="test-actor",
         ),
         IngestMeeting(
             title="Second concurrent meeting",
@@ -775,6 +816,7 @@ def test_concurrent_same_content_ingests_assign_exact_storage_key_ownership(
             timezone="UTC",
             original_name="second.wav",
             ingest_key="concurrent-two",
+            actor_id="test-actor",
         ),
     )
 
@@ -811,6 +853,7 @@ def test_concurrent_exact_replays_create_one_meeting_and_one_binding(tmp_path: P
             timezone="UTC",
             original_name="first.wav",
             ingest_key="concurrent-key",
+            actor_id="test-actor",
             participants=PARTICIPANTS,
         ),
         IngestMeeting(
@@ -819,6 +862,7 @@ def test_concurrent_exact_replays_create_one_meeting_and_one_binding(tmp_path: P
             timezone="UTC",
             original_name="second.wav",
             ingest_key="concurrent-key",
+            actor_id="test-actor",
             participants=PARTICIPANTS,
         ),
     )
@@ -856,6 +900,7 @@ def test_concurrent_changed_request_binds_one_payload_and_rejects_the_other(
             timezone="UTC",
             original_name="first.wav",
             ingest_key="concurrent-key",
+            actor_id="test-actor",
         ),
         IngestMeeting(
             title="Second request",
@@ -863,6 +908,7 @@ def test_concurrent_changed_request_binds_one_payload_and_rejects_the_other(
             timezone="UTC",
             original_name="second.wav",
             ingest_key="concurrent-key",
+            actor_id="test-actor",
         ),
     )
 
@@ -926,6 +972,7 @@ def test_cleanup_scheduling_failure_does_not_mask_ingest_outcomes(
         timezone="UTC",
         original_name="meeting.wav",
         ingest_key="upload-one",
+        actor_id="test-actor",
     )
 
     meeting = service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEfirst"))
@@ -959,6 +1006,7 @@ def test_ingest_persists_a_neutral_audio_name(tmp_path: Path) -> None:
             timezone="UTC",
             original_name="customer-acquisition-confidential.wav",
             ingest_key="upload-one",
+            actor_id="test-actor",
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEprivate"),
     )
@@ -1010,12 +1058,13 @@ async def test_extraction_preserves_submitted_meeting_metadata(tmp_path: Path) -
             timezone="Asia/Calcutta",
             original_name="meeting.wav",
             ingest_key="upload-1",
+            actor_id="test-actor",
             participants=submitted_participants,
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"),
     )
 
-    reviewed = await service.process(ingested.id)
+    reviewed = await process_meeting(service, database, ingested.id)
 
     assert reviewed.title == "Submitted customer title"
     assert reviewed.participants == submitted_participants
@@ -1035,11 +1084,12 @@ async def test_workflow_creates_no_external_intents_before_approval(tmp_path: Pa
             timezone="Asia/Calcutta",
             original_name="meeting.wav",
             ingest_key="upload-1",
+            actor_id="test-actor",
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"),
     )
 
-    reviewed = await service.process(ingested.id)
+    reviewed = await process_meeting(service, database, ingested.id)
 
     assert reviewed.status is MeetingStatus.AWAITING_APPROVAL
     with SqliteUnitOfWork(database) as uow:
@@ -1070,10 +1120,11 @@ async def test_approval_request_replay_returns_existing_projection(tmp_path: Pat
             timezone="Asia/Calcutta",
             original_name="meeting.wav",
             ingest_key="upload-1",
+            actor_id="test-actor",
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"),
     )
-    reviewed = await service.process(ingested.id)
+    reviewed = await process_meeting(service, database, ingested.id)
     digest = review_digest(database, reviewed.id)
 
     first = service.approve(
@@ -1106,10 +1157,11 @@ async def test_human_edit_creates_new_revision_before_approval(tmp_path: Path) -
             timezone="Asia/Calcutta",
             original_name="meeting.wav",
             ingest_key="upload-1",
+            actor_id="test-actor",
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"),
     )
-    reviewed = await service.process(ingested.id)
+    reviewed = await process_meeting(service, database, ingested.id)
     with SqliteUnitOfWork(database) as uow:
         original = uow.reviews.latest_for_meeting(reviewed.id)
     assert original is not None
@@ -1156,10 +1208,11 @@ async def test_delivery_revision_changes_approved_intent_projection(tmp_path: Pa
             timezone="Asia/Calcutta",
             original_name="meeting.wav",
             ingest_key="upload-1",
+            actor_id="test-actor",
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"),
     )
-    reviewed = await service.process(ingested.id)
+    reviewed = await process_meeting(service, database, ingested.id)
     with SqliteUnitOfWork(database) as uow:
         original = uow.reviews.latest_for_meeting(reviewed.id)
     assert original is not None

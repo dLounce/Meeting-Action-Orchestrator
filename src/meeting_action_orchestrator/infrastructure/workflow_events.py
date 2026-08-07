@@ -6,9 +6,12 @@ from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from meeting_action_orchestrator.application.ports import WorkflowEventCursor
+from meeting_action_orchestrator.domain.enums import ProcessingStage
 from meeting_action_orchestrator.domain.hashing import canonical_json
 from meeting_action_orchestrator.domain.workflow_events import (
     WORKFLOW_SEQUENCE_MAX,
+    ProcessingAttemptMetadata,
+    ProcessingRetryRequestedMetadata,
     WorkflowEvent,
     WorkflowEventDraft,
     WorkflowEventType,
@@ -111,6 +114,53 @@ class SqliteWorkflowEventRepository:
         if any(event.sequence != expected_sequence + offset for offset, event in enumerate(events)):
             raise WorkflowEventIntegrityError("Stored workflow event sequence is not contiguous")
         return events
+
+    def latest_processing_event(
+        self,
+        meeting_id: UUID,
+        stage: ProcessingStage,
+    ) -> WorkflowEvent | None:
+        if not isinstance(meeting_id, UUID):
+            raise ValueError("meeting_id must be a UUID")
+        if not isinstance(stage, ProcessingStage):
+            raise ValueError("stage must be a processing stage")
+        try:
+            row = self._connection.execute(
+                """
+                SELECT * FROM workflow_events
+                WHERE meeting_id = ?
+                  AND type IN (?, ?)
+                  AND json_extract(safe_metadata_json, '$.stage') = ?
+                ORDER BY sequence DESC
+                LIMIT 1
+                """,
+                (
+                    str(meeting_id),
+                    WorkflowEventType.PROCESSING_ATTEMPTED.value,
+                    WorkflowEventType.PROCESSING_RETRY_REQUESTED.value,
+                    stage.value,
+                ),
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            raise WorkflowEventIntegrityError(
+                "Stored workflow event violates the audit contract"
+            ) from None
+        if row is None:
+            return None
+        event = _event_from_row(row)
+        metadata = event.safe_metadata
+        valid = (
+            event.type is WorkflowEventType.PROCESSING_ATTEMPTED
+            and isinstance(metadata, ProcessingAttemptMetadata)
+            and metadata.stage is stage
+        ) or (
+            event.type is WorkflowEventType.PROCESSING_RETRY_REQUESTED
+            and isinstance(metadata, ProcessingRetryRequestedMetadata)
+            and metadata.stage is stage
+        )
+        if not valid:
+            raise WorkflowEventIntegrityError("Stored workflow event violates the audit contract")
+        return event
 
 
 def _as_utc_text(value: datetime) -> str:

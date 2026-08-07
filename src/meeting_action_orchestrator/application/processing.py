@@ -9,6 +9,10 @@ from enum import Enum
 from typing import Protocol, TypeGuard
 from uuid import UUID, uuid4
 
+from meeting_action_orchestrator.application.auditing import (
+    append_meeting_transition,
+    append_processing_attempt,
+)
 from meeting_action_orchestrator.application.errors import ResourceNotFoundError
 from meeting_action_orchestrator.application.ports import Clock, UnitOfWork
 from meeting_action_orchestrator.application.state_machine import transition_meeting
@@ -24,6 +28,11 @@ from meeting_action_orchestrator.domain.models import (
     Meeting,
     ProcessingJob,
     WorkflowFailure,
+)
+from meeting_action_orchestrator.domain.workflow_events import (
+    ProcessingAttemptMetadata,
+    ProcessingAuditOutcome,
+    WorkflowEventType,
 )
 
 UnitOfWorkFactory = Callable[[], UnitOfWork]
@@ -118,36 +127,6 @@ class ProcessingScheduler:
         )
         uow.processing_jobs.add(job)
         return job
-
-    def cancel(self, job_id: UUID) -> ProcessingJob:
-        now = self._clock.now()
-        with self._unit_of_work() as uow:
-            current = uow.processing_jobs.get(job_id)
-            if current is None:
-                raise ResourceNotFoundError("Processing job")
-            terminal = {
-                ProcessingJobStatus.SUCCEEDED,
-                ProcessingJobStatus.FAILED,
-                ProcessingJobStatus.CANCELLED,
-            }
-            if current.status in terminal:
-                return current
-            cancelled = _replace_job(
-                current,
-                status=ProcessingJobStatus.CANCELLED,
-                updated_at=now,
-                next_attempt_at=None,
-                lease_owner=None,
-                lease_expires_at=None,
-            )
-            uow.processing_jobs.save(
-                cancelled,
-                current.status,
-                current.lease_owner,
-                current.lease_expires_at,
-            )
-            uow.commit()
-        return cancelled
 
 
 class ProcessingWorker:
@@ -267,7 +246,7 @@ class ProcessingWorker:
                     inconsistent_failure,
                     now,
                 )
-            claimed = tuple(
+            selected = tuple(
                 uow.processing_jobs.claim_due(
                     stage,
                     self._worker_id,
@@ -276,8 +255,20 @@ class ProcessingWorker:
                     limit,
                 )
             )
+            claimed = []
+            for job in selected:
+                if not _prepare_claimed_attempt(uow, job, now):
+                    continue
+                append_processing_attempt(
+                    uow.workflow_events,
+                    job,
+                    ProcessingAuditOutcome.STARTED,
+                    _processing_input_digest(uow, job),
+                    now,
+                )
+                claimed.append(job)
             uow.commit()
-        return claimed
+        return tuple(claimed)
 
     @staticmethod
     def _repair_expired_exhausted(
@@ -288,6 +279,11 @@ class ProcessingWorker:
         now: datetime,
     ) -> None:
         meeting = uow.meetings.get(job.meeting_id)
+        has_open_attempt = (
+            _latest_processing_outcome(uow, job, job.attempt_count)
+            is ProcessingAuditOutcome.STARTED
+        )
+        transitions: tuple[tuple[Meeting, Meeting], ...] = ()
         if meeting is not None and _has_committed_artifact(uow, job, meeting):
             status = ProcessingJobStatus.SUCCEEDED
             job_failure = None
@@ -298,7 +294,7 @@ class ProcessingWorker:
             repaired_meeting = None
         else:
             status = ProcessingJobStatus.FAILED
-            repaired_meeting = (
+            repair = (
                 _fail_meeting_for_expired_job(
                     meeting,
                     job.stage,
@@ -306,8 +302,9 @@ class ProcessingWorker:
                     now,
                 )
                 if meeting is not None
-                else None
+                else (None, ())
             )
+            repaired_meeting, transitions = repair
             failed_status = _stage_states(job.stage)[2]
             if repaired_meeting is not None:
                 job_failure = expired_failure
@@ -326,12 +323,32 @@ class ProcessingWorker:
         )
         if repaired_meeting is not None and meeting is not None:
             uow.meetings.save(repaired_meeting, meeting.version)
+            for previous, current in transitions:
+                append_meeting_transition(uow.workflow_events, previous, current, now)
         uow.processing_jobs.save(
             repaired_job,
             job.status,
             job.lease_owner,
             job.lease_expires_at,
         )
+        if has_open_attempt and meeting is not None and status is ProcessingJobStatus.SUCCEEDED:
+            append_processing_attempt(
+                uow.workflow_events,
+                repaired_job,
+                ProcessingAuditOutcome.SUCCEEDED,
+                _processing_input_digest(uow, repaired_job),
+                now,
+                output_digest=_processing_output_digest(uow, repaired_job),
+            )
+        elif has_open_attempt and meeting is not None and status is ProcessingJobStatus.FAILED:
+            append_processing_attempt(
+                uow.workflow_events,
+                repaired_job,
+                ProcessingAuditOutcome.FAILED,
+                _processing_input_digest(uow, repaired_job),
+                now,
+                failure=job_failure,
+            )
 
     async def _execute(self, job: ProcessingJob) -> WorkflowFailure | None:
         try:
@@ -364,6 +381,14 @@ class ProcessingWorker:
                 current.lease_owner,
                 current.lease_expires_at,
             )
+            append_processing_attempt(
+                uow.workflow_events,
+                completed,
+                ProcessingAuditOutcome.SUCCEEDED,
+                _processing_input_digest(uow, completed),
+                now,
+                output_digest=_processing_output_digest(uow, completed),
+            )
             uow.commit()
         return completed
 
@@ -377,8 +402,42 @@ class ProcessingWorker:
             current = uow.processing_jobs.get(claimed.id)
             if not self._owns_live_lease(current, now):
                 return None
+            meeting = uow.meetings.get(current.meeting_id)
+            if meeting is not None and _has_committed_artifact(uow, current, meeting):
+                completed = _replace_job(
+                    current,
+                    status=ProcessingJobStatus.SUCCEEDED,
+                    updated_at=now,
+                    next_attempt_at=None,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_failure=None,
+                )
+                uow.processing_jobs.save(
+                    completed,
+                    current.status,
+                    current.lease_owner,
+                    current.lease_expires_at,
+                )
+                append_processing_attempt(
+                    uow.workflow_events,
+                    completed,
+                    ProcessingAuditOutcome.SUCCEEDED,
+                    _processing_input_digest(uow, completed),
+                    now,
+                    output_digest=_processing_output_digest(uow, completed),
+                )
+                uow.commit()
+                return completed
+            effective_failure = failure
+            if (
+                meeting is not None
+                and meeting.status is _stage_states(current.stage)[2]
+                and meeting.failure is not None
+            ):
+                effective_failure = meeting.failure
             retryable = (
-                failure.disposition is FailureDisposition.RETRYABLE
+                effective_failure.disposition is FailureDisposition.RETRYABLE
                 and current.attempt_count < current.max_attempts
             )
             status = ProcessingJobStatus.RETRY_WAIT if retryable else ProcessingJobStatus.FAILED
@@ -386,13 +445,15 @@ class ProcessingWorker:
             if retryable:
                 retry_base = now
                 provider_retry_at = None
-                if failure.retry_after_seconds is not None:
-                    provider_retry_at = now + timedelta(seconds=failure.retry_after_seconds)
+                if effective_failure.retry_after_seconds is not None:
+                    provider_retry_at = now + timedelta(
+                        seconds=effective_failure.retry_after_seconds
+                    )
                     retry_base = provider_retry_at
                 retry_at = self._retry_scheduler.schedule(retry_base, current.attempt_count)
                 if provider_retry_at is not None:
                     minimum_retry_at = provider_retry_at
-                    if failure.retry_after_seconds > 0:
+                    if effective_failure.retry_after_seconds > 0:
                         minimum_retry_at += timedelta(microseconds=1)
                     retry_at = max(retry_at, minimum_retry_at)
             failed = _replace_job(
@@ -402,13 +463,26 @@ class ProcessingWorker:
                 next_attempt_at=retry_at,
                 lease_owner=None,
                 lease_expires_at=None,
-                last_failure=failure,
+                last_failure=effective_failure,
             )
             uow.processing_jobs.save(
                 failed,
                 current.status,
                 current.lease_owner,
                 current.lease_expires_at,
+            )
+            append_processing_attempt(
+                uow.workflow_events,
+                failed,
+                (
+                    ProcessingAuditOutcome.RETRY_SCHEDULED
+                    if retryable
+                    else ProcessingAuditOutcome.FAILED
+                ),
+                _processing_input_digest(uow, failed),
+                now,
+                failure=effective_failure,
+                retry_at=retry_at,
             )
             uow.commit()
         return failed
@@ -460,14 +534,187 @@ def _fail_meeting_for_expired_job(
     stage: ProcessingStage,
     failure: WorkflowFailure,
     now: datetime,
-) -> Meeting | None:
+) -> tuple[Meeting | None, tuple[tuple[Meeting, Meeting], ...]]:
     pending, active, failed = _stage_states(stage)
     if meeting.status is failed:
-        return None
+        return None, ()
+    transitions: list[tuple[Meeting, Meeting]] = []
     if meeting.status is pending:
-        meeting = transition_meeting(meeting, active, now)
+        started = transition_meeting(meeting, active, now)
+        transitions.append((meeting, started))
+        meeting = started
     if meeting.status is active:
-        return transition_meeting(meeting, failed, now, failure=failure)
+        completed = transition_meeting(meeting, failed, now, failure=failure)
+        transitions.append((meeting, completed))
+        return completed, tuple(transitions)
+    return None, ()
+
+
+def _processing_input_digest(uow: UnitOfWork, job: ProcessingJob) -> str | None:
+    meeting = uow.meetings.get(job.meeting_id)
+    if meeting is not None and job.stage is ProcessingStage.TRANSCRIPTION:
+        asset = uow.audio_assets.get(meeting.audio_asset_id)
+        if asset is not None:
+            return asset.sha256
+    if meeting is not None and job.stage is ProcessingStage.EXTRACTION:
+        transcript = (
+            uow.transcripts.get(meeting.current_transcript_id)
+            if meeting.current_transcript_id is not None
+            else uow.transcripts.latest_for_meeting(meeting.id)
+        )
+        if transcript is not None:
+            return transcript.sha256
+    return None
+
+
+def _prepare_claimed_attempt(
+    uow: UnitOfWork,
+    claimed: ProcessingJob,
+    now: datetime,
+) -> bool:
+    previous_attempt = claimed.attempt_count - 1
+    if previous_attempt < 1:
+        return True
+    latest_outcome = _latest_processing_outcome(uow, claimed, previous_attempt)
+    has_open_attempt = latest_outcome is ProcessingAuditOutcome.STARTED
+    previous = _replace_job(claimed, attempt_count=previous_attempt)
+    meeting = uow.meetings.get(claimed.meeting_id)
+    if meeting is not None and _has_committed_artifact(uow, previous, meeting):
+        succeeded = _replace_job(
+            previous,
+            status=ProcessingJobStatus.SUCCEEDED,
+            lease_owner=None,
+            lease_expires_at=None,
+            last_failure=None,
+        )
+        uow.processing_jobs.save(
+            succeeded,
+            claimed.status,
+            claimed.lease_owner,
+            claimed.lease_expires_at,
+        )
+        if has_open_attempt:
+            append_processing_attempt(
+                uow.workflow_events,
+                succeeded,
+                ProcessingAuditOutcome.SUCCEEDED,
+                _processing_input_digest(uow, succeeded),
+                now,
+                output_digest=_processing_output_digest(uow, succeeded),
+            )
+        return False
+    if meeting is not None and meeting.status is MeetingStatus.CANCELLED:
+        cancelled = _replace_job(
+            previous,
+            status=ProcessingJobStatus.CANCELLED,
+            lease_owner=None,
+            lease_expires_at=None,
+            last_failure=None,
+        )
+        uow.processing_jobs.save(
+            cancelled,
+            claimed.status,
+            claimed.lease_owner,
+            claimed.lease_expires_at,
+        )
+        return False
+    failure = _reclaimed_attempt_failure(meeting, claimed.stage, now)
+    if failure.disposition is not FailureDisposition.RETRYABLE:
+        failed = _replace_job(
+            previous,
+            status=ProcessingJobStatus.FAILED,
+            lease_owner=None,
+            lease_expires_at=None,
+            last_failure=failure,
+        )
+        uow.processing_jobs.save(
+            failed,
+            claimed.status,
+            claimed.lease_owner,
+            claimed.lease_expires_at,
+        )
+        if has_open_attempt:
+            append_processing_attempt(
+                uow.workflow_events,
+                failed,
+                ProcessingAuditOutcome.FAILED,
+                _processing_input_digest(uow, failed),
+                now,
+                failure=failure,
+            )
+        return False
+    if has_open_attempt:
+        append_processing_attempt(
+            uow.workflow_events,
+            previous,
+            ProcessingAuditOutcome.RETRY_SCHEDULED,
+            _processing_input_digest(uow, previous),
+            now,
+            failure=failure,
+            retry_at=now,
+        )
+    return True
+
+
+def _latest_processing_outcome(
+    uow: UnitOfWork,
+    claimed: ProcessingJob,
+    attempt_number: int,
+) -> ProcessingAuditOutcome | None:
+    event = uow.workflow_events.latest_processing_event(
+        claimed.meeting_id,
+        claimed.stage,
+    )
+    if event is None or event.type is WorkflowEventType.PROCESSING_RETRY_REQUESTED:
+        return None
+    metadata = event.safe_metadata
+    if not isinstance(metadata, ProcessingAttemptMetadata):
+        return None
+    if metadata.attempt_number != attempt_number:
+        return None
+    return metadata.outcome
+
+
+def _reclaimed_attempt_failure(
+    meeting: Meeting | None,
+    stage: ProcessingStage,
+    now: datetime,
+) -> WorkflowFailure:
+    if meeting is not None and meeting.status is _stage_states(stage)[2]:
+        if meeting.failure is not None:
+            return meeting.failure
+        return WorkflowFailure(
+            code=FailureCode.INTERNAL,
+            disposition=FailureDisposition.PERMANENT,
+            safe_message="The processing job state is inconsistent",
+            occurred_at=now,
+        )
+    return WorkflowFailure(
+        code=FailureCode.PROVIDER_TIMEOUT,
+        disposition=FailureDisposition.RETRYABLE,
+        safe_message="The processing lease expired before completion",
+        occurred_at=now,
+    )
+
+
+def _processing_output_digest(uow: UnitOfWork, job: ProcessingJob) -> str | None:
+    meeting = uow.meetings.get(job.meeting_id)
+    if meeting is not None and job.stage is ProcessingStage.TRANSCRIPTION:
+        transcript = (
+            uow.transcripts.get(meeting.current_transcript_id)
+            if meeting.current_transcript_id is not None
+            else None
+        )
+        if transcript is not None:
+            return transcript.sha256
+    if meeting is not None and job.stage is ProcessingStage.EXTRACTION:
+        review = (
+            uow.reviews.get(meeting.current_review_id)
+            if meeting.current_review_id is not None
+            else None
+        )
+        if review is not None:
+            return review.content_digest
     return None
 
 

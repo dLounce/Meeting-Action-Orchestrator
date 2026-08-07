@@ -118,7 +118,7 @@ async def create_meeting(
     metadata: Annotated[str, Form(min_length=2, max_length=32_000)],
     recording: Annotated[UploadFile, File()],
     dependencies: ApiDependenciesValue,
-    _principal: PrincipalValue,
+    principal: PrincipalValue,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> MeetingResponse:
     request_key = parse_idempotency_key(idempotency_key)
@@ -131,6 +131,7 @@ async def create_meeting(
             timezone=request.timezone,
             original_name=original_name,
             ingest_key=request_key,
+            actor_id=principal.subject,
             participants=tuple(item.to_domain() for item in request.participants),
         )
         try:

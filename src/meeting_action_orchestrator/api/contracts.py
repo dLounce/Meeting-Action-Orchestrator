@@ -5,7 +5,7 @@ from typing import BinaryIO, Protocol
 from uuid import UUID
 
 from meeting_action_orchestrator.application.meeting_erasure import MeetingErasureResult
-from meeting_action_orchestrator.application.ports import MeetingListCursor
+from meeting_action_orchestrator.application.ports import MeetingListCursor, WorkflowEventCursor
 from meeting_action_orchestrator.application.processing_control import ProcessingControlResult
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
@@ -23,6 +23,7 @@ from meeting_action_orchestrator.domain.models import (
     WriteIntent,
     WriteReceipt,
 )
+from meeting_action_orchestrator.domain.workflow_events import WorkflowEvent
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,12 @@ class MeetingPageResult:
 class ProcessingResult:
     meeting_id: UUID
     jobs: tuple[ProcessingJob, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowEventPageResult:
+    items: tuple[WorkflowEvent, ...]
+    next_cursor: WorkflowEventCursor | None
 
 
 class Authenticator(Protocol):
@@ -106,6 +113,14 @@ class MeetingQueryService(Protocol):
     async def get_recap(self, meeting_id: UUID) -> RecapArtifact: ...
 
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult: ...
+
+    async def list_workflow_events(
+        self,
+        meeting_id: UUID,
+        *,
+        cursor: WorkflowEventCursor | None,
+        limit: int,
+    ) -> WorkflowEventPageResult: ...
 
 
 class ProcessingController(Protocol):

@@ -36,6 +36,7 @@ from meeting_action_orchestrator.domain.workflow_events import (
     MeetingTransitionMetadata,
     ProcessingAttemptMetadata,
     ProcessingAuditOutcome,
+    ProcessingRetryRequestedMetadata,
     ReviewApprovedMetadata,
     ReviewChangeKind,
     ReviewRevisionMetadata,
@@ -269,6 +270,11 @@ def test_safe_metadata_models_have_only_bounded_scalar_fields() -> None:
             input_digest="a" * 64,
             output_digest="b" * 64,
         ),
+        ProcessingRetryRequestedMetadata(
+            stage=ProcessingStage.TRANSCRIPTION,
+            previous_attempt_count=1,
+            meeting_version=3,
+        ),
         specialist_metadata(),
         ReviewRevisionMetadata(
             revision_number=1,
@@ -309,10 +315,6 @@ def test_safe_metadata_models_have_only_bounded_scalar_fields() -> None:
     "updates",
     [
         {
-            "outcome": ProcessingAuditOutcome.SUCCEEDED,
-            "output_digest": None,
-        },
-        {
             "outcome": ProcessingAuditOutcome.STARTED,
             "output_digest": "b" * 64,
         },
@@ -342,6 +344,27 @@ def test_processing_metadata_rejects_inconsistent_outcomes(
 
     with pytest.raises(ValidationError):
         ProcessingAttemptMetadata.model_validate(payload)
+
+
+def test_processing_success_can_omit_an_unavailable_output_digest() -> None:
+    metadata = ProcessingAttemptMetadata(
+        stage=ProcessingStage.TRANSCRIPTION,
+        attempt_number=1,
+        outcome=ProcessingAuditOutcome.SUCCEEDED,
+        input_digest="a" * 64,
+    )
+
+    assert metadata.output_digest is None
+
+
+def test_processing_attempt_can_omit_an_unavailable_input_digest() -> None:
+    metadata = ProcessingAttemptMetadata(
+        stage=ProcessingStage.TRANSCRIPTION,
+        attempt_number=1,
+        outcome=ProcessingAuditOutcome.STARTED,
+    )
+
+    assert metadata.input_digest is None
 
 
 def test_review_events_bind_the_exact_immutable_review_digest() -> None:

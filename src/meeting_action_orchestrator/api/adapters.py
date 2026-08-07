@@ -11,12 +11,17 @@ from meeting_action_orchestrator.api.contracts import (
     ProcessingResult,
     ReadinessCheck,
     ReadinessResult,
+    WorkflowEventPageResult,
 )
 from meeting_action_orchestrator.application.errors import (
     OperationConflictError,
     ResourceNotFoundError,
 )
-from meeting_action_orchestrator.application.ports import MeetingListCursor, UnitOfWork
+from meeting_action_orchestrator.application.ports import (
+    MeetingListCursor,
+    UnitOfWork,
+    WorkflowEventCursor,
+)
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
@@ -251,6 +256,20 @@ class UnitOfWorkQueryFacade:
     async def get_recap(self, meeting_id: UUID) -> RecapArtifact:
         return await asyncio.to_thread(self._get_recap, meeting_id)
 
+    async def list_workflow_events(
+        self,
+        meeting_id: UUID,
+        *,
+        cursor: WorkflowEventCursor | None,
+        limit: int,
+    ) -> WorkflowEventPageResult:
+        return await asyncio.to_thread(
+            self._list_workflow_events,
+            meeting_id,
+            cursor=cursor,
+            limit=limit,
+        )
+
     def _list_meetings(
         self,
         *,
@@ -350,6 +369,42 @@ class UnitOfWorkQueryFacade:
                 raise OperationConflictError("A write receipt does not belong to the meeting")
             validate_write_receipt(intent, receipt)
         return DeliveryResult(meeting=meeting, intents=intents, receipts=receipts)
+
+    def _list_workflow_events(
+        self,
+        meeting_id: UUID,
+        *,
+        cursor: WorkflowEventCursor | None,
+        limit: int,
+    ) -> WorkflowEventPageResult:
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between one and 100")
+        if cursor is not None and cursor.meeting_id != meeting_id:
+            raise ValueError("workflow event cursor belongs to another meeting")
+        with self._unit_of_work() as uow:
+            _required(uow.meetings.get(meeting_id), "Meeting")
+            items = tuple(
+                uow.workflow_events.list_page(
+                    meeting_id,
+                    cursor=cursor,
+                    limit=limit,
+                )
+            )
+            next_cursor = None
+            if len(items) == limit:
+                anchor = WorkflowEventCursor(meeting_id=meeting_id, sequence=items[-1].sequence)
+                probe = tuple(
+                    uow.workflow_events.list_page(
+                        meeting_id,
+                        cursor=anchor,
+                        limit=1,
+                    )
+                )
+                if probe:
+                    next_cursor = anchor
+        if any(item.meeting_id != meeting_id for item in items):
+            raise OperationConflictError("A workflow event does not belong to the meeting")
+        return WorkflowEventPageResult(items=items, next_cursor=next_cursor)
 
 
 class AsyncDeliveryFacade:

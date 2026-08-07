@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from threading import get_ident
@@ -15,6 +15,10 @@ from meeting_action_orchestrator.agents.contracts import (
     AgentRunContext,
     ExtractionRequest,
     MeetingExtraction,
+    RecapDraft,
+    RecapRequest,
+    VerificationReport,
+    VerificationRequest,
 )
 from meeting_action_orchestrator.application.errors import (
     ProviderError,
@@ -35,6 +39,7 @@ from meeting_action_orchestrator.application.processing import (
     ProcessingOutcome,
     ProcessingWorker,
 )
+from meeting_action_orchestrator.application.processing_control import ProcessingControlService
 from meeting_action_orchestrator.application.provider_policy import ProviderErrorMetadata
 from meeting_action_orchestrator.application.state_machine import transition_meeting
 from meeting_action_orchestrator.application.workflow import (
@@ -52,6 +57,15 @@ from meeting_action_orchestrator.domain.models import (
     ConnectorTarget,
     ProcessingJob,
     WorkflowFailure,
+)
+from meeting_action_orchestrator.domain.workflow_events import (
+    ProcessingAttemptMetadata,
+    ProcessingAuditOutcome,
+    ProcessingRetryRequestedMetadata,
+    SpecialistHandoffMetadata,
+    SpecialistRole,
+    WorkflowEvent,
+    WorkflowEventType,
 )
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.openai_transcription import TranscriptionOutput
@@ -89,6 +103,16 @@ class TransientTranscriber:
         raise ProviderTransientError
 
 
+class PermanentTranscriber:
+    async def transcribe(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+    ) -> TranscriptionOutput:
+        del audio_path, language
+        raise ProviderInputError
+
+
 class ExpiringOnceTranscriber:
     def __init__(self, clock: MutableClock) -> None:
         self._clock = clock
@@ -117,6 +141,58 @@ class FailingSpecialists(FakeSpecialists):
     ) -> AgentResult[MeetingExtraction]:
         del request, context
         raise self._error
+
+
+class RecapFailingSpecialists(FakeSpecialists):
+    async def write_recap(
+        self,
+        request: RecapRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[RecapDraft]:
+        del request, context
+        raise ProviderTransientError
+
+
+class TimedSpecialists(FakeSpecialists):
+    def __init__(self, clock: MutableClock, *, expire_on_verify: bool = False) -> None:
+        self._clock = clock
+        self._expire_on_verify = expire_on_verify
+
+    async def extract(
+        self,
+        request: ExtractionRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[MeetingExtraction]:
+        result = replace(
+            await super().extract(request, context),
+            workflow_request_ids=("req_private_raw_marker",),
+        )
+        self._clock.current += timedelta(seconds=1)
+        return result
+
+    async def write_recap(
+        self,
+        request: RecapRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[RecapDraft]:
+        result = replace(
+            await super().write_recap(request, context),
+            workflow_request_ids=("req_private_raw_marker",),
+        )
+        self._clock.current += timedelta(seconds=1)
+        return result
+
+    async def verify(
+        self,
+        request: VerificationRequest,
+        context: AgentRunContext,
+    ) -> AgentResult[VerificationReport]:
+        result = replace(
+            await super().verify(request, context),
+            workflow_request_ids=("req_private_raw_marker",),
+        )
+        self._clock.current += timedelta(seconds=9 if self._expire_on_verify else 1)
+        return result
 
 
 def create_workflow(
@@ -159,6 +235,7 @@ def ingest(service: MeetingWorkflow, ingest_key: str = "durable-upload") -> UUID
             timezone="Asia/Calcutta",
             original_name="meeting.wav",
             ingest_key=ingest_key,
+            actor_id="test-actor",
         ),
         io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"),
     )
@@ -187,6 +264,25 @@ def lease_failure(at: datetime) -> WorkflowFailure:
         disposition=FailureDisposition.RETRYABLE,
         safe_message="The processing lease expired",
         occurred_at=at,
+    )
+
+
+def workflow_events(database: Database, meeting_id: UUID) -> tuple[WorkflowEvent, ...]:
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        return tuple(uow.workflow_events.list_page(meeting_id, cursor=None, limit=100))
+
+
+def processing_metadata(
+    database: Database,
+    meeting_id: UUID,
+    stage: ProcessingStage,
+) -> tuple[ProcessingAttemptMetadata, ...]:
+    return tuple(
+        event.safe_metadata
+        for event in workflow_events(database, meeting_id)
+        if event.type is WorkflowEventType.PROCESSING_ATTEMPTED
+        and isinstance(event.safe_metadata, ProcessingAttemptMetadata)
+        and event.safe_metadata.stage is stage
     )
 
 
@@ -550,3 +646,316 @@ async def test_expired_handler_cannot_commit_stage_output(tmp_path: Path) -> Non
 
     assert recovered[0].outcome is ProcessingOutcome.SUCCEEDED
     assert service.get_meeting(meeting_id).status is MeetingStatus.TRANSCRIBED
+
+    audit = processing_metadata(database, meeting_id, ProcessingStage.TRANSCRIPTION)
+    assert [(item.attempt_number, item.outcome) for item in audit] == [
+        (1, ProcessingAuditOutcome.STARTED),
+        (1, ProcessingAuditOutcome.RETRY_SCHEDULED),
+        (2, ProcessingAuditOutcome.STARTED),
+        (2, ProcessingAuditOutcome.SUCCEEDED),
+    ]
+    assert audit[1].failure_code is FailureCode.PROVIDER_TIMEOUT
+    assert audit[1].retry_delay_ms == 0
+
+
+async def test_committed_artifact_repairs_expired_attempt_without_phantom_reclaim(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock)
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    claimed = worker._claim(ProcessingStage.TRANSCRIPTION, 1)
+
+    assert await service.execute_transcription_job(claimed[0]) is None
+    clock.current += timedelta(seconds=10)
+
+    recovered = await create_worker(
+        service,
+        database,
+        clock,
+        "worker-b",
+    ).run_once(ProcessingStage.TRANSCRIPTION)
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        job = uow.processing_jobs.find_for_stage(
+            meeting_id,
+            ProcessingStage.TRANSCRIPTION,
+        )
+    assert recovered == ()
+    assert job is not None
+    assert job.status is ProcessingJobStatus.SUCCEEDED
+    assert job.attempt_count == 1
+    assert [
+        item.outcome
+        for item in processing_metadata(
+            database,
+            meeting_id,
+            ProcessingStage.TRANSCRIPTION,
+        )
+    ] == [ProcessingAuditOutcome.STARTED, ProcessingAuditOutcome.SUCCEEDED]
+
+
+async def test_persisted_permanent_failure_repairs_expired_job_without_retry(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock, PermanentTranscriber())
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    claimed = worker._claim(ProcessingStage.TRANSCRIPTION, 1)
+
+    failure = await service.execute_transcription_job(claimed[0])
+    assert failure is not None
+    assert failure.code is FailureCode.INVALID_INPUT
+    clock.current += timedelta(seconds=10)
+
+    recovered = await create_worker(
+        service,
+        database,
+        clock,
+        "worker-b",
+    ).run_once(ProcessingStage.TRANSCRIPTION)
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        job = uow.processing_jobs.find_for_stage(
+            meeting_id,
+            ProcessingStage.TRANSCRIPTION,
+        )
+    audit = processing_metadata(database, meeting_id, ProcessingStage.TRANSCRIPTION)
+    assert recovered == ()
+    assert job is not None
+    assert job.status is ProcessingJobStatus.FAILED
+    assert job.attempt_count == 1
+    assert job.last_failure is not None
+    assert job.last_failure.code is FailureCode.INVALID_INPUT
+    assert [(item.outcome, item.failure_code) for item in audit] == [
+        (ProcessingAuditOutcome.STARTED, None),
+        (ProcessingAuditOutcome.FAILED, FailureCode.INVALID_INPUT),
+    ]
+
+
+async def test_manual_retry_epoch_closes_only_the_new_expired_attempt(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock, PermanentTranscriber())
+    meeting_id = ingest(service)
+    initial = create_worker(service, database, clock, "worker-a")
+    result = await initial.run_once(ProcessingStage.TRANSCRIPTION)
+    assert result[0].outcome is ProcessingOutcome.FAILED
+    failed_meeting = service.get_meeting(meeting_id)
+    control = ProcessingControlService(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        clock=clock,
+    )
+
+    retried = await control.retry(
+        meeting_id,
+        expected_version=failed_meeting.version,
+        request_key="manual-retry-one",
+        actor_id="portfolio-owner",
+    )
+    current_worker = create_worker(service, database, clock, "worker-b")
+    claimed = current_worker._claim(ProcessingStage.TRANSCRIPTION, 1)
+    service._start_stage(
+        retried.meeting,
+        MeetingStatus.TRANSCRIBING,
+        job=claimed[0],
+    )
+    clock.current += timedelta(seconds=10)
+
+    await create_worker(
+        service,
+        database,
+        clock,
+        "worker-c",
+    ).run_once(ProcessingStage.TRANSCRIPTION)
+
+    events = workflow_events(database, meeting_id)
+    retry_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.type is WorkflowEventType.PROCESSING_RETRY_REQUESTED
+    )
+    retry_event = events[retry_index]
+    assert isinstance(retry_event.safe_metadata, ProcessingRetryRequestedMetadata)
+    assert retry_event.actor_id == "portfolio-owner"
+    audit = tuple(
+        event.safe_metadata
+        for event in events[retry_index + 1 :]
+        if event.type is WorkflowEventType.PROCESSING_ATTEMPTED
+        and isinstance(event.safe_metadata, ProcessingAttemptMetadata)
+    )
+    assert [(item.attempt_number, item.outcome) for item in audit[:3]] == [
+        (1, ProcessingAuditOutcome.STARTED),
+        (1, ProcessingAuditOutcome.RETRY_SCHEDULED),
+        (2, ProcessingAuditOutcome.STARTED),
+    ]
+    assert audit[1].retry_delay_ms == 0
+
+
+async def test_ambiguous_artifact_commit_finishes_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock)
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    complete = service._complete_transcription
+
+    def commit_then_raise(*arguments: object) -> object:
+        complete(*arguments)
+        raise sqlite3.OperationalError("commit outcome unavailable")
+
+    monkeypatch.setattr(service, "_complete_transcription", commit_then_raise)
+
+    result = await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    assert result[0].outcome is ProcessingOutcome.SUCCEEDED
+    assert service.get_meeting(meeting_id).status is MeetingStatus.TRANSCRIBED
+    assert [
+        item.outcome
+        for item in processing_metadata(
+            database,
+            meeting_id,
+            ProcessingStage.TRANSCRIPTION,
+        )
+    ] == [ProcessingAuditOutcome.STARTED, ProcessingAuditOutcome.SUCCEEDED]
+
+
+async def test_persisted_failure_wins_when_failure_commit_reports_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(tmp_path, clock, PermanentTranscriber())
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    fail_stage = service._fail_stage
+
+    def commit_then_raise(*arguments: object, **keywords: object) -> None:
+        fail_stage(*arguments, **keywords)
+        raise sqlite3.OperationalError("commit outcome unavailable")
+
+    monkeypatch.setattr(service, "_fail_stage", commit_then_raise)
+
+    result = await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    assert result[0].outcome is ProcessingOutcome.FAILED
+    assert result[0].job is not None
+    assert result[0].job.last_failure is not None
+    assert result[0].job.last_failure.code is FailureCode.INVALID_INPUT
+    audit = processing_metadata(database, meeting_id, ProcessingStage.TRANSCRIPTION)
+    assert audit[-1].outcome is ProcessingAuditOutcome.FAILED
+    assert audit[-1].failure_code is FailureCode.INVALID_INPUT
+
+
+async def test_partial_specialist_chain_emits_no_committed_handoff(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    service, database = create_workflow(
+        tmp_path,
+        clock,
+        specialists=RecapFailingSpecialists(),
+    )
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    result = await worker.run_once(ProcessingStage.EXTRACTION)
+
+    events = workflow_events(database, meeting_id)
+    assert result[0].outcome is ProcessingOutcome.RETRY_SCHEDULED
+    assert not any(event.type is WorkflowEventType.SPECIALIST_HANDOFF_COMPLETED for event in events)
+    assert not any(event.type is WorkflowEventType.REVIEW_REVISED for event in events)
+
+
+async def test_extraction_lease_loss_commits_no_handoff_or_review(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    specialists = TimedSpecialists(clock, expire_on_verify=True)
+    service, database = create_workflow(
+        tmp_path,
+        clock,
+        specialists=specialists,
+    )
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    result = await worker.run_once(ProcessingStage.EXTRACTION)
+
+    events = workflow_events(database, meeting_id)
+    assert result[0].outcome is ProcessingOutcome.LEASE_LOST
+    assert not any(event.type is WorkflowEventType.SPECIALIST_HANDOFF_COMPLETED for event in events)
+    assert not any(event.type is WorkflowEventType.REVIEW_REVISED for event in events)
+    assert service.get_meeting(meeting_id).status is MeetingStatus.EXTRACTING
+
+
+async def test_handoff_events_preserve_completion_order_and_identifier_privacy(
+    tmp_path: Path,
+) -> None:
+    clock = MutableClock()
+    specialists = TimedSpecialists(clock)
+    service, database = create_workflow(
+        tmp_path,
+        clock,
+        specialists=specialists,
+    )
+    meeting_id = ingest(service)
+    worker = create_worker(service, database, clock, "worker-a")
+    await worker.run_once(ProcessingStage.TRANSCRIPTION)
+
+    result = await worker.run_once(ProcessingStage.EXTRACTION)
+
+    events = tuple(
+        event
+        for event in workflow_events(database, meeting_id)
+        if event.type is WorkflowEventType.SPECIALIST_HANDOFF_COMPLETED
+    )
+    metadata = tuple(event.safe_metadata for event in events)
+    assert result[0].outcome is ProcessingOutcome.SUCCEEDED
+    assert all(isinstance(item, SpecialistHandoffMetadata) for item in metadata)
+    assert [
+        item.specialist for item in metadata if isinstance(item, SpecialistHandoffMetadata)
+    ] == [
+        SpecialistRole.EXTRACT,
+        SpecialistRole.RECAP,
+        SpecialistRole.VERIFY,
+    ]
+    assert [event.occurred_at for event in events] == sorted(event.occurred_at for event in events)
+    serialized = "\n".join(event.safe_metadata.model_dump_json() for event in events)
+    assert "req_private_raw_marker" not in serialized
+    assert "request_ids_digest" in serialized
+    meeting = service.get_meeting(meeting_id)
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        asset = uow.audio_assets.get(meeting.audio_asset_id)
+        transcript = uow.transcripts.latest_for_meeting(meeting_id)
+        review = (
+            uow.reviews.get(meeting.current_review_id)
+            if meeting.current_review_id is not None
+            else None
+        )
+    assert asset is not None
+    assert transcript is not None
+    assert review is not None
+    transcription_success = processing_metadata(
+        database,
+        meeting_id,
+        ProcessingStage.TRANSCRIPTION,
+    )[-1]
+    extraction_success = processing_metadata(
+        database,
+        meeting_id,
+        ProcessingStage.EXTRACTION,
+    )[-1]
+    assert transcription_success.outcome is ProcessingAuditOutcome.SUCCEEDED
+    assert transcription_success.input_digest == asset.sha256
+    assert transcription_success.output_digest == transcript.sha256
+    assert extraction_success.outcome is ProcessingAuditOutcome.SUCCEEDED
+    assert extraction_success.input_digest == transcript.sha256
+    assert extraction_success.output_digest == review.content_digest

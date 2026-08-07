@@ -15,6 +15,7 @@ from meeting_action_orchestrator.api.middleware import (
 from meeting_action_orchestrator.api.problems import install_problem_handlers
 from meeting_action_orchestrator.api.routes import health_router, meeting_router
 from meeting_action_orchestrator.api.security import SecurityHeadersMiddleware
+from meeting_action_orchestrator.api.workflow_event_routes import workflow_event_router
 
 REQUEST_ENVELOPE_BYTES = 1024 * 1024
 Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
@@ -39,6 +40,7 @@ def create_app(
     install_service_error_handlers(app)
     app.include_router(health_router)
     app.include_router(meeting_router)
+    app.include_router(workflow_event_router)
     app.include_router(erasure_router)
     app.add_middleware(
         RequestBodyLimitMiddleware,

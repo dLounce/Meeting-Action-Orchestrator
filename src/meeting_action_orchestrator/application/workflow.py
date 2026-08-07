@@ -16,6 +16,12 @@ from meeting_action_orchestrator.agents.contracts import (
     RecapRequest,
     VerificationRequest,
 )
+from meeting_action_orchestrator.application.auditing import (
+    append_delivery_transition,
+    append_meeting_transition,
+    append_review_revision,
+    specialist_handoff_draft,
+)
 from meeting_action_orchestrator.application.errors import (
     AudioAssetIdentityMismatchError,
     OperationConflictError,
@@ -105,6 +111,15 @@ from meeting_action_orchestrator.domain.services import (
     project_write_intents,
     validate_review_evidence,
 )
+from meeting_action_orchestrator.domain.workflow_events import (
+    DeliveryChangeKind,
+    MeetingIngestedMetadata,
+    ReviewApprovedMetadata,
+    ReviewChangeKind,
+    SpecialistRole,
+    WorkflowEventDraft,
+    WorkflowEventType,
+)
 
 _NEUTRAL_AUDIO_NAMES = {
     AudioMediaType.MP3: "recording.mp3",
@@ -127,6 +142,7 @@ class IngestMeeting:
     timezone: str
     original_name: str
     ingest_key: str
+    actor_id: str
     participants: tuple[PersonRef, ...] = ()
 
 
@@ -264,6 +280,20 @@ class MeetingWorkflow:
                         ProcessingStage.TRANSCRIPTION,
                         scheduled_at=now,
                     )
+                    uow.workflow_events.append(
+                        WorkflowEventDraft(
+                            meeting_id=meeting.id,
+                            type=WorkflowEventType.MEETING_INGESTED,
+                            actor_id=command.actor_id,
+                            safe_metadata=MeetingIngestedMetadata(
+                                recording_digest=asset.sha256,
+                                media_type=asset.detected_media_type,
+                                size_bytes=asset.size_bytes,
+                                duration_ms=asset.duration_ms,
+                            ),
+                            occurred_at=now,
+                        )
+                    )
                     uow.commit()
         except BaseException:
             self._schedule_abandoned_recording(stored)
@@ -303,16 +333,6 @@ class MeetingWorkflow:
                 },
             )
 
-    async def process(self, meeting_id: UUID) -> Meeting:
-        meeting = await asyncio.to_thread(self.get_meeting, meeting_id)
-        if meeting.status in {MeetingStatus.INGESTED, MeetingStatus.TRANSCRIPTION_FAILED}:
-            meeting = await self._transcribe(meeting)
-        if meeting.status in {MeetingStatus.TRANSCRIBED, MeetingStatus.EXTRACTION_FAILED}:
-            meeting = await self._extract(meeting)
-        if meeting.status in {MeetingStatus.TRANSCRIBING, MeetingStatus.EXTRACTING}:
-            raise WorkflowBusyError
-        return meeting
-
     def get_meeting(self, meeting_id: UUID) -> Meeting:
         with self._unit_of_work() as uow:
             meeting = uow.meetings.get(meeting_id)
@@ -346,7 +366,7 @@ class MeetingWorkflow:
         if meeting.status not in allowed:
             return _invalid_job_failure(self._clock.now())
         try:
-            await self._transcribe(meeting, job=job)
+            await self._transcribe(meeting, job)
         except Exception as error:
             failure = _transcription_failure(error, self._clock.now())
             await asyncio.to_thread(
@@ -381,7 +401,7 @@ class MeetingWorkflow:
         if meeting.status not in allowed:
             return _invalid_job_failure(self._clock.now())
         try:
-            await self._extract(meeting, job=job)
+            await self._extract(meeting, job)
         except Exception as error:
             failure = _extraction_failure(error, self._clock.now())
             await asyncio.to_thread(
@@ -448,13 +468,49 @@ class MeetingWorkflow:
                 approved_review_id=review.id,
             )
             if intents:
-                approved = transition_meeting(approved, MeetingStatus.FILING, now)
+                completed = transition_meeting(approved, MeetingStatus.FILING, now)
             else:
-                approved = transition_meeting(approved, MeetingStatus.COMPLETED, now)
+                completed = transition_meeting(approved, MeetingStatus.COMPLETED, now)
             uow.approvals.add(approval)
             uow.recaps.add(recap)
             uow.write_intents.add_many(intents)
-            uow.meetings.save(approved, meeting.version)
+            uow.meetings.save(completed, meeting.version)
+            append_meeting_transition(
+                uow.workflow_events,
+                meeting,
+                approved,
+                now,
+                actor_id=actor_id,
+            )
+            uow.workflow_events.append(
+                WorkflowEventDraft(
+                    meeting_id=meeting.id,
+                    type=WorkflowEventType.REVIEW_APPROVED,
+                    actor_id=actor_id,
+                    safe_metadata=ReviewApprovedMetadata(
+                        revision_number=review.revision_number,
+                        review_digest=review.content_digest,
+                        write_intent_count=len(intents),
+                    ),
+                    occurred_at=now,
+                )
+            )
+            for intent in intents:
+                append_delivery_transition(
+                    uow.workflow_events,
+                    None,
+                    intent,
+                    now,
+                    change_kind=DeliveryChangeKind.CREATED,
+                    actor_id=actor_id,
+                )
+            append_meeting_transition(
+                uow.workflow_events,
+                approved,
+                completed,
+                now,
+                actor_id=actor_id,
+            )
             uow.commit()
         return ApprovalResult(approval, recap, intents)
 
@@ -492,6 +548,20 @@ class MeetingWorkflow:
             )
             uow.reviews.add(revised)
             uow.meetings.save(updated, meeting.version)
+            append_review_revision(
+                uow.workflow_events,
+                revised,
+                ReviewChangeKind.ACTION_EDITED,
+                now,
+                actor_id=actor_id,
+            )
+            append_meeting_transition(
+                uow.workflow_events,
+                meeting,
+                updated,
+                now,
+                actor_id=actor_id,
+            )
             uow.commit()
         return ReviewUpdateResult(updated, revised)
 
@@ -526,6 +596,20 @@ class MeetingWorkflow:
             )
             uow.reviews.add(revised)
             uow.meetings.save(updated, meeting.version)
+            append_review_revision(
+                uow.workflow_events,
+                revised,
+                ReviewChangeKind.ISSUE_UPDATED,
+                now,
+                actor_id=actor_id,
+            )
+            append_meeting_transition(
+                uow.workflow_events,
+                meeting,
+                updated,
+                now,
+                actor_id=actor_id,
+            )
             uow.commit()
         return ReviewUpdateResult(updated, revised)
 
@@ -565,14 +649,27 @@ class MeetingWorkflow:
             )
             uow.reviews.add(revised)
             uow.meetings.save(updated, meeting.version)
+            append_review_revision(
+                uow.workflow_events,
+                revised,
+                ReviewChangeKind.DELIVERY_UPDATED,
+                now,
+                actor_id=actor_id,
+            )
+            append_meeting_transition(
+                uow.workflow_events,
+                meeting,
+                updated,
+                now,
+                actor_id=actor_id,
+            )
             uow.commit()
         return ReviewUpdateResult(updated, revised)
 
     async def _transcribe(
         self,
         meeting: Meeting,
-        *,
-        job: ProcessingJob | None = None,
+        job: ProcessingJob,
     ) -> Meeting:
         meeting = await asyncio.to_thread(
             self._start_stage,
@@ -605,8 +702,7 @@ class MeetingWorkflow:
     async def _extract(
         self,
         meeting: Meeting,
-        *,
-        job: ProcessingJob | None = None,
+        job: ProcessingJob,
     ) -> Meeting:
         meeting = await asyncio.to_thread(
             self._start_stage,
@@ -620,23 +716,58 @@ class MeetingWorkflow:
         )
         budget = AgentBudget(self._max_agent_requests, self._max_agent_output_tokens)
         try:
+            extraction_request = build_extraction_request(meeting, transcript)
             extraction = await self._specialists.extract(
-                build_extraction_request(meeting, transcript),
-                AgentRunContext(str(meeting.id), "extract", budget),
+                extraction_request,
+                AgentRunContext(str(job.id), "extract", budget),
+            )
+            extraction_handoff = await asyncio.to_thread(
+                specialist_handoff_draft,
+                meeting_id=meeting.id,
+                specialist=SpecialistRole.EXTRACT,
+                processing_attempt_number=job.attempt_count,
+                request=extraction_request,
+                result=extraction,
+                occurred_at=self._clock.now(),
             )
             record = build_canonical_record(meeting, extraction.output)
+            recap_request = RecapRequest(meeting_id=str(meeting.id), record=record)
             recap = await self._specialists.write_recap(
-                RecapRequest(meeting_id=str(meeting.id), record=record),
-                AgentRunContext(str(meeting.id), "recap", budget),
+                recap_request,
+                AgentRunContext(str(job.id), "recap", budget),
+            )
+            recap_handoff = await asyncio.to_thread(
+                specialist_handoff_draft,
+                meeting_id=meeting.id,
+                specialist=SpecialistRole.RECAP,
+                processing_attempt_number=job.attempt_count,
+                request=recap_request,
+                result=recap,
+                occurred_at=self._clock.now(),
+            )
+            verification_request = VerificationRequest(
+                meeting_id=str(meeting.id),
+                transcript=transcript_input(transcript),
+                record=record,
+                recap=recap.output,
             )
             verification = await self._specialists.verify(
-                VerificationRequest(
-                    meeting_id=str(meeting.id),
-                    transcript=transcript_input(transcript),
-                    record=record,
-                    recap=recap.output,
-                ),
-                AgentRunContext(str(meeting.id), "verify", budget),
+                verification_request,
+                AgentRunContext(str(job.id), "verify", budget),
+            )
+            verification_handoff = await asyncio.to_thread(
+                specialist_handoff_draft,
+                meeting_id=meeting.id,
+                specialist=SpecialistRole.VERIFY,
+                processing_attempt_number=job.attempt_count,
+                request=verification_request,
+                result=verification,
+                occurred_at=self._clock.now(),
+            )
+            handoffs = (
+                extraction_handoff,
+                recap_handoff,
+                verification_handoff,
             )
             package = map_review_package(
                 meeting=meeting,
@@ -663,6 +794,7 @@ class MeetingWorkflow:
             meeting.id,
             package.review,
             job,
+            handoffs,
         )
 
     def _load_audio_asset(self, audio_asset_id: UUID) -> AudioAsset:
@@ -673,7 +805,7 @@ class MeetingWorkflow:
         self,
         meeting_id: UUID,
         transcript: Transcript,
-        job: ProcessingJob | None,
+        job: ProcessingJob,
     ) -> Meeting:
         now = self._clock.now()
         with self._unit_of_work() as uow:
@@ -693,6 +825,7 @@ class MeetingWorkflow:
                 ProcessingStage.EXTRACTION,
                 scheduled_at=now,
             )
+            append_meeting_transition(uow.workflow_events, current, completed, now)
             uow.commit()
         return completed
 
@@ -707,7 +840,8 @@ class MeetingWorkflow:
         self,
         meeting_id: UUID,
         review: ReviewRevision,
-        job: ProcessingJob | None,
+        job: ProcessingJob,
+        handoffs: tuple[WorkflowEventDraft, WorkflowEventDraft, WorkflowEventDraft],
     ) -> Meeting:
         now = self._clock.now()
         with self._unit_of_work() as uow:
@@ -721,6 +855,15 @@ class MeetingWorkflow:
             )
             uow.reviews.add(review)
             uow.meetings.save(completed, current.version)
+            for handoff in handoffs:
+                uow.workflow_events.append(handoff)
+            append_review_revision(
+                uow.workflow_events,
+                review,
+                ReviewChangeKind.MODEL_CREATED,
+                now,
+            )
+            append_meeting_transition(uow.workflow_events, current, completed, now)
             uow.commit()
         return completed
 
@@ -729,7 +872,7 @@ class MeetingWorkflow:
         meeting: Meeting,
         target: MeetingStatus,
         *,
-        job: ProcessingJob | None = None,
+        job: ProcessingJob,
     ) -> Meeting:
         now = self._clock.now()
         with self._unit_of_work() as uow:
@@ -740,6 +883,7 @@ class MeetingWorkflow:
                 return current
             started = transition_meeting(current, target, now)
             uow.meetings.save(started, current.version)
+            append_meeting_transition(uow.workflow_events, current, started, now)
             uow.commit()
         return started
 
@@ -765,7 +909,7 @@ class MeetingWorkflow:
         target: MeetingStatus,
         failure: WorkflowFailure,
         *,
-        job: ProcessingJob | None = None,
+        job: ProcessingJob,
     ) -> None:
         now = self._clock.now()
         with self._unit_of_work() as uow:
@@ -786,6 +930,7 @@ class MeetingWorkflow:
                 return
             failed = transition_meeting(current, target, now, failure=failure)
             uow.meetings.save(failed, current.version)
+            append_meeting_transition(uow.workflow_events, current, failed, now)
             uow.commit()
 
     def _validate_job(
@@ -804,12 +949,10 @@ class MeetingWorkflow:
     @staticmethod
     def _require_active_job(
         uow: UnitOfWork,
-        job: ProcessingJob | None,
+        job: ProcessingJob,
         stage: ProcessingStage,
         now: datetime,
     ) -> None:
-        if job is None:
-            return
         persisted = uow.processing_jobs.get(job.id)
         active = (
             job.stage is stage

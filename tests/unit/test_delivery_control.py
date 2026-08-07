@@ -36,6 +36,11 @@ from meeting_action_orchestrator.domain.models import (
     WriteIntent,
     WriteReceipt,
 )
+from meeting_action_orchestrator.domain.workflow_events import (
+    DeliveryTransitionMetadata,
+    MeetingTransitionMetadata,
+    WorkflowEventDraft,
+)
 
 NOW = datetime(2026, 8, 7, 14, 0, tzinfo=timezone.utc)
 MEETING_ID = UUID(int=1)
@@ -184,9 +189,26 @@ class Database:
         self.depth = 0
         self.commits = 0
         self.persistence_threads: set[int] = set()
+        self.events: list[WorkflowEventDraft] = []
 
     def unit_of_work(self) -> UnitOfWork:
         return UnitOfWork(self)
+
+
+def delivery_events(database: Database) -> tuple[DeliveryTransitionMetadata, ...]:
+    return tuple(
+        event.safe_metadata
+        for event in database.events
+        if isinstance(event.safe_metadata, DeliveryTransitionMetadata)
+    )
+
+
+def meeting_events(database: Database) -> tuple[MeetingTransitionMetadata, ...]:
+    return tuple(
+        event.safe_metadata
+        for event in database.events
+        if isinstance(event.safe_metadata, MeetingTransitionMetadata)
+    )
 
 
 class MeetingRepository:
@@ -239,6 +261,15 @@ class ReceiptRepository:
 
     def for_intent(self, intent_id: UUID) -> WriteReceipt | None:
         return self.database.receipts.get(intent_id)
+
+
+class EventRepository:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def append(self, draft: WorkflowEventDraft) -> object:
+        self.database.events.append(draft)
+        return draft
 
 
 class DeliveryOperationRepository:
@@ -375,6 +406,7 @@ class UnitOfWork:
         self.write_intents = IntentRepository(database)
         self.write_receipts = ReceiptRepository(database)
         self.delivery_operations = DeliveryOperationRepository(database)
+        self.workflow_events = EventRepository(database)
 
     def __enter__(self) -> UnitOfWork:
         self.database.persistence_threads.add(get_ident())
@@ -400,10 +432,16 @@ class Reconciler:
         self.resolve = resolve
         self.calls: list[UUID] = []
         self.seen_statuses: list[WriteStatus] = []
+        self.actor_ids: list[str | None] = []
 
-    async def reconcile_intent(self, intent_id: UUID) -> object:
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> object:
         assert self.database.depth == 0
         self.calls.append(intent_id)
+        self.actor_ids.append(actor_id)
         intent = self.database.intents[intent_id]
         self.seen_statuses.append(intent.status)
         if self.resolve:
@@ -414,9 +452,14 @@ class Reconciler:
 
 
 class CrashingReconciler(Reconciler):
-    async def reconcile_intent(self, intent_id: UUID) -> object:
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> object:
         assert self.database.depth == 0
         self.calls.append(intent_id)
+        self.actor_ids.append(actor_id)
         raise RuntimeError("connector stopped")
 
 
@@ -426,9 +469,14 @@ class BlockingReconciler(Reconciler):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def reconcile_intent(self, intent_id: UUID) -> object:
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> object:
         assert self.database.depth == 0
         self.calls.append(intent_id)
+        self.actor_ids.append(actor_id)
         self.entered.set()
         await self.release.wait()
         return object()
@@ -439,8 +487,12 @@ class AdvancingReconciler(Reconciler):
         super().__init__(database, resolve=False)
         self.clock = clock
 
-    async def reconcile_intent(self, intent_id: UUID) -> object:
-        result = await super().reconcile_intent(intent_id)
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> object:
+        result = await super().reconcile_intent(intent_id, actor_id)
         self.clock.current += timedelta(seconds=90)
         return result
 
@@ -501,6 +553,13 @@ async def test_retry_queues_a_selected_permanent_failure_and_is_state_idempotent
     assert not reconciler.calls
     assert database.persistence_threads
     assert get_ident() not in database.persistence_threads
+    assert [
+        (event.previous_status, event.current_status) for event in delivery_events(database)
+    ] == [(WriteStatus.PERMANENT_FAILED, WriteStatus.RETRY_WAIT)]
+    assert [
+        (event.previous_status, event.current_status) for event in meeting_events(database)
+    ] == [(MeetingStatus.FILING_FAILED, MeetingStatus.FILING)]
+    assert all(event.actor_id == "owner" for event in database.events)
 
 
 @pytest.mark.asyncio
@@ -517,6 +576,7 @@ async def test_retry_reconciles_unknown_before_it_can_return_to_the_create_queue
     )
 
     assert reconciler.calls == [unknown.id]
+    assert reconciler.actor_ids == ["owner"]
     assert database.intents[unknown.id].status is WriteStatus.SUCCEEDED
     assert result.receipts == (database.receipts[unknown.id],)
 
@@ -549,12 +609,20 @@ async def test_retry_routes_ambiguous_permanent_failures_through_reconciliation(
 
     updated = database.intents[failed.id]
     assert reconciler.calls == [failed.id]
+    assert reconciler.actor_ids == ["owner"]
     assert reconciler.seen_statuses == [WriteStatus.UNKNOWN]
     assert updated.status is WriteStatus.UNKNOWN
     assert updated.next_reconcile_at == NOW
     assert updated.attempt_count == failed.attempt_count
     assert result.intents[0].status is WriteStatus.UNKNOWN
     assert not scheduler.attempts
+    assert [
+        (event.previous_status, event.current_status) for event in delivery_events(database)
+    ] == [(WriteStatus.PERMANENT_FAILED, WriteStatus.UNKNOWN)]
+    assert [
+        (event.previous_status, event.current_status) for event in meeting_events(database)
+    ] == [(MeetingStatus.FILING_FAILED, MeetingStatus.FILING)]
+    assert all(event.actor_id == "owner" for event in database.events)
 
 
 @pytest.mark.asyncio
@@ -573,6 +641,7 @@ async def test_reconcile_calls_only_selected_unknown_intents() -> None:
     )
 
     assert reconciler.calls == [unknown.id]
+    assert reconciler.actor_ids == ["owner"]
     assert tuple(intent.id for intent in result.intents) == (unknown.id, pending.id, failed.id)
     assert database.intents[pending.id].status is WriteStatus.PENDING
     assert database.intents[failed.id].status is WriteStatus.PERMANENT_FAILED
@@ -593,6 +662,7 @@ async def test_empty_selection_applies_to_every_unknown_intent() -> None:
     )
 
     assert reconciler.calls == [first.id, second.id]
+    assert reconciler.actor_ids == ["owner", "owner"]
 
 
 @pytest.mark.asyncio
@@ -632,6 +702,7 @@ async def test_exhausted_failure_is_an_idempotent_noop() -> None:
     assert database.intents[exhausted.id] == exhausted
     assert result.replayed is False
     assert not scheduler.attempts
+    assert not database.events
 
 
 @pytest.mark.asyncio

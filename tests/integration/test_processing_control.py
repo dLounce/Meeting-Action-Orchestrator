@@ -23,6 +23,12 @@ from meeting_action_orchestrator.domain.enums import (
 )
 from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
 from meeting_action_orchestrator.domain.models import Meeting, ProcessingJob, WorkflowFailure
+from meeting_action_orchestrator.domain.workflow_events import (
+    MeetingTransitionMetadata,
+    ProcessingRetryRequestedMetadata,
+    WorkflowEvent,
+    WorkflowEventType,
+)
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOfWork
 from tests.integration.test_processing_jobs import (
@@ -67,6 +73,11 @@ def service(database: Database) -> ProcessingControlService:
         unit_of_work=lambda: SqliteUnitOfWork(database),
         clock=FrozenClock(),
     )
+
+
+def workflow_events(database: Database) -> tuple[WorkflowEvent, ...]:
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        return tuple(uow.workflow_events.list_page(MEETING_ID, cursor=None, limit=100))
 
 
 def set_meeting(
@@ -163,6 +174,14 @@ async def test_retry_resets_failed_job_once_and_returns_authoritative_replay(
     assert replay.meeting.version == 5
     assert replay.jobs[0].status is ProcessingJobStatus.RUNNING
     assert replay.jobs[0].attempt_count == 1
+    events = workflow_events(database)
+    assert [event.type for event in events] == [WorkflowEventType.PROCESSING_RETRY_REQUESTED]
+    metadata = events[0].safe_metadata
+    assert isinstance(metadata, ProcessingRetryRequestedMetadata)
+    assert metadata.stage is ProcessingStage.TRANSCRIPTION
+    assert metadata.previous_attempt_count == 3
+    assert metadata.meeting_version == 5
+    assert events[0].actor_id == "owner"
 
 
 async def test_retry_rejects_stale_versions_and_idempotency_key_rebinding(
@@ -295,6 +314,7 @@ async def test_retry_rolls_back_job_and_meeting_when_binding_insert_fails(
         assert uow.meetings.get(MEETING_ID) == original_meeting
         assert uow.processing_jobs.get(JOB_ID) == original_job
         assert uow.meeting_operations.get("retry-rollback") is None
+    assert not workflow_events(database)
 
 
 async def test_cancellation_is_atomic_and_idempotent(tmp_path: Path) -> None:
@@ -345,6 +365,14 @@ async def test_cancellation_is_atomic_and_idempotent(tmp_path: Path) -> None:
     assert replay.replayed is True
     assert replay.meeting == first.meeting
     assert replay.jobs == first.jobs
+    events = workflow_events(database)
+    assert [event.type for event in events] == [WorkflowEventType.MEETING_TRANSITIONED]
+    metadata = events[0].safe_metadata
+    assert isinstance(metadata, MeetingTransitionMetadata)
+    assert metadata.previous_status is MeetingStatus.INGESTED
+    assert metadata.current_status is MeetingStatus.CANCELLED
+    assert metadata.meeting_version == 1
+    assert events[0].actor_id == "owner"
     with SqliteUnitOfWork(database) as uow:
         assert uow.meeting_operations.get("cancel-one") is not None
     with pytest.raises(IdempotencyConflictError):

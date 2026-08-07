@@ -178,7 +178,7 @@ class OpenAIAgentsRunner:
                 output=output,
                 usage=usage,
                 model=definition.model,
-                provider_request_ids=self._request_ids(result, client_request_id),
+                workflow_request_ids=self._request_ids(result, client_request_id),
             )
         except OpenAIAgentError:
             raise
@@ -415,13 +415,13 @@ class OpenAIAgentsRunner:
         client_request_id: str | None = None,
     ) -> tuple[str, ...]:
         request_ids: list[str] = []
+        client_id = sanitize_provider_identifier(client_request_id)
+        if client_id is not None:
+            request_ids.append(client_id)
         for response in getattr(result, "raw_responses", ()):
             for attribute in ("request_id", "_request_id"):
                 value = sanitize_provider_identifier(getattr(response, attribute, None))
                 if value is not None and value not in request_ids:
                     request_ids.append(value)
                     break
-        if request_ids:
-            return tuple(request_ids)
-        fallback = sanitize_provider_identifier(client_request_id)
-        return (fallback,) if fallback is not None else ()
+        return tuple(request_ids)

@@ -603,6 +603,7 @@ async def test_create_meeting_accepts_bounded_multipart_audio() -> None:
     assert response.headers["etag"] == '"meeting-0"'
     assert workflow.created is not None
     assert workflow.created.ingest_key == "upload-one"
+    assert workflow.created.actor_id == "portfolio-owner"
     assert workflow.content == b"RIFF0000WAVEdata"
 
 
@@ -649,6 +650,32 @@ async def test_create_meeting_rejects_invalid_timezone_before_ingest() -> None:
     assert isinstance(workflow, FakeWorkflow)
     assert response.status_code == 422
     assert workflow.created is None
+
+
+async def test_create_meeting_rejects_request_supplied_actor_identity() -> None:
+    services = dependencies()
+    response = await request(
+        "/v1/meetings",
+        method="POST",
+        services=services,
+        headers=authorization(**{"Idempotency-Key": "upload-one"}),
+        files={
+            "metadata": (
+                None,
+                '{"title":"Release planning","occurred_at":"2026-08-07T09:00:00Z",'
+                '"timezone":"UTC","actor_id":"request-supplied-actor"}',
+                None,
+            ),
+            "recording": ("meeting.wav", b"RIFF0000WAVEdata", "audio/wav"),
+        },
+    )
+
+    workflow = services.workflow
+    assert isinstance(workflow, FakeWorkflow)
+    assert response.status_code == 422
+    assert response.headers["content-type"] == "application/problem+json"
+    assert workflow.created is None
+    assert "request-supplied-actor" not in response.text
 
 
 async def test_ingest_conflict_does_not_disclose_tombstone_state_or_request_key() -> None:

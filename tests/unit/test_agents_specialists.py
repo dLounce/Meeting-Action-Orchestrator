@@ -48,7 +48,7 @@ class FakeRunner:
                 total_tokens=150,
             ),
             model=definition.model,
-            provider_request_ids=("req_1",),
+            workflow_request_ids=("req_1",),
         )
 
 
