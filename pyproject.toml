@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meeting-action-orchestrator"
+version = "0.1.0"
+description = "A review-first meeting workflow that turns recordings into approved follow-up actions."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT" }
+authors = [{ name = "Shubham" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.116,<1",
+    "httpx>=0.28,<1",
+    "jinja2>=3.1,<4",
+    "mcp>=1.12,<2",
+    "openai-agents>=0.2,<1",
+    "pydantic>=2.11,<3",
+    "pydantic-settings>=2.10,<3",
+    "python-multipart>=0.0.20,<1",
+    "uvicorn[standard]>=0.35,<1",
+]
+
+[project.scripts]
+meeting-orchestrator = "meeting_action_orchestrator.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.16,<2",
+    "pytest>=8.4,<9",
+    "pytest-asyncio>=1.0,<2",
+    "pytest-cov>=6.2,<7",
+    "respx>=0.22,<1",
+    "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/meeting_action_orchestrator"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["A", "ANN", "ARG", "ASYNC", "B", "C4", "DTZ", "E", "F", "I", "N", "PERF", "PIE", "PL", "PT", "RET", "RSE", "RUF", "S", "SIM", "T20", "TRY", "UP"]
+ignore = ["ANN401", "PLR0913"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --cov=meeting_action_orchestrator --cov-branch --cov-report=term-missing --cov-fail-under=90"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["meeting_action_orchestrator"]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+show_missing = true
+skip_covered = true
