@@ -17,7 +17,9 @@ SENSITIVE_KEYS = frozenset(
         "content",
         "cookie",
         "credentials",
+        "digest",
         "email",
+        "erasure_hmac_keys",
         "external_id",
         "external_url",
         "filename",
@@ -29,7 +31,9 @@ SENSITIVE_KEYS = frozenset(
         "path",
         "prompt",
         "provider_request_id",
+        "request_fingerprint",
         "secret",
+        "sha256",
         "text",
         "token",
         "transcript",
@@ -42,7 +46,9 @@ def sanitize(value: Any, *, key: str | None = None) -> Any:
     normalized_key = key.lower().replace("-", "_") if key is not None else None
     if normalized_key is not None and (
         normalized_key in SENSITIVE_KEYS
-        or normalized_key.endswith(("_key", "_password", "_secret", "_token"))
+        or normalized_key.endswith(
+            ("_digest", "_fingerprint", "_key", "_keys", "_password", "_secret", "_token")
+        )
     ):
         return REDACTED
     if isinstance(value, Mapping):

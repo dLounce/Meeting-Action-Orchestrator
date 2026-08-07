@@ -14,6 +14,11 @@ def test_sanitize_redacts_nested_sensitive_values() -> None:
         "actor_id": "actor-1",
         "email": "person@example.com",
         "provider_request_id": "provider-1",
+        "digest": "digest-1",
+        "verifier_digest": "digest-2",
+        "erasure_hmac_keys": "encoded-keyring",
+        "request_fingerprint": "fingerprint-1",
+        "sha256": "audio-hash",
         "authorization": "Bearer secret",
         "nested": {
             "transcript": "private meeting",
@@ -30,6 +35,11 @@ def test_sanitize_redacts_nested_sensitive_values() -> None:
         "actor_id": REDACTED,
         "email": REDACTED,
         "provider_request_id": REDACTED,
+        "digest": REDACTED,
+        "verifier_digest": REDACTED,
+        "erasure_hmac_keys": REDACTED,
+        "request_fingerprint": REDACTED,
+        "sha256": REDACTED,
         "authorization": REDACTED,
         "nested": {"transcript": REDACTED, "service_token": REDACTED},
     }
