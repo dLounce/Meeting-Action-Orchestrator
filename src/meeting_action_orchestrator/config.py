@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,7 +31,6 @@ class Settings(BaseSettings):
     app_env: Literal["development", "test", "production"] = "development"
     app_host: str = "127.0.0.1"
     app_port: int = Field(default=8000, ge=1, le=65535)
-    app_base_url: str = "http://127.0.0.1:8000"
     database_path: Path = Path("runtime/orchestrator.sqlite3")
     upload_directory: Path = Path("uploads")
     max_upload_bytes: int = Field(default=26_214_400, gt=0)
@@ -48,13 +49,22 @@ class Settings(BaseSettings):
     openai_recap_max_output_tokens: int = Field(default=2_500, ge=500)
     openai_verifier_max_output_tokens: int = Field(default=3_000, ge=500)
     openai_tracing_enabled: bool = False
-    trace_include_sensitive_data: bool = False
 
     mcp_server_url: str | None = None
     mcp_auth_token: SecretStr | None = None
+    mcp_connector_id: str = Field(default="workspace", min_length=1, max_length=200)
+    mcp_task_resource_id: str | None = Field(default=None, min_length=1, max_length=200)
+    mcp_calendar_resource_id: str | None = Field(default=None, min_length=1, max_length=200)
     mcp_calendar_tool: str = "create_calendar_event"
     mcp_task_tool: str = "create_task"
     mcp_lookup_tool: str = "find_action_by_idempotency_key"
+    mcp_request_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    mcp_sse_timeout_seconds: float = Field(default=300.0, gt=0, le=3_600)
+    mcp_call_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+
+    worker_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    processing_batch_size: int = Field(default=1, ge=1, le=10)
+    delivery_batch_size: int = Field(default=20, ge=1, le=100)
 
     @field_validator("api_bearer_token", "openai_api_key", "mcp_auth_token", mode="before")
     @classmethod
@@ -63,12 +73,36 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("mcp_server_url", mode="before")
+    @field_validator(
+        "mcp_server_url",
+        "mcp_task_resource_id",
+        "mcp_calendar_resource_id",
+        mode="before",
+    )
     @classmethod
-    def empty_url_is_none(cls, value: object) -> object:
+    def empty_optional_text_is_none(cls, value: object) -> object:
         if value == "":
             return None
         return value
+
+    @model_validator(mode="after")
+    def validate_mcp_transport(self) -> Settings:
+        specialist_budget = (
+            self.openai_extractor_max_output_tokens
+            + self.openai_recap_max_output_tokens
+            + self.openai_verifier_max_output_tokens
+        )
+        if self.openai_max_output_tokens_per_run < specialist_budget:
+            raise ValueError("The run output budget must cover all specialist limits")
+        if self.mcp_server_url is None:
+            return self
+        parsed = urlsplit(self.mcp_server_url)
+        loopback = _is_loopback_host(parsed.hostname)
+        if self.app_env == "production" and parsed.scheme != "https" and not loopback:
+            raise ValueError("Production MCP connections must use HTTPS")
+        if self.mcp_auth_token is not None and parsed.scheme != "https" and not loopback:
+            raise ValueError("Authenticated MCP connections must use HTTPS")
+        return self
 
     def require_openai_api_key(self) -> str:
         if self.openai_api_key is None:
@@ -84,3 +118,14 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if host is None:
+        return False
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False

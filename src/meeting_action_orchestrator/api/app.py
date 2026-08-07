@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
+
 from fastapi import FastAPI
 
 from meeting_action_orchestrator.api.contracts import ApiDependencies
@@ -13,9 +16,14 @@ from meeting_action_orchestrator.api.routes import health_router, meeting_router
 from meeting_action_orchestrator.api.security import SecurityHeadersMiddleware
 
 REQUEST_ENVELOPE_BYTES = 1024 * 1024
+Lifespan = Callable[[FastAPI], AbstractAsyncContextManager[None]]
 
 
-def create_app(dependencies: ApiDependencies) -> FastAPI:
+def create_app(
+    dependencies: ApiDependencies,
+    *,
+    lifespan: Lifespan | None = None,
+) -> FastAPI:
     app = FastAPI(
         title="Meeting Action Orchestrator API",
         summary="Review-first meeting transcription and action delivery",
@@ -23,6 +31,7 @@ def create_app(dependencies: ApiDependencies) -> FastAPI:
         docs_url=None,
         redoc_url=None,
         openapi_url="/openapi.json",
+        lifespan=lifespan,
     )
     app.state.api_dependencies = dependencies
     install_problem_handlers(app)
