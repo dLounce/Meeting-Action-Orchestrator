@@ -5,7 +5,11 @@ from uuid import uuid4
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from meeting_action_orchestrator.api.problems import create_problem, problem_response
+from meeting_action_orchestrator.api.problems import (
+    create_problem,
+    problem_instance_from_scope,
+    problem_response,
+)
 
 
 class RequestIdMiddleware:
@@ -119,7 +123,7 @@ class RequestBodyLimitMiddleware:
                 status,
                 detail=detail,
                 type_uri="urn:meeting-action-orchestrator:problem:request-body-size",
-                instance=scope.get("path"),
+                instance=problem_instance_from_scope(scope),
                 request_id=request_id if isinstance(request_id, str) else None,
             )
         )

@@ -6,7 +6,11 @@ from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 from starlette.types import ExceptionHandler
 
-from meeting_action_orchestrator.api.problems import create_problem, problem_response
+from meeting_action_orchestrator.api.problems import (
+    create_problem,
+    problem_instance,
+    problem_response,
+)
 from meeting_action_orchestrator.application.errors import (
     ApplicationError,
     OperationConflictError,
@@ -30,7 +34,7 @@ async def application_error_handler(request: Request, exc: ApplicationError) -> 
         status,
         detail=detail,
         type_uri=type_uri,
-        instance=request.url.path,
+        instance=problem_instance(request),
         request_id=_request_id(request),
     )
     return problem_response(problem, headers=headers)
@@ -48,7 +52,7 @@ async def domain_error_handler(request: Request, exc: DomainError) -> JSONRespon
         status,
         detail=detail,
         type_uri=type_uri,
-        instance=request.url.path,
+        instance=problem_instance(request),
         request_id=_request_id(request),
     )
     return problem_response(problem)

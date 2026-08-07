@@ -98,6 +98,11 @@ def create_test_app() -> FastAPI:
     async def broken() -> None:
         raise RuntimeError(_BROKEN_ROUTE_MESSAGE)
 
+    @app.get("/meetings/{meeting_id}")
+    async def dynamic_meeting(meeting_id: str) -> None:
+        del meeting_id
+        raise HTTPException(status_code=404, detail="Meeting not found")
+
     return app
 
 
@@ -143,6 +148,22 @@ async def test_http_exception_is_rendered_as_problem_detail() -> None:
         "instance": "/missing",
         "request_id": "request-123",
     }
+
+
+async def test_problem_instance_uses_route_template() -> None:
+    response = await get_response("/meetings/private-meeting-id")
+
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["instance"] == "/meetings/{meeting_id}"
+    assert "private-meeting-id" not in response.text
+
+
+async def test_unmatched_route_uses_fixed_problem_instance() -> None:
+    response = await get_response("/private-unmatched-path")
+
+    assert response.status_code == HTTPStatus.NOT_FOUND
+    assert response.json()["instance"] == "/unmatched"
+    assert "private-unmatched-path" not in response.text
 
 
 async def test_structured_http_exception_is_not_reflected() -> None:

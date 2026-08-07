@@ -9,13 +9,14 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
-from starlette.types import ExceptionHandler
+from starlette.types import ExceptionHandler, Scope
 
 VALIDATION_PROBLEM_TYPE = "urn:meeting-action-orchestrator:problem:request-validation"
 INTERNAL_PROBLEM_TYPE = "urn:meeting-action-orchestrator:problem:internal-error"
 MINIMUM_PROBLEM_STATUS = 400
 MAXIMUM_PROBLEM_STATUS = 599
 _INVALID_PROBLEM_STATUS_MESSAGE = "Problem status must be between 400 and 599"
+_UNMATCHED_PROBLEM_INSTANCE = "/unmatched"
 
 
 class FieldViolation(BaseModel):
@@ -96,7 +97,7 @@ async def problem_exception_handler(
 ) -> JSONResponse:
     problem = exc.problem.model_copy(
         update={
-            "instance": exc.problem.instance or request.url.path,
+            "instance": exc.problem.instance or problem_instance(request),
             "request_id": exc.problem.request_id or _request_id(request),
         }
     )
@@ -113,7 +114,7 @@ async def http_exception_handler(
         exc.status_code,
         title=title,
         detail=detail,
-        instance=request.url.path,
+        instance=problem_instance(request),
         request_id=_request_id(request),
     )
     return problem_response(problem, headers=exc.headers)
@@ -137,7 +138,7 @@ async def validation_exception_handler(
                 428,
                 detail="If-Match must identify the meeting version being changed.",
                 type_uri="urn:meeting-action-orchestrator:problem:precondition-required",
-                instance=request.url.path,
+                instance=problem_instance(request),
                 request_id=_request_id(request),
             )
         )
@@ -147,7 +148,7 @@ async def validation_exception_handler(
                 400,
                 detail="Idempotency-Key is required for this operation.",
                 type_uri="urn:meeting-action-orchestrator:problem:idempotency-key-required",
-                instance=request.url.path,
+                instance=problem_instance(request),
                 request_id=_request_id(request),
             )
         )
@@ -157,7 +158,7 @@ async def validation_exception_handler(
         title="Request validation failed",
         detail="One or more request fields are invalid.",
         type_uri=VALIDATION_PROBLEM_TYPE,
-        instance=request.url.path,
+        instance=problem_instance(request),
         request_id=_request_id(request),
         errors=violations,
     )
@@ -172,7 +173,7 @@ async def unhandled_exception_handler(
         500,
         detail="The server could not complete the request.",
         type_uri=INTERNAL_PROBLEM_TYPE,
-        instance=request.url.path,
+        instance=problem_instance(request),
         request_id=_request_id(request),
     )
     return problem_response(problem)
@@ -189,6 +190,16 @@ def install_problem_handlers(app: FastAPI) -> None:
         cast(ExceptionHandler, validation_exception_handler),
     )
     app.add_exception_handler(Exception, cast(ExceptionHandler, unhandled_exception_handler))
+
+
+def problem_instance(request: Request) -> str:
+    return problem_instance_from_scope(request.scope)
+
+
+def problem_instance_from_scope(scope: Scope) -> str:
+    route = scope.get("route")
+    path = getattr(route, "path", None)
+    return path if isinstance(path, str) and path else _UNMATCHED_PROBLEM_INSTANCE
 
 
 def _field_violation(error: Mapping[str, Any]) -> FieldViolation:

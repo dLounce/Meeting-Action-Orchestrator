@@ -919,6 +919,8 @@ async def test_request_body_limit_rejects_declared_oversized_payloads_early() ->
     assert response.status_code == 413
     assert response.headers["content-type"] == "application/problem+json"
     assert response.json()["type"].endswith("request-body-size")
+    assert response.json()["instance"] == "/unmatched"
+    assert MEETING_ID.hex not in response.text
 
 
 async def test_request_body_limit_counts_chunked_payloads() -> None:

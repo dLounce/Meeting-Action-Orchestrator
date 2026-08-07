@@ -49,6 +49,6 @@ def _serve(settings: Settings) -> int:
         host=settings.app_host,
         port=settings.app_port,
         log_config=None,
-        access_log=True,
+        access_log=False,
     )
     return 0

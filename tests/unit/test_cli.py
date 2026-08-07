@@ -47,7 +47,7 @@ def test_serve_command_uses_configured_binding(tmp_path: Path, monkeypatch: Any)
                 "host": configured.app_host,
                 "port": configured.app_port,
                 "log_config": None,
-                "access_log": True,
+                "access_log": False,
             },
         )
     ]
