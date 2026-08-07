@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, ClassVar, Protocol
@@ -114,7 +115,8 @@ class LocalAudioStore:
         self._max_bytes = max_bytes
 
     def put(self, stream: BinaryIO, original_name: str) -> StoredAudio:
-        self._root.mkdir(parents=True, exist_ok=True)
+        self._root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _restrict_permissions(self._root, 0o700)
         safe_name = Path(original_name.replace("\\", "/")).name
         if not safe_name:
             raise AudioValidationError("A filename is required")
@@ -123,7 +125,12 @@ class LocalAudioStore:
         size_bytes = 0
         header = b""
         try:
-            with temporary_path.open("xb") as destination:
+            descriptor = os.open(
+                temporary_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as destination:
                 while chunk := stream.read(1024 * 1024):
                     size_bytes += len(chunk)
                     if size_bytes > self._max_bytes:
@@ -179,3 +186,8 @@ def detect_audio_type(header: bytes) -> str:
     if len(header) >= 12 and header[4:8] == b"ftyp":
         return "audio/mp4"
     raise AudioValidationError("Only MP3, M4A, and WAV recordings are supported")
+
+
+def _restrict_permissions(path: Path, mode: int) -> None:
+    with suppress(OSError):
+        path.chmod(mode)

@@ -10,7 +10,10 @@ def test_sanitize_redacts_nested_sensitive_values() -> None:
     value = {
         "job_id": "job-1",
         "authorization": "Bearer secret",
-        "nested": {"transcript": "private meeting"},
+        "nested": {
+            "transcript": "private meeting",
+            "service_token": "secret",
+        },
     }
 
     result = sanitize(value)
@@ -18,7 +21,7 @@ def test_sanitize_redacts_nested_sensitive_values() -> None:
     assert result == {
         "job_id": "job-1",
         "authorization": REDACTED,
-        "nested": {"transcript": REDACTED},
+        "nested": {"transcript": REDACTED, "service_token": REDACTED},
     }
 
 
@@ -31,3 +34,20 @@ def test_json_formatter_emits_safe_structured_record() -> None:
     assert result["level"] == "info"
     assert result["message"] == "processed"
     assert result["fields"] == {"meeting_id": "meeting-1", "api_key": REDACTED}
+
+
+def test_json_formatter_does_not_interpolate_log_arguments() -> None:
+    record = logging.LogRecord(
+        "test",
+        logging.INFO,
+        __file__,
+        1,
+        "provider failed: %s",
+        ("private transcript",),
+        None,
+    )
+
+    result = json.loads(JsonFormatter().format(record))
+
+    assert result["message"] == "provider failed: %s"
+    assert "private transcript" not in json.dumps(result)

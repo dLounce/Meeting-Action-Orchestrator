@@ -28,7 +28,11 @@ SENSITIVE_KEYS = frozenset(
 
 
 def sanitize(value: Any, *, key: str | None = None) -> Any:
-    if key is not None and key.lower() in SENSITIVE_KEYS:
+    normalized_key = key.lower().replace("-", "_") if key is not None else None
+    if normalized_key is not None and (
+        normalized_key in SENSITIVE_KEYS
+        or normalized_key.endswith(("_key", "_password", "_secret", "_token"))
+    ):
         return REDACTED
     if isinstance(value, Mapping):
         return {
@@ -51,7 +55,9 @@ class JsonFormatter(logging.Formatter):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname.lower(),
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": str(record.msg)
+            if isinstance(record.msg, str)
+            else type(record.msg).__name__,
         }
         fields = getattr(record, "fields", None)
         if isinstance(fields, Mapping):

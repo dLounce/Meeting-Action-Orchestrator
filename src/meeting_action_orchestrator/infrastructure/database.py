@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 SCHEMA_V1 = """
@@ -174,11 +174,15 @@ class Database:
         return self._path
 
     def connect(self) -> sqlite3.Connection:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _restrict_permissions(self._path.parent, 0o700)
         connection = sqlite3.connect(self._path, timeout=5, isolation_level=None)
+        _restrict_permissions(self._path, 0o600)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
+        _restrict_permissions(Path(f"{self._path}-wal"), 0o600)
+        _restrict_permissions(Path(f"{self._path}-shm"), 0o600)
         connection.execute("PRAGMA synchronous = NORMAL")
         connection.execute("PRAGMA busy_timeout = 5000")
         return connection
@@ -214,3 +218,8 @@ class Database:
         with self.connect() as connection:
             result = connection.execute("SELECT 1").fetchone()
         return result is not None and result[0] == 1
+
+
+def _restrict_permissions(path: Path, mode: int) -> None:
+    with suppress(OSError):
+        path.chmod(mode)
