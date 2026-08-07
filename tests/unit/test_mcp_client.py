@@ -96,10 +96,12 @@ class FakeSession:
         events: list[str],
         *,
         initialize_error: Exception | None = None,
+        call_error: Exception | None = None,
         block_calls: bool = False,
     ) -> None:
         self.events = events
         self.initialize_error = initialize_error
+        self.call_error = call_error
         self.block_calls = block_calls
         self.initialize_count = 0
         self.calls: list[
@@ -148,7 +150,35 @@ class FakeSession:
             except asyncio.CancelledError:
                 self.cancelled = True
                 raise
+        if self.call_error is not None:
+            raise self.call_error
         return self.result
+
+
+class ConcurrentFailureSession(FakeSession):
+    def __init__(self, events: list[str], error: Exception) -> None:
+        super().__init__(events)
+        self.error = error
+        self.slow_started = asyncio.Event()
+        self.release_slow = asyncio.Event()
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        read_timeout_seconds: timedelta | None = None,
+        _progress_callback: Any | None = None,
+        *,
+        meta: dict[str, Any] | None = None,
+    ) -> CallToolResult:
+        self.events.append("session.call")
+        self.calls.append((name, arguments, read_timeout_seconds, meta))
+        if name == "tasks.slow":
+            self.slow_started.set()
+            await self.release_slow.wait()
+            return self.result
+        await self.slow_started.wait()
+        raise self.error
 
 
 class SessionFactory:
@@ -217,6 +247,7 @@ async def test_start_initializes_once_and_call_tool_matches_the_mcp_protocol() -
 
     await managed.start()
     await managed.start()
+    assert managed.connected
     result = await managed.call_tool(
         "tasks.create",
         {"title": "Publish brief"},
@@ -224,6 +255,7 @@ async def test_start_initializes_once_and_call_tool_matches_the_mcp_protocol() -
     )
     await managed.close()
     await managed.close()
+    assert not managed.connected
 
     headers, timeout, auth = http_factory.calls[0]
     assert headers == {"Authorization": f"Bearer {credential}"}
@@ -305,6 +337,80 @@ async def test_failed_initialization_closes_every_layer_and_can_be_retried() -> 
 
 
 @pytest.mark.asyncio
+async def test_failed_call_invalidates_the_session_and_reconnects_with_authorization() -> None:
+    events: list[str] = []
+    credential = "-".join(("private", "token"))
+    failure = OSError("connection lost")
+    failed = FakeSession(events, call_error=failure)
+    healthy = FakeSession(events)
+    managed, actual_events, http_factory, _, _, _ = client(
+        token=credential,
+        sessions=(failed, healthy),
+    )
+    failed.events = actual_events
+    healthy.events = actual_events
+    await managed.start()
+
+    with pytest.raises(OSError, match="connection lost") as captured:
+        await managed.call_tool(
+            "tasks.create",
+            {"title": "Publish brief"},
+            meta={"idempotencyKey": "key-one"},
+        )
+
+    assert captured.value is failure
+    assert not managed.connected
+    assert len(failed.calls) == 1
+    assert not healthy.calls
+    assert actual_events[-3:] == ["session.exit", "transport.exit", "http.exit"]
+
+    await managed.start()
+    assert managed.connected
+    result = await managed.call_tool(
+        "tasks.create",
+        {"title": "Publish brief"},
+        meta={"idempotencyKey": "key-one"},
+    )
+    await managed.close()
+
+    assert result is healthy.result
+    assert len(failed.calls) == 1
+    assert len(healthy.calls) == 1
+    assert [call[0] for call in http_factory.calls] == [
+        {"Authorization": f"Bearer {credential}"},
+        {"Authorization": f"Bearer {credential}"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_call_waits_for_other_active_calls_before_closing_session() -> None:
+    events: list[str] = []
+    failure = OSError("connection lost")
+    session = ConcurrentFailureSession(events, failure)
+    managed, actual_events, _, _, _, _ = client(session=session)
+    session.events = actual_events
+    await managed.start()
+    slow = asyncio.create_task(managed.call_tool("tasks.slow"))
+    await session.slow_started.wait()
+    failed = asyncio.create_task(managed.call_tool("tasks.fail"))
+    await asyncio.sleep(0.01)
+
+    assert not managed.connected
+    assert "session.exit" not in actual_events
+    with pytest.raises(McpClientNotStartedError):
+        await managed.call_tool("tasks.create")
+
+    session.release_slow.set()
+    assert await slow is session.result
+    with pytest.raises(OSError, match="connection lost") as captured:
+        await failed
+    await managed.close()
+
+    assert captured.value is failure
+    assert actual_events[-3:] == ["session.exit", "transport.exit", "http.exit"]
+
+
+@pytest.mark.asyncio
 async def test_call_timeout_cancels_the_in_flight_session_request() -> None:
     events: list[str] = []
     session = FakeSession(events, block_calls=True)
@@ -316,6 +422,8 @@ async def test_call_timeout_cancels_the_in_flight_session_request() -> None:
         await managed.call_tool("tasks.create")
 
     assert session.cancelled is True
+    assert not managed.connected
+    assert actual_events[-3:] == ["session.exit", "transport.exit", "http.exit"]
     await managed.close()
 
 
@@ -332,6 +440,7 @@ async def test_caller_cancellation_propagates_and_close_still_completes() -> Non
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert not managed.connected
     await managed.close()
 
     assert session.cancelled is True

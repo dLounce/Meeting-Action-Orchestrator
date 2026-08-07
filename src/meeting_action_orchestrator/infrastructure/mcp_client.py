@@ -117,6 +117,7 @@ class _Lifecycle(Enum):
     NEW = "new"
     STARTING = "starting"
     STARTED = "started"
+    RECOVERING = "recovering"
     CLOSING = "closing"
     CLOSED = "closed"
 
@@ -193,8 +194,12 @@ class ManagedMcpHttpClient:
     ) -> None:
         await self.close()
 
+    @property
+    def connected(self) -> bool:
+        return self._lifecycle is _Lifecycle.STARTED and self._session is not None
+
     async def start(self) -> None:
-        async with self._lifecycle_lock:
+        async with self._close_lock, self._lifecycle_lock:
             if self._lifecycle is _Lifecycle.STARTED:
                 return
             if self._lifecycle in {_Lifecycle.CLOSING, _Lifecycle.CLOSED}:
@@ -239,7 +244,6 @@ class ManagedMcpHttpClient:
             self._stack = stack
             self._session = managed_session
             self._lifecycle = _Lifecycle.STARTED
-            self._headers = {}
 
     async def close(self) -> None:
         async with self._close_lock:
@@ -282,6 +286,7 @@ class ManagedMcpHttpClient:
         meta: dict[str, Any] | None = None,
     ) -> CallToolResult:
         session = await self._acquire_call()
+        failed = False
         try:
             timeout = timedelta(seconds=self._call_timeout)
             with anyio.fail_after(self._call_timeout):
@@ -291,8 +296,14 @@ class ManagedMcpHttpClient:
                     read_timeout_seconds=timeout,
                     meta=meta,
                 )
+        except BaseException:
+            failed = True
+            raise
         finally:
             await self._release_call()
+            if failed:
+                with anyio.CancelScope(shield=True), suppress(BaseException):
+                    await self._invalidate(session)
 
     async def _acquire_call(self) -> Session:
         async with self._lifecycle_lock:
@@ -311,6 +322,25 @@ class ManagedMcpHttpClient:
                 self._active_calls -= 1
                 if self._active_calls == 0:
                     self._idle.set()
+
+    async def _invalidate(self, session: Session) -> None:
+        async with self._close_lock:
+            async with self._lifecycle_lock:
+                if self._lifecycle is not _Lifecycle.STARTED or self._session is not session:
+                    return
+                self._lifecycle = _Lifecycle.RECOVERING
+                idle = self._idle
+                stack = self._stack
+                self._session = None
+                self._stack = None
+            await idle.wait()
+            try:
+                if stack is not None:
+                    await stack.aclose()
+            finally:
+                async with self._lifecycle_lock:
+                    if self._lifecycle is _Lifecycle.RECOVERING:
+                        self._lifecycle = _Lifecycle.NEW
 
 
 def _validated_endpoint(value: str) -> str:

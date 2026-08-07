@@ -30,6 +30,7 @@ from meeting_action_orchestrator.api.contracts import (
 )
 from meeting_action_orchestrator.application.delivery import (
     ApprovedOutboxExecutor,
+    DeliveryBatch,
     PersistedApprovalAuthorizer,
 )
 from meeting_action_orchestrator.application.delivery import (
@@ -78,10 +79,13 @@ class ProcessingRunner(Protocol):
 
 
 class DeliveryRunner(Protocol):
-    async def run_once(self, limit: int = 20) -> object: ...
+    async def run_once(self, limit: int = 20) -> DeliveryBatch: ...
 
 
 class McpLifecycle(Protocol):
+    @property
+    def connected(self) -> bool: ...
+
     async def start(self) -> None: ...
 
     async def close(self) -> None: ...
@@ -103,7 +107,6 @@ class RuntimeSupervisor:
     closeables: tuple[AsyncCloser, ...] = ()
     _started: bool = field(default=False, init=False)
     _stopped: bool = field(default=False, init=False)
-    _mcp_ready: bool = field(default=False, init=False)
     _tasks: list[asyncio.Task[None]] = field(default_factory=list, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
@@ -123,7 +126,7 @@ class RuntimeSupervisor:
 
     @property
     def delivery_ready(self) -> bool:
-        return self.mcp_client is None or self._mcp_ready
+        return self.mcp_client is None or self.mcp_client.connected
 
     @property
     def started(self) -> bool:
@@ -173,7 +176,7 @@ class RuntimeSupervisor:
 
     async def stop(self) -> None:
         async with self._lock:
-            if not self._started and not self._tasks and not self._mcp_ready:
+            if not self._started and not self._tasks:
                 return
             await self._cancel_workers()
             try:
@@ -222,7 +225,10 @@ class RuntimeSupervisor:
         while True:
             try:
                 await self._connect_mcp()
-                await self.delivery.run_once(self.delivery_batch_size)
+                for _ in range(self.delivery_batch_size):
+                    batch = await self.delivery.run_once(1)
+                    if not batch.results or not self.delivery_ready:
+                        break
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -233,10 +239,9 @@ class RuntimeSupervisor:
             await asyncio.sleep(self.poll_interval_seconds)
 
     async def _connect_mcp(self) -> None:
-        if self.mcp_client is None or self._mcp_ready:
+        if self.mcp_client is None or self.mcp_client.connected:
             return
         await self.mcp_client.start()
-        self._mcp_ready = True
         logger.info("delivery connector ready")
 
     async def _cancel_workers(self) -> None:
@@ -265,7 +270,6 @@ class RuntimeSupervisor:
             *(resource.close() for resource in resources),
             return_exceptions=True,
         )
-        self._mcp_ready = False
         failures = sum(isinstance(result, BaseException) for result in results)
         if failures:
             logger.error(
