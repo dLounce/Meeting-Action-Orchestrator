@@ -29,6 +29,7 @@ from meeting_action_orchestrator.application.mapping import DeliveryTargets
 from meeting_action_orchestrator.application.reviewing import ActionEdit
 from meeting_action_orchestrator.application.workflow import IngestMeeting, MeetingWorkflow
 from meeting_action_orchestrator.domain.enums import MeetingStatus, ReviewOrigin, WriteKind
+from meeting_action_orchestrator.domain.errors import IdempotencyConflictError
 from meeting_action_orchestrator.domain.models import ConnectorTarget
 from meeting_action_orchestrator.infrastructure.audio import AudioMetadata, StoredAudio
 from meeting_action_orchestrator.infrastructure.database import Database
@@ -69,6 +70,9 @@ class FakeRecordingStore:
 
     def path(self, storage_key: str) -> Path:
         return self.root / storage_key
+
+    def delete(self, storage_key: str) -> None:
+        self.path(storage_key).unlink(missing_ok=True)
 
 
 class FakeTranscriber:
@@ -198,6 +202,49 @@ def workflow(tmp_path: Path) -> tuple[MeetingWorkflow, Database]:
         max_agent_output_tokens=12_000,
     )
     return service, database
+
+
+def test_conflicting_ingest_removes_the_unreferenced_recording(tmp_path: Path) -> None:
+    service, _ = workflow(tmp_path)
+    command = IngestMeeting(
+        title="Raw meeting",
+        occurred_at=NOW,
+        timezone="Asia/Calcutta",
+        original_name="meeting.wav",
+        ingest_key="upload-one",
+    )
+    service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEfirst"))
+
+    with pytest.raises(IdempotencyConflictError):
+        service.ingest(command, io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEsecond"))
+
+    recordings = tuple((tmp_path / "audio").glob("*.wav"))
+    assert len(recordings) == 1
+
+
+def test_duplicate_content_keeps_the_shared_recording(tmp_path: Path) -> None:
+    service, _ = workflow(tmp_path)
+    content = b"RIFF\x00\x00\x00\x00WAVEshared"
+    first = IngestMeeting(
+        title="First meeting",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="first.wav",
+        ingest_key="upload-one",
+    )
+    second = IngestMeeting(
+        title="Second meeting",
+        occurred_at=NOW,
+        timezone="UTC",
+        original_name="second.wav",
+        ingest_key="upload-two",
+    )
+
+    service.ingest(first, io.BytesIO(content))
+    service.ingest(second, io.BytesIO(content))
+
+    recordings = tuple((tmp_path / "audio").glob("*.wav"))
+    assert len(recordings) == 1
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,6 +103,8 @@ class RecordingStore(Protocol):
 
     def path(self, storage_key: str) -> Path: ...
 
+    def delete(self, storage_key: str) -> None: ...
+
 
 class TranscriptionProvider(Protocol):
     async def transcribe(
@@ -191,47 +194,58 @@ class MeetingWorkflow:
         if command.occurred_at.tzinfo is None or command.occurred_at.utcoffset() is None:
             raise ValueError("Meeting time must include a UTC offset")
         stored = self._recording_store.put(stream, command.original_name)
-        now = self._clock.now()
-        with self._unit_of_work() as uow:
-            existing = uow.meetings.find_by_ingest_key(command.ingest_key)
-            if existing is not None:
-                asset = _required(uow.audio_assets.get(existing.audio_asset_id), "Audio asset")
-                if asset.sha256 != stored.sha256:
-                    raise IdempotencyConflictError(command.ingest_key)
-                return existing
-            asset = uow.audio_assets.find_by_sha256(stored.sha256)
-            if asset is None:
-                asset = AudioAsset(
+        try:
+            now = self._clock.now()
+            with self._unit_of_work() as uow:
+                existing = uow.meetings.find_by_ingest_key(command.ingest_key)
+                if existing is not None:
+                    asset = _required(uow.audio_assets.get(existing.audio_asset_id), "Audio asset")
+                    if asset.sha256 != stored.sha256:
+                        raise IdempotencyConflictError(command.ingest_key)
+                    return existing
+                asset = uow.audio_assets.find_by_sha256(stored.sha256)
+                if asset is None:
+                    asset = AudioAsset(
+                        id=uuid4(),
+                        storage_key=stored.storage_key,
+                        original_name=stored.original_name,
+                        detected_media_type=AudioMediaType(stored.metadata.media_type),
+                        size_bytes=stored.size_bytes,
+                        duration_ms=stored.metadata.duration_ms,
+                        sha256=stored.sha256,
+                        created_at=now,
+                    )
+                    uow.audio_assets.add(asset)
+                meeting = Meeting(
                     id=uuid4(),
-                    storage_key=stored.storage_key,
-                    original_name=stored.original_name,
-                    detected_media_type=AudioMediaType(stored.metadata.media_type),
-                    size_bytes=stored.size_bytes,
-                    duration_ms=stored.metadata.duration_ms,
-                    sha256=stored.sha256,
+                    ingest_key=command.ingest_key,
+                    title=command.title,
+                    audio_asset_id=asset.id,
+                    occurred_at=command.occurred_at,
+                    timezone=command.timezone,
+                    participants=command.participants,
                     created_at=now,
+                    updated_at=now,
                 )
-                uow.audio_assets.add(asset)
-            meeting = Meeting(
-                id=uuid4(),
-                ingest_key=command.ingest_key,
-                title=command.title,
-                audio_asset_id=asset.id,
-                occurred_at=command.occurred_at,
-                timezone=command.timezone,
-                participants=command.participants,
-                created_at=now,
-                updated_at=now,
-            )
-            uow.meetings.add(meeting)
-            self._processing_scheduler.enqueue_in(
-                uow,
-                meeting.id,
-                ProcessingStage.TRANSCRIPTION,
-                scheduled_at=now,
-            )
-            uow.commit()
+                uow.meetings.add(meeting)
+                self._processing_scheduler.enqueue_in(
+                    uow,
+                    meeting.id,
+                    ProcessingStage.TRANSCRIPTION,
+                    scheduled_at=now,
+                )
+                uow.commit()
+        except BaseException:
+            self._discard_unreferenced_recording(stored)
+            raise
         return meeting
+
+    def _discard_unreferenced_recording(self, stored: StoredAudio) -> None:
+        with suppress(Exception):
+            with self._unit_of_work() as uow:
+                referenced = uow.audio_assets.find_by_sha256(stored.sha256)
+            if referenced is None:
+                self._recording_store.delete(stored.storage_key)
 
     async def process(self, meeting_id: UUID) -> Meeting:
         meeting = self.get_meeting(meeting_id)
