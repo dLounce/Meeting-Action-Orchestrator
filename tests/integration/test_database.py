@@ -19,7 +19,7 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 9
+    assert version == 10
     assert {
         "approvals",
         "audio_assets",
@@ -46,8 +46,8 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 9
-    assert database.migrate() == 9
+    assert database.migrate() == 10
+    assert database.migrate() == 10
     assert database.healthcheck()
 
 
@@ -259,7 +259,7 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
     database = Database(path)
 
-    assert database.migrate() == 9
+    assert database.migrate() == 10
     with database.connect() as connection:
         tables = connection.execute(
             """

@@ -328,6 +328,10 @@ def test_version_six_migration_makes_existing_unknown_writes_due(tmp_path: Path)
         connection.execute("DROP INDEX idx_review_revisions_transcript_id")
         connection.execute("DROP INDEX idx_approvals_review_revision_id")
         connection.execute("DROP INDEX idx_recap_artifacts_meeting_id")
+        connection.execute("DROP TRIGGER workflow_events_reject_duplicate_id_insert")
+        connection.execute("DROP TRIGGER workflow_events_require_contiguous_insert")
+        connection.execute("DROP TRIGGER workflow_events_reject_update")
+        connection.execute("DROP TRIGGER workflow_events_reject_direct_delete")
         connection.execute("DROP TRIGGER audio_assets_reject_cleanup_insert")
         connection.execute("DROP TRIGGER audio_assets_reject_cleanup_update")
         connection.execute("DROP TABLE recording_cleanup_jobs")
@@ -350,7 +354,7 @@ def test_version_six_migration_makes_existing_unknown_writes_due(tmp_path: Path)
         )
         connection.execute("PRAGMA user_version = 5")
 
-    assert database.migrate() == 9
+    assert database.migrate() == 10
     with SqliteUnitOfWork(database, immediate=False) as restarted:
         due = restarted.write_intents.list_unknown_ids(NOW, 1)
         loaded = restarted.write_intents.get(INTENT_ID)

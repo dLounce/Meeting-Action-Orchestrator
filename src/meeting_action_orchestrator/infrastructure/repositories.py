@@ -44,6 +44,9 @@ from meeting_action_orchestrator.domain.models import (
     WriteReceipt,
 )
 from meeting_action_orchestrator.infrastructure.database import Database
+from meeting_action_orchestrator.infrastructure.workflow_events import (
+    SqliteWorkflowEventRepository,
+)
 
 
 class PersistenceConflictError(RuntimeError):
@@ -2374,6 +2377,7 @@ class SqliteUnitOfWork:
         self.processing_jobs: SqliteProcessingJobRepository
         self.write_intents: SqliteWriteIntentRepository
         self.write_receipts: SqliteWriteReceiptRepository
+        self.workflow_events: SqliteWorkflowEventRepository
 
     def __enter__(self) -> SqliteUnitOfWork:
         connection = self._database.connect()
@@ -2398,6 +2402,10 @@ class SqliteUnitOfWork:
         self.processing_jobs = SqliteProcessingJobRepository(connection)
         self.write_intents = SqliteWriteIntentRepository(connection)
         self.write_receipts = SqliteWriteReceiptRepository(connection)
+        self.workflow_events = SqliteWorkflowEventRepository(
+            connection,
+            writable=self._immediate,
+        )
         return self
 
     def __exit__(

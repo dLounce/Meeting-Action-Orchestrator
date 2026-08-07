@@ -46,6 +46,11 @@ from meeting_action_orchestrator.domain.models import (
     WriteIntent,
     WriteReceipt,
 )
+from meeting_action_orchestrator.domain.workflow_events import (
+    WORKFLOW_SEQUENCE_MAX,
+    WorkflowEvent,
+    WorkflowEventDraft,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +183,22 @@ class MeetingListCursor:
     def __post_init__(self) -> None:
         if self.created_at.utcoffset() is None:
             raise ValueError("created_at must include a UTC offset")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowEventCursor:
+    meeting_id: UUID
+    sequence: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.meeting_id, UUID):
+            raise ValueError("meeting_id must be a UUID")
+        if (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or not 1 <= self.sequence <= WORKFLOW_SEQUENCE_MAX
+        ):
+            raise ValueError("sequence must be a positive workflow event sequence")
 
 
 class MeetingRepository(Protocol):
@@ -517,6 +538,18 @@ class WriteReceiptRepository(Protocol):
     def find_by_idempotency_key(self, idempotency_key: str) -> WriteReceipt | None: ...
 
 
+class WorkflowEventRepository(Protocol):
+    def append(self, draft: WorkflowEventDraft) -> WorkflowEvent: ...
+
+    def list_page(
+        self,
+        meeting_id: UUID,
+        *,
+        cursor: WorkflowEventCursor | None,
+        limit: int,
+    ) -> Sequence[WorkflowEvent]: ...
+
+
 class UnitOfWork(Protocol):
     meetings: MeetingRepository
     ingest_requests: IngestRequestBindingRepository
@@ -536,6 +569,7 @@ class UnitOfWork(Protocol):
     processing_jobs: ProcessingJobRepository
     write_intents: WriteIntentRepository
     write_receipts: WriteReceiptRepository
+    workflow_events: WorkflowEventRepository
 
     def __enter__(self) -> UnitOfWork: ...
 

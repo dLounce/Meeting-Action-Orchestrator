@@ -1156,6 +1156,62 @@ def _expand_utc_checks(template: str) -> str:
 
 SCHEMA_V9 = _expand_utc_checks(_SCHEMA_V9_TEMPLATE)
 
+SCHEMA_V10 = """
+CREATE TABLE workflow_events_v10_guard (
+    valid INTEGER NOT NULL CHECK (valid = 1)
+);
+INSERT INTO workflow_events_v10_guard (valid)
+SELECT CASE
+    WHEN EXISTS (
+        SELECT 1
+        FROM (
+            SELECT
+                sequence,
+                ROW_NUMBER() OVER (
+                    PARTITION BY meeting_id ORDER BY sequence
+                ) AS expected_sequence
+            FROM workflow_events
+        )
+        WHERE typeof(sequence) <> 'integer'
+           OR sequence <> expected_sequence
+    ) THEN 0
+    ELSE 1
+END;
+DROP TABLE workflow_events_v10_guard;
+CREATE TRIGGER workflow_events_reject_duplicate_id_insert
+BEFORE INSERT ON workflow_events
+WHEN EXISTS (
+    SELECT 1 FROM workflow_events WHERE id = NEW.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow event identity already exists');
+END;
+CREATE TRIGGER workflow_events_require_contiguous_insert
+BEFORE INSERT ON workflow_events
+WHEN typeof(NEW.sequence) <> 'integer'
+    OR NEW.sequence <> (
+        SELECT COALESCE(MAX(sequence), 0) + 1
+        FROM workflow_events
+        WHERE meeting_id = NEW.meeting_id
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'workflow event sequence is not contiguous');
+END;
+CREATE TRIGGER workflow_events_reject_update
+BEFORE UPDATE ON workflow_events
+BEGIN
+    SELECT RAISE(ABORT, 'workflow events are append-only');
+END;
+CREATE TRIGGER workflow_events_reject_direct_delete
+BEFORE DELETE ON workflow_events
+WHEN EXISTS (
+    SELECT 1 FROM meetings WHERE id = OLD.meeting_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow events are append-only');
+END;
+"""
+
 MIGRATIONS = (
     (1, SCHEMA_V1),
     (2, SCHEMA_V2),
@@ -1166,6 +1222,7 @@ MIGRATIONS = (
     (7, SCHEMA_V7),
     (8, SCHEMA_V8),
     (9, SCHEMA_V9),
+    (10, SCHEMA_V10),
 )
 
 
