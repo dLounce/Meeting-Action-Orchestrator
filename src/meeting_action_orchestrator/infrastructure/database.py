@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+SCHEMA_V1 = """
+CREATE TABLE IF NOT EXISTS audio_assets (
+    id TEXT PRIMARY KEY,
+    storage_key TEXT NOT NULL UNIQUE,
+    original_name TEXT NOT NULL,
+    media_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK (size_bytes > 0),
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms > 0),
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audio_assets_sha256 ON audio_assets (sha256);
+CREATE TABLE IF NOT EXISTS meetings (
+    id TEXT PRIMARY KEY,
+    ingest_key TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    audio_asset_id TEXT NOT NULL REFERENCES audio_assets (id),
+    occurred_at TEXT,
+    timezone TEXT NOT NULL,
+    participants_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current_transcript_id TEXT,
+    current_review_id TEXT,
+    approved_review_id TEXT,
+    failure_json TEXT,
+    version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_meetings_status_updated ON meetings (status, updated_at);
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+    next_attempt_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_failure_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (meeting_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_claim
+ON processing_jobs (stage, status, next_attempt_at, lease_expires_at);
+CREATE TABLE IF NOT EXISTS transcripts (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    audio_asset_id TEXT NOT NULL REFERENCES audio_assets (id),
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    language TEXT,
+    segments_json TEXT NOT NULL,
+    text TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    provider_request_id TEXT,
+    usage_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transcripts_meeting_created
+ON transcripts (meeting_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS review_revisions (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    transcript_id TEXT NOT NULL REFERENCES transcripts (id),
+    revision_number INTEGER NOT NULL CHECK (revision_number > 0),
+    origin TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    actor_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (meeting_id, revision_number)
+);
+CREATE INDEX IF NOT EXISTS idx_review_revisions_meeting
+ON review_revisions (meeting_id, revision_number DESC);
+CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL UNIQUE REFERENCES meetings (id) ON DELETE CASCADE,
+    review_revision_id TEXT NOT NULL REFERENCES review_revisions (id),
+    review_digest TEXT NOT NULL,
+    request_key TEXT NOT NULL UNIQUE,
+    actor_id TEXT NOT NULL,
+    approved_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recap_artifacts (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    approval_id TEXT NOT NULL UNIQUE REFERENCES approvals (id) ON DELETE CASCADE,
+    format TEXT NOT NULL,
+    content TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS write_intents (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    approval_id TEXT NOT NULL REFERENCES approvals (id) ON DELETE CASCADE,
+    source_action_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    connector_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    next_attempt_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    external_id TEXT,
+    external_url TEXT,
+    last_failure_json TEXT,
+    version INTEGER NOT NULL DEFAULT 0 CHECK (version >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (approval_id, kind, source_action_id)
+);
+CREATE INDEX IF NOT EXISTS idx_write_intents_claim
+ON write_intents (status, next_attempt_at, lease_expires_at);
+CREATE TABLE IF NOT EXISTS write_attempts (
+    id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL REFERENCES write_intents (id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL CHECK (attempt_number > 0),
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    outcome TEXT,
+    provider_request_id TEXT,
+    sanitized_failure_json TEXT,
+    UNIQUE (intent_id, attempt_number)
+);
+CREATE TABLE IF NOT EXISTS write_receipts (
+    id TEXT PRIMARY KEY,
+    intent_id TEXT NOT NULL UNIQUE REFERENCES write_intents (id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_digest TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    external_url TEXT,
+    reconciled INTEGER NOT NULL CHECK (reconciled IN (0, 1)),
+    recorded_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow_events (
+    id TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    type TEXT NOT NULL,
+    actor_id TEXT,
+    safe_metadata_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE (meeting_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_meeting_sequence
+ON workflow_events (meeting_id, sequence);
+"""
+
+MIGRATIONS = ((1, SCHEMA_V1),)
+
+
+class Database:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def connect(self) -> sqlite3.Connection:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self._path, timeout=5, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        return connection
+
+    @contextmanager
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        connection = self.connect()
+        connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        try:
+            yield connection
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+        finally:
+            connection.close()
+
+    def migrate(self) -> int:
+        with self.transaction(immediate=True) as connection:
+            current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            for version, sql in MIGRATIONS:
+                if version <= current:
+                    continue
+                for statement in sql.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.execute(f"PRAGMA user_version = {version}")
+                current = version
+        return current
+
+    def healthcheck(self) -> bool:
+        with self.connect() as connection:
+            result = connection.execute("SELECT 1").fetchone()
+        return result is not None and result[0] == 1
