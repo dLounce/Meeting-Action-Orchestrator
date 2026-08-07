@@ -18,7 +18,7 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 2
+    assert version == 3
     assert {
         "approvals",
         "audio_assets",
@@ -38,8 +38,8 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 2
-    assert database.migrate() == 2
+    assert database.migrate() == 3
+    assert database.migrate() == 3
     assert database.healthcheck()
 
 
@@ -50,7 +50,7 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
     database = Database(path)
 
-    assert database.migrate() == 2
+    assert database.migrate() == 3
     with database.connect() as connection:
         table = connection.execute(
             """
@@ -59,6 +59,20 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
             """
         ).fetchone()
     assert table is not None
+
+
+def test_migrate_adds_meeting_keyset_indexes(tmp_path: Path) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+
+    with database.connect() as connection:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'meetings'"
+        ).fetchall()
+
+    names = {row["name"] for row in rows}
+    assert "idx_meetings_created_id" in names
+    assert "idx_meetings_status_created_id" in names
 
 
 def test_transaction_rolls_back_on_failure(tmp_path: Path) -> None:

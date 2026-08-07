@@ -15,6 +15,8 @@ from pydantic import (
 
 from meeting_action_orchestrator.api.contracts import (
     DeliveryResult,
+    MeetingPageResult,
+    ProcessingResult,
     ReadinessResult,
 )
 from meeting_action_orchestrator.application.workflow import ApprovalResult
@@ -22,6 +24,8 @@ from meeting_action_orchestrator.domain.enums import (
     FailureCode,
     FailureDisposition,
     MeetingStatus,
+    ProcessingJobStatus,
+    ProcessingStage,
     ReviewOrigin,
     WriteKind,
     WriteStatus,
@@ -33,6 +37,8 @@ from meeting_action_orchestrator.domain.models import (
     Meeting,
     OpenQuestion,
     PersonRef,
+    ProcessingJob,
+    RecapArtifact,
     ReviewIssue,
     ReviewRevision,
     Risk,
@@ -186,6 +192,91 @@ class MeetingResponse(ApiModel):
             version=meeting.version,
             created_at=meeting.created_at,
             updated_at=meeting.updated_at,
+        )
+
+
+class MeetingListResponse(ApiModel):
+    items: tuple[MeetingResponse, ...]
+    next_cursor: str | None
+
+    @classmethod
+    def from_result(
+        cls,
+        result: MeetingPageResult,
+        next_cursor: str | None,
+    ) -> MeetingListResponse:
+        return cls(
+            items=tuple(MeetingResponse.from_domain(item) for item in result.items),
+            next_cursor=next_cursor,
+        )
+
+
+class ProcessingJobResponse(ApiModel):
+    id: UUID
+    stage: ProcessingStage
+    status: ProcessingJobStatus
+    attempt_count: int
+    max_attempts: int
+    next_attempt_at: datetime | None
+    failure: FailureResponse | None
+    created_at: datetime
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, job: ProcessingJob) -> ProcessingJobResponse:
+        failure = job.last_failure
+        return cls(
+            id=job.id,
+            stage=job.stage,
+            status=job.status,
+            attempt_count=job.attempt_count,
+            max_attempts=job.max_attempts,
+            next_attempt_at=job.next_attempt_at,
+            failure=(
+                FailureResponse(
+                    code=failure.code,
+                    disposition=failure.disposition,
+                    message=failure.safe_message,
+                    occurred_at=failure.occurred_at,
+                )
+                if failure is not None
+                else None
+            ),
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+        )
+
+
+class ProcessingResponse(ApiModel):
+    meeting_id: UUID
+    jobs: tuple[ProcessingJobResponse, ...]
+
+    @classmethod
+    def from_result(cls, result: ProcessingResult) -> ProcessingResponse:
+        return cls(
+            meeting_id=result.meeting_id,
+            jobs=tuple(ProcessingJobResponse.from_domain(job) for job in result.jobs),
+        )
+
+
+class RecapResponse(ApiModel):
+    id: UUID
+    meeting_id: UUID
+    approval_id: UUID
+    format: Literal["markdown"] = "markdown"
+    content: str
+    sha256: str
+    created_at: datetime
+
+    @classmethod
+    def from_domain(cls, recap: RecapArtifact) -> RecapResponse:
+        return cls(
+            id=recap.id,
+            meeting_id=recap.meeting_id,
+            approval_id=recap.approval_id,
+            content=recap.content,
+            sha256=recap.sha256,
+            created_at=recap.created_at,
         )
 
 

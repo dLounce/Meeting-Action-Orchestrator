@@ -4,14 +4,17 @@ from dataclasses import dataclass
 from typing import BinaryIO, Protocol
 from uuid import UUID
 
+from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
     IngestMeeting,
 )
-from meeting_action_orchestrator.domain.enums import WriteKind
+from meeting_action_orchestrator.domain.enums import MeetingStatus, WriteKind
 from meeting_action_orchestrator.domain.models import (
     Meeting,
+    ProcessingJob,
+    RecapArtifact,
     ReviewRevision,
     Transcript,
     WriteIntent,
@@ -47,6 +50,18 @@ class DeliveryResult:
     replayed: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class MeetingPageResult:
+    items: tuple[Meeting, ...]
+    next_cursor: MeetingListCursor | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessingResult:
+    meeting_id: UUID
+    jobs: tuple[ProcessingJob, ...]
+
+
 class Authenticator(Protocol):
     async def authenticate(self, token: str) -> Principal | None: ...
 
@@ -57,8 +72,6 @@ class ReadinessProbe(Protocol):
 
 class MeetingWorkflowService(Protocol):
     async def ingest(self, command: IngestMeeting, stream: BinaryIO) -> Meeting: ...
-
-    async def process(self, meeting_id: UUID) -> Meeting: ...
 
     async def get_meeting(self, meeting_id: UUID) -> Meeting: ...
 
@@ -73,9 +86,21 @@ class MeetingWorkflowService(Protocol):
 
 
 class MeetingQueryService(Protocol):
+    async def list_meetings(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> MeetingPageResult: ...
+
+    async def get_processing(self, meeting_id: UUID) -> ProcessingResult: ...
+
     async def get_transcript(self, meeting_id: UUID) -> Transcript: ...
 
     async def get_review(self, meeting_id: UUID) -> ReviewRevision: ...
+
+    async def get_recap(self, meeting_id: UUID) -> RecapArtifact: ...
 
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult: ...
 

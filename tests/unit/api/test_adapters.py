@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import BinaryIO, cast
 from uuid import UUID
 
@@ -16,7 +16,11 @@ from meeting_action_orchestrator.api.adapters import (
     UnitOfWorkQueryFacade,
 )
 from meeting_action_orchestrator.application.delivery_control import DeliveryControlResult
-from meeting_action_orchestrator.application.errors import OperationConflictError
+from meeting_action_orchestrator.application.errors import (
+    OperationConflictError,
+    ResourceNotFoundError,
+)
+from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
@@ -26,9 +30,18 @@ from meeting_action_orchestrator.application.workflow import (
 from meeting_action_orchestrator.domain.enums import (
     IssueStatus,
     MeetingStatus,
+    ProcessingJobStatus,
+    ProcessingStage,
     WriteKind,
 )
-from meeting_action_orchestrator.domain.models import Approval, Meeting, ReviewRevision, Transcript
+from meeting_action_orchestrator.domain.models import (
+    Approval,
+    Meeting,
+    ProcessingJob,
+    RecapArtifact,
+    ReviewRevision,
+    Transcript,
+)
 from tests.unit.api.test_app import (
     ACTION_ID,
     APPROVAL_ID,
@@ -36,6 +49,7 @@ from tests.unit.api.test_app import (
     MEETING_ID,
     REVIEW_ID,
     meeting,
+    recap,
     review,
     transcript,
 )
@@ -151,10 +165,9 @@ async def test_workflow_facade_offloads_ingest_and_status_reads() -> None:
     )
 
     await facade.ingest(command, io.BytesIO(b"audio"))
-    await facade.get_meeting(MEETING_ID)
-    processing_status = await facade.process(MEETING_ID)
+    loaded = await facade.get_meeting(MEETING_ID)
 
-    assert processing_status == versioned_meeting()
+    assert loaded == versioned_meeting()
     assert backend.sync_thread_ids
     assert all(thread_id != main_thread for thread_id in backend.sync_thread_ids)
 
@@ -201,11 +214,23 @@ async def test_workflow_facade_supplies_fresh_versions_to_mutations() -> None:
 
 
 class ItemRepository:
-    def __init__(self, value: object | None) -> None:
+    def __init__(self, value: object | None, page: tuple[Meeting, ...] = ()) -> None:
         self.value = value
+        self.page = page
+        self.page_calls: list[tuple[MeetingStatus | None, MeetingListCursor | None, int]] = []
 
     def get(self, _item_id: UUID) -> object | None:
         return self.value
+
+    def list_page(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> tuple[Meeting, ...]:
+        self.page_calls.append((status, cursor, limit))
+        return self.page[:limit]
 
 
 class ApprovalRepository:
@@ -229,6 +254,22 @@ class ReceiptRepository:
         return None
 
 
+class ProcessingRepository:
+    def __init__(self, values: tuple[ProcessingJob, ...] = ()) -> None:
+        self.values = values
+
+    def list_for_meeting(self, _meeting_id: UUID) -> tuple[ProcessingJob, ...]:
+        return self.values
+
+
+class RecapRepository:
+    def __init__(self, value: RecapArtifact | None = None) -> None:
+        self.value = value
+
+    def for_approval(self, _approval_id: UUID) -> RecapArtifact | None:
+        return self.value
+
+
 class QueryUnitOfWork:
     def __init__(
         self,
@@ -237,11 +278,16 @@ class QueryUnitOfWork:
         current_transcript: Transcript | None = None,
         current_review: ReviewRevision | None = None,
         approval: Approval | None = None,
+        recap_artifact: RecapArtifact | None = None,
+        processing_jobs: tuple[ProcessingJob, ...] = (),
+        meeting_page: tuple[Meeting, ...] = (),
     ) -> None:
-        self.meetings = ItemRepository(current_meeting)
+        self.meetings = ItemRepository(current_meeting, meeting_page)
         self.transcripts = ItemRepository(current_transcript)
         self.reviews = ItemRepository(current_review)
         self.approvals = ApprovalRepository(approval)
+        self.recaps = RecapRepository(recap_artifact)
+        self.processing_jobs = ProcessingRepository(processing_jobs)
         self.write_intents = IntentRepository()
         self.write_receipts = ReceiptRepository()
 
@@ -283,6 +329,94 @@ def approval(meeting_id: UUID = MEETING_ID) -> Approval:
         actor_id="portfolio-owner",
         approved_at=NOW,
     )
+
+
+def processing_job(meeting_id: UUID = MEETING_ID) -> ProcessingJob:
+    return ProcessingJob(
+        id=UUID("90000000-0000-4000-8000-000000000001"),
+        meeting_id=meeting_id,
+        stage=ProcessingStage.TRANSCRIPTION,
+        status=ProcessingJobStatus.RUNNING,
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="worker-one",
+        lease_expires_at=NOW + timedelta(minutes=5),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+async def test_query_facade_builds_a_strict_keyset_page() -> None:
+    first = meeting().model_copy(
+        update={
+            "id": UUID("10000000-0000-4000-8000-000000000003"),
+            "ingest_key": "upload-three",
+            "created_at": NOW + timedelta(minutes=2),
+            "updated_at": NOW + timedelta(minutes=2),
+        }
+    )
+    second = meeting().model_copy(
+        update={
+            "id": UUID("10000000-0000-4000-8000-000000000002"),
+            "ingest_key": "upload-two",
+            "created_at": NOW + timedelta(minutes=1),
+            "updated_at": NOW + timedelta(minutes=1),
+        }
+    )
+    repository = QueryUnitOfWork(meeting(), meeting_page=(first, second, meeting()))
+    query = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: repository))
+
+    result = await query.list_meetings(
+        status=MeetingStatus.INGESTED,
+        cursor=None,
+        limit=2,
+    )
+
+    assert result.items == (first, second)
+    assert result.next_cursor == MeetingListCursor(created_at=second.created_at, id=second.id)
+    assert repository.meetings.page_calls == [(MeetingStatus.INGESTED, None, 3)]
+
+
+async def test_query_facade_reads_processing_and_recap_bindings() -> None:
+    current = approved_meeting()
+    uow = QueryUnitOfWork(
+        current,
+        approval=approval(),
+        recap_artifact=recap(),
+        processing_jobs=(processing_job(),),
+    )
+    query = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: uow))
+
+    processing = await query.get_processing(MEETING_ID)
+    stored_recap = await query.get_recap(MEETING_ID)
+
+    assert processing.meeting_id == MEETING_ID
+    assert processing.jobs == (processing_job(),)
+    assert stored_recap == recap()
+
+
+async def test_query_facade_hides_missing_recaps_and_rejects_cross_meeting_records() -> None:
+    missing_uow = QueryUnitOfWork(approved_meeting(), approval=approval())
+    missing = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: missing_uow))
+    wrong_recap = recap().model_copy(update={"meeting_id": OTHER_MEETING_ID})
+    mismatched_uow = QueryUnitOfWork(
+        approved_meeting(),
+        approval=approval(),
+        recap_artifact=wrong_recap,
+    )
+    mismatched = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: mismatched_uow))
+    wrong_job_uow = QueryUnitOfWork(
+        meeting(),
+        processing_jobs=(processing_job(OTHER_MEETING_ID),),
+    )
+    wrong_job = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: wrong_job_uow))
+
+    with pytest.raises(ResourceNotFoundError):
+        await missing.get_recap(MEETING_ID)
+    with pytest.raises(OperationConflictError, match="recap does not belong"):
+        await mismatched.get_recap(MEETING_ID)
+    with pytest.raises(OperationConflictError, match="processing job does not belong"):
+        await wrong_job.get_processing(MEETING_ID)
 
 
 async def test_query_facade_loads_current_records_and_approved_delivery_state() -> None:

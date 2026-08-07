@@ -1,16 +1,31 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import re
+from datetime import datetime
 from typing import Annotated, cast
+from uuid import UUID
 
 from fastapi import Depends, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from meeting_action_orchestrator.api.contracts import ApiDependencies, Principal
 from meeting_action_orchestrator.api.problems import ProblemError, create_problem
+from meeting_action_orchestrator.application.ports import MeetingListCursor
+from meeting_action_orchestrator.domain.enums import MeetingStatus
 
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:+/-]{0,199}")
 REVIEW_ETAG_PATTERN = re.compile(r'"([0-9a-f]{64})"')
+MEETING_CURSOR_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+MEETING_CURSOR_VERSION = 1
+MEETING_CURSOR_STATUS_BYTES = 8
+MEETING_CURSOR_UUID_BYTES = 16
+MEETING_CURSOR_CHECKSUM_BYTES = 8
+MEETING_CURSOR_TIMESTAMP_MAX_BYTES = 48
+MEETING_CURSOR_CHECKSUM_CONTEXT = b"meeting-action-orchestrator:meeting-cursor:v1:"
 _bearer = HTTPBearer(auto_error=False)
 
 
@@ -92,5 +107,98 @@ def parse_idempotency_key(value: str | None) -> str:
     return key
 
 
+def parse_meeting_cursor(
+    value: str | None,
+    status: MeetingStatus | None,
+) -> MeetingListCursor | None:
+    if value is None:
+        return None
+    if MEETING_CURSOR_PATTERN.fullmatch(value) is None:
+        raise _invalid_meeting_cursor()
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError) as exc:
+        raise _invalid_meeting_cursor() from exc
+    if _encode_cursor_bytes(decoded) != value:
+        raise _invalid_meeting_cursor()
+    minimum_size = (
+        2 + MEETING_CURSOR_STATUS_BYTES + MEETING_CURSOR_UUID_BYTES + MEETING_CURSOR_CHECKSUM_BYTES
+    )
+    if len(decoded) < minimum_size or decoded[0] != MEETING_CURSOR_VERSION:
+        raise _invalid_meeting_cursor()
+    timestamp_size = decoded[1]
+    expected_size = minimum_size + timestamp_size
+    if not 1 <= timestamp_size <= MEETING_CURSOR_TIMESTAMP_MAX_BYTES:
+        raise _invalid_meeting_cursor()
+    if len(decoded) != expected_size:
+        raise _invalid_meeting_cursor()
+    body = decoded[:-MEETING_CURSOR_CHECKSUM_BYTES]
+    checksum = decoded[-MEETING_CURSOR_CHECKSUM_BYTES:]
+    if not hmac.compare_digest(checksum, _meeting_cursor_checksum(body)):
+        raise _invalid_meeting_cursor()
+    status_start = 2
+    timestamp_start = status_start + MEETING_CURSOR_STATUS_BYTES
+    uuid_start = timestamp_start + timestamp_size
+    if not hmac.compare_digest(
+        decoded[status_start:timestamp_start],
+        _meeting_status_fingerprint(status),
+    ):
+        raise _invalid_meeting_cursor()
+    try:
+        timestamp_text = decoded[timestamp_start:uuid_start].decode("ascii")
+        created_at = datetime.fromisoformat(timestamp_text)
+        meeting_id = UUID(bytes=decoded[uuid_start : uuid_start + MEETING_CURSOR_UUID_BYTES])
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _invalid_meeting_cursor() from exc
+    if created_at.utcoffset() is None or str(created_at) != timestamp_text:
+        raise _invalid_meeting_cursor()
+    return MeetingListCursor(created_at=created_at, id=meeting_id)
+
+
+def format_meeting_cursor(
+    cursor: MeetingListCursor | None,
+    status: MeetingStatus | None,
+) -> str | None:
+    if cursor is None:
+        return None
+    timestamp = str(cursor.created_at).encode("ascii")
+    if not 1 <= len(timestamp) <= MEETING_CURSOR_TIMESTAMP_MAX_BYTES:
+        raise ValueError("created_at cannot be represented in a meeting cursor")
+    body = b"".join(
+        (
+            bytes((MEETING_CURSOR_VERSION, len(timestamp))),
+            _meeting_status_fingerprint(status),
+            timestamp,
+            cursor.id.bytes,
+        )
+    )
+    return _encode_cursor_bytes(body + _meeting_cursor_checksum(body))
+
+
 def format_etag(value: str) -> str:
     return f'"{value}"'
+
+
+def _meeting_status_fingerprint(status: MeetingStatus | None) -> bytes:
+    value = status.value if status is not None else "*"
+    return hashlib.sha256(value.encode("ascii")).digest()[:MEETING_CURSOR_STATUS_BYTES]
+
+
+def _meeting_cursor_checksum(body: bytes) -> bytes:
+    return hashlib.sha256(MEETING_CURSOR_CHECKSUM_CONTEXT + body).digest()[
+        :MEETING_CURSOR_CHECKSUM_BYTES
+    ]
+
+
+def _encode_cursor_bytes(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _invalid_meeting_cursor() -> ProblemError:
+    return ProblemError(
+        create_problem(
+            400,
+            detail="The meeting page cursor is invalid for this query.",
+            type_uri="urn:meeting-action-orchestrator:problem:invalid-page-cursor",
+        )
+    )

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.application.state_machine import transition_meeting
 from meeting_action_orchestrator.domain.enums import AudioMediaType, MeetingStatus, ReviewOrigin
 from meeting_action_orchestrator.domain.models import (
@@ -156,3 +157,103 @@ def test_read_only_unit_of_work_does_not_reserve_the_writer(tmp_path: Path) -> N
         assert reader.meetings.get(MEETING_ID) is None
         with SqliteUnitOfWork(database) as writer:
             writer.commit()
+
+
+def test_meeting_keyset_pages_are_stable_with_tied_timestamps(tmp_path: Path) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+    records = tuple(
+        meeting().model_copy(
+            update={
+                "id": UUID(f"10000000-0000-4000-8000-{ordinal:012d}"),
+                "ingest_key": f"upload-{ordinal}",
+                "status": MeetingStatus.CANCELLED if ordinal == 4 else MeetingStatus.INGESTED,
+                "created_at": NOW
+                + timedelta(minutes=2 if ordinal == 5 else 1 if ordinal > 1 else 0),
+                "updated_at": NOW
+                + timedelta(minutes=2 if ordinal == 5 else 1 if ordinal > 1 else 0),
+            }
+        )
+        for ordinal in range(1, 6)
+    )
+
+    with SqliteUnitOfWork(database) as uow:
+        uow.audio_assets.add(asset())
+        for record in records:
+            uow.meetings.add(record)
+        uow.commit()
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        first = tuple(uow.meetings.list_page(status=None, cursor=None, limit=2))
+        second = tuple(
+            uow.meetings.list_page(
+                status=None,
+                cursor=MeetingListCursor(created_at=first[-1].created_at, id=first[-1].id),
+                limit=2,
+            )
+        )
+        filtered = tuple(
+            uow.meetings.list_page(
+                status=MeetingStatus.INGESTED,
+                cursor=None,
+                limit=10,
+            )
+        )
+
+    assert [item.ingest_key for item in first] == ["upload-5", "upload-4"]
+    assert [item.ingest_key for item in second] == ["upload-3", "upload-2"]
+    assert {item.id for item in first}.isdisjoint(item.id for item in second)
+    assert [item.ingest_key for item in filtered] == [
+        "upload-5",
+        "upload-3",
+        "upload-2",
+        "upload-1",
+    ]
+
+
+def test_meeting_created_at_is_an_immutable_persistence_key(tmp_path: Path) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+    original = meeting()
+
+    with SqliteUnitOfWork(database) as uow:
+        uow.audio_assets.add(asset())
+        uow.meetings.add(original)
+        uow.commit()
+
+    moved = original.model_copy(update={"created_at": NOW + timedelta(minutes=1)})
+    with pytest.raises(PersistenceConflictError), SqliteUnitOfWork(database) as uow:
+        uow.meetings.save(moved, expected_version=0)
+
+
+def test_meeting_keyset_queries_seek_from_the_cursor(tmp_path: Path) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+    cursor_time = str(NOW)
+    cursor_id = str(MEETING_ID)
+
+    with database.connect() as connection:
+        unfiltered = connection.execute(
+            """
+            EXPLAIN QUERY PLAN SELECT * FROM meetings
+            WHERE (created_at, id) < (?, ?)
+            ORDER BY created_at DESC, id DESC LIMIT ?
+            """,
+            (cursor_time, cursor_id, 20),
+        ).fetchall()
+        filtered = connection.execute(
+            """
+            EXPLAIN QUERY PLAN SELECT * FROM meetings
+            WHERE status = ? AND (created_at, id) < (?, ?)
+            ORDER BY created_at DESC, id DESC LIMIT ?
+            """,
+            (MeetingStatus.INGESTED.value, cursor_time, cursor_id, 20),
+        ).fetchall()
+
+    assert any(
+        "SEARCH meetings USING INDEX idx_meetings_created_id" in row["detail"] for row in unfiltered
+    )
+    assert any(
+        "SEARCH meetings USING INDEX idx_meetings_status_created_id" in row["detail"]
+        for row in filtered
+    )

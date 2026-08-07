@@ -19,6 +19,7 @@ from meeting_action_orchestrator.agents.contracts import (
     VerificationRequest,
 )
 from meeting_action_orchestrator.domain.enums import (
+    MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
 )
@@ -109,12 +110,30 @@ class SpecialistProvider(Protocol):
     ) -> AgentResult[VerificationReport]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class MeetingListCursor:
+    created_at: datetime
+    id: UUID
+
+    def __post_init__(self) -> None:
+        if self.created_at.utcoffset() is None:
+            raise ValueError("created_at must include a UTC offset")
+
+
 class MeetingRepository(Protocol):
     def add(self, meeting: Meeting) -> None: ...
 
     def get(self, meeting_id: UUID) -> Meeting | None: ...
 
     def find_by_ingest_key(self, ingest_key: str) -> Meeting | None: ...
+
+    def list_page(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> Sequence[Meeting]: ...
 
     def save(self, meeting: Meeting, expected_version: int) -> None: ...
 

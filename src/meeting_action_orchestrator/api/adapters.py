@@ -7,6 +7,8 @@ from uuid import UUID
 
 from meeting_action_orchestrator.api.contracts import (
     DeliveryResult,
+    MeetingPageResult,
+    ProcessingResult,
     ReadinessCheck,
     ReadinessResult,
 )
@@ -14,16 +16,17 @@ from meeting_action_orchestrator.application.errors import (
     OperationConflictError,
     ResourceNotFoundError,
 )
-from meeting_action_orchestrator.application.ports import UnitOfWork
+from meeting_action_orchestrator.application.ports import MeetingListCursor, UnitOfWork
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
     IngestMeeting,
     ReviewUpdateResult,
 )
-from meeting_action_orchestrator.domain.enums import WriteKind
+from meeting_action_orchestrator.domain.enums import MeetingStatus, WriteKind
 from meeting_action_orchestrator.domain.models import (
     Meeting,
+    RecapArtifact,
     ReviewRevision,
     Transcript,
     WriteIntent,
@@ -127,9 +130,6 @@ class AsyncWorkflowFacade:
     async def ingest(self, command: IngestMeeting, stream: BinaryIO) -> Meeting:
         return await asyncio.to_thread(self._workflow.ingest, command, stream)
 
-    async def process(self, meeting_id: UUID) -> Meeting:
-        return await self.get_meeting(meeting_id)
-
     async def get_meeting(self, meeting_id: UUID) -> Meeting:
         return await asyncio.to_thread(self._workflow.get_meeting, meeting_id)
 
@@ -222,6 +222,23 @@ class UnitOfWorkQueryFacade:
     def __init__(self, unit_of_work: UnitOfWorkFactory) -> None:
         self._unit_of_work = unit_of_work
 
+    async def list_meetings(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> MeetingPageResult:
+        return await asyncio.to_thread(
+            self._list_meetings,
+            status=status,
+            cursor=cursor,
+            limit=limit,
+        )
+
+    async def get_processing(self, meeting_id: UUID) -> ProcessingResult:
+        return await asyncio.to_thread(self._get_processing, meeting_id)
+
     async def get_transcript(self, meeting_id: UUID) -> Transcript:
         return await asyncio.to_thread(self._get_transcript, meeting_id)
 
@@ -230,6 +247,42 @@ class UnitOfWorkQueryFacade:
 
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult:
         return await asyncio.to_thread(self._get_delivery, meeting_id)
+
+    async def get_recap(self, meeting_id: UUID) -> RecapArtifact:
+        return await asyncio.to_thread(self._get_recap, meeting_id)
+
+    def _list_meetings(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> MeetingPageResult:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between one and 100")
+        with self._unit_of_work() as uow:
+            records = tuple(
+                uow.meetings.list_page(
+                    status=status,
+                    cursor=cursor,
+                    limit=limit + 1,
+                )
+            )
+        items = records[:limit]
+        next_cursor = (
+            MeetingListCursor(created_at=items[-1].created_at, id=items[-1].id)
+            if len(records) > limit
+            else None
+        )
+        return MeetingPageResult(items=items, next_cursor=next_cursor)
+
+    def _get_processing(self, meeting_id: UUID) -> ProcessingResult:
+        with self._unit_of_work() as uow:
+            meeting = _required(uow.meetings.get(meeting_id), "Meeting")
+            jobs = tuple(uow.processing_jobs.list_for_meeting(meeting_id))
+        if any(job.meeting_id != meeting.id for job in jobs):
+            raise OperationConflictError("A processing job does not belong to the meeting")
+        return ProcessingResult(meeting_id=meeting.id, jobs=jobs)
 
     def _get_transcript(self, meeting_id: UUID) -> Transcript:
         with self._unit_of_work() as uow:
@@ -253,6 +306,24 @@ class UnitOfWorkQueryFacade:
         if review.meeting_id != meeting.id or review.id != meeting.current_review_id:
             raise OperationConflictError("The current review does not belong to the meeting")
         return review
+
+    def _get_recap(self, meeting_id: UUID) -> RecapArtifact:
+        with self._unit_of_work() as uow:
+            meeting = _required(uow.meetings.get(meeting_id), "Meeting")
+            approval = uow.approvals.for_meeting(meeting_id)
+            if approval is None:
+                raise ResourceNotFoundError("Recap")
+            recap = uow.recaps.for_approval(approval.id)
+            if recap is None:
+                raise ResourceNotFoundError("Recap")
+        if (
+            approval.meeting_id != meeting.id
+            or meeting.approved_review_id != approval.review_revision_id
+            or recap.meeting_id != meeting.id
+            or recap.approval_id != approval.id
+        ):
+            raise OperationConflictError("The recap does not belong to the meeting approval")
+        return recap
 
     def _get_delivery(self, meeting_id: UUID) -> DeliveryResult:
         with self._unit_of_work() as uow:

@@ -5,14 +5,16 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, File, Form, Header, Response, UploadFile
+from fastapi import APIRouter, File, Form, Header, Query, Response, UploadFile
 from pydantic import ValidationError
 
 from meeting_action_orchestrator.api.dependencies import (
     ApiDependenciesValue,
     PrincipalValue,
     format_etag,
+    format_meeting_cursor,
     parse_idempotency_key,
+    parse_meeting_cursor,
     parse_review_precondition,
 )
 from meeting_action_orchestrator.api.problems import (
@@ -31,14 +33,17 @@ from meeting_action_orchestrator.api.schemas import (
     DeliverySelectionRequest,
     HealthResponse,
     IssueResolutionRequest,
+    MeetingListResponse,
     MeetingResponse,
+    ProcessingResponse,
     ReadinessResponse,
+    RecapResponse,
     ReviewResponse,
     TranscriptResponse,
 )
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import IngestMeeting
-from meeting_action_orchestrator.domain.enums import IssueStatus, WriteKind
+from meeting_action_orchestrator.domain.enums import IssueStatus, MeetingStatus, WriteKind
 from meeting_action_orchestrator.domain.errors import DomainError
 
 PROBLEM_SCHEMA = ProblemDetail.model_json_schema(by_alias=True)
@@ -140,6 +145,29 @@ async def create_meeting(
 
 
 @meeting_router.get(
+    "",
+    response_model=MeetingListResponse,
+    operation_id="listMeetings",
+)
+async def list_meetings(
+    dependencies: ApiDependenciesValue,
+    _principal: PrincipalValue,
+    status: MeetingStatus | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+) -> MeetingListResponse:
+    result = await dependencies.queries.list_meetings(
+        status=status,
+        cursor=parse_meeting_cursor(cursor, status),
+        limit=limit,
+    )
+    return MeetingListResponse.from_result(
+        result,
+        format_meeting_cursor(result.next_cursor, status),
+    )
+
+
+@meeting_router.get(
     "/{meeting_id}",
     response_model=MeetingResponse,
     operation_id="getMeeting",
@@ -155,20 +183,18 @@ async def get_meeting(
     return MeetingResponse.from_domain(meeting)
 
 
-@meeting_router.post(
+@meeting_router.get(
     "/{meeting_id}/processing",
-    response_model=MeetingResponse,
-    operation_id="processMeeting",
+    response_model=ProcessingResponse,
+    operation_id="getMeetingProcessing",
 )
-async def process_meeting(
+async def get_processing(
     meeting_id: UUID,
-    response: Response,
     dependencies: ApiDependenciesValue,
     _principal: PrincipalValue,
-) -> MeetingResponse:
-    meeting = await dependencies.workflow.process(meeting_id)
-    response.headers["ETag"] = format_etag(f"meeting-{meeting.version}")
-    return MeetingResponse.from_domain(meeting)
+) -> ProcessingResponse:
+    result = await dependencies.queries.get_processing(meeting_id)
+    return ProcessingResponse.from_result(result)
 
 
 @meeting_router.get(
@@ -201,6 +227,22 @@ async def get_review(
     review = await dependencies.queries.get_review(meeting_id)
     response.headers["ETag"] = format_etag(review.content_digest)
     return ReviewResponse.from_domain(review)
+
+
+@meeting_router.get(
+    "/{meeting_id}/recap",
+    response_model=RecapResponse,
+    operation_id="getMeetingRecap",
+)
+async def get_recap(
+    meeting_id: UUID,
+    response: Response,
+    dependencies: ApiDependenciesValue,
+    _principal: PrincipalValue,
+) -> RecapResponse:
+    recap = await dependencies.queries.get_recap(meeting_id)
+    response.headers["ETag"] = format_etag(recap.sha256)
+    return RecapResponse.from_domain(recap)
 
 
 @meeting_router.patch(

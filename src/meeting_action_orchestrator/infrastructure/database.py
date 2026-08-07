@@ -175,7 +175,14 @@ CREATE INDEX idx_delivery_operation_bindings_meeting
 ON delivery_operation_bindings (meeting_id, created_at);
 """
 
-MIGRATIONS = ((1, SCHEMA_V1), (2, SCHEMA_V2))
+SCHEMA_V3 = """
+CREATE INDEX idx_meetings_created_id
+ON meetings (created_at DESC, id DESC);
+CREATE INDEX idx_meetings_status_created_id
+ON meetings (status, created_at DESC, id DESC);
+"""
+
+MIGRATIONS = ((1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3))
 
 
 class Database:

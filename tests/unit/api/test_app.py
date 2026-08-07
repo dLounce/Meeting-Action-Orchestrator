@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import BinaryIO
 from uuid import UUID
 
@@ -10,23 +10,37 @@ import httpx
 from meeting_action_orchestrator.api import ApiDependencies, create_app
 from meeting_action_orchestrator.api.contracts import (
     DeliveryResult,
+    MeetingPageResult,
     Principal,
+    ProcessingResult,
     ReadinessCheck,
     ReadinessResult,
 )
+from meeting_action_orchestrator.application.errors import ResourceNotFoundError
+from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
     ApprovalResult,
     IngestMeeting,
 )
-from meeting_action_orchestrator.domain.enums import MeetingStatus, ReviewOrigin, WriteKind
+from meeting_action_orchestrator.domain.enums import (
+    FailureCode,
+    FailureDisposition,
+    MeetingStatus,
+    ProcessingJobStatus,
+    ProcessingStage,
+    ReviewOrigin,
+    WriteKind,
+)
 from meeting_action_orchestrator.domain.models import (
     Approval,
     Meeting,
+    ProcessingJob,
     RecapArtifact,
     ReviewRevision,
     Transcript,
     TranscriptSegment,
+    WorkflowFailure,
 )
 
 NOW = datetime(2026, 8, 7, 9, 0, tzinfo=timezone.utc)
@@ -39,6 +53,8 @@ ACTION_ID = UUID("60000000-0000-4000-8000-000000000001")
 ISSUE_ID = UUID("60000000-0000-4000-8000-000000000002")
 APPROVAL_ID = UUID("70000000-0000-4000-8000-000000000001")
 RECAP_ID = UUID("80000000-0000-4000-8000-000000000001")
+JOB_ID = UUID("90000000-0000-4000-8000-000000000001")
+EXTRACTION_JOB_ID = UUID("90000000-0000-4000-8000-000000000002")
 VALID_TOKEN = MEETING_ID.hex
 
 
@@ -90,6 +106,53 @@ def review() -> ReviewRevision:
         purpose="Confirm the release plan",
         recap_markdown="# Release planning",
         created_at=NOW,
+    )
+
+
+def recap() -> RecapArtifact:
+    current = review()
+    return RecapArtifact(
+        id=RECAP_ID,
+        meeting_id=MEETING_ID,
+        approval_id=APPROVAL_ID,
+        content=current.recap_markdown,
+        created_at=NOW,
+    )
+
+
+def processing_job() -> ProcessingJob:
+    return ProcessingJob(
+        id=JOB_ID,
+        meeting_id=MEETING_ID,
+        stage=ProcessingStage.TRANSCRIPTION,
+        status=ProcessingJobStatus.RUNNING,
+        attempt_count=1,
+        max_attempts=3,
+        lease_owner="private-worker",
+        lease_expires_at=NOW + timedelta(minutes=5),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def retrying_processing_job() -> ProcessingJob:
+    return ProcessingJob(
+        id=EXTRACTION_JOB_ID,
+        meeting_id=MEETING_ID,
+        stage=ProcessingStage.EXTRACTION,
+        status=ProcessingJobStatus.RETRY_WAIT,
+        attempt_count=1,
+        max_attempts=2,
+        next_attempt_at=NOW + timedelta(minutes=5),
+        last_failure=WorkflowFailure(
+            code=FailureCode.PROVIDER_UNAVAILABLE,
+            disposition=FailureDisposition.RETRYABLE,
+            safe_message="The provider is temporarily unavailable",
+            provider_request_id="private-provider-request",
+            occurred_at=NOW,
+        ),
+        created_at=NOW,
+        updated_at=NOW,
     )
 
 
@@ -146,17 +209,34 @@ class FakeWorkflow:
             actor_id=actor_id,
             approved_at=NOW,
         )
-        recap = RecapArtifact(
-            id=RECAP_ID,
-            meeting_id=MEETING_ID,
-            approval_id=APPROVAL_ID,
-            content=current.recap_markdown,
-            created_at=NOW,
-        )
-        return ApprovalResult(approval, recap, ())
+        return ApprovalResult(approval, recap(), ())
 
 
 class FakeQueries:
+    async def list_meetings(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> MeetingPageResult:
+        assert limit >= 1
+        if status is not None:
+            assert status is MeetingStatus.INGESTED
+        return MeetingPageResult(
+            items=(meeting(),),
+            next_cursor=(
+                MeetingListCursor(created_at=NOW, id=MEETING_ID) if cursor is None else None
+            ),
+        )
+
+    async def get_processing(self, meeting_id: UUID) -> ProcessingResult:
+        assert meeting_id == MEETING_ID
+        return ProcessingResult(
+            meeting_id=meeting_id,
+            jobs=(processing_job(), retrying_processing_job()),
+        )
+
     async def get_transcript(self, meeting_id: UUID) -> Transcript:
         assert meeting_id == MEETING_ID
         return transcript()
@@ -165,9 +245,19 @@ class FakeQueries:
         assert meeting_id == MEETING_ID
         return review()
 
+    async def get_recap(self, meeting_id: UUID) -> RecapArtifact:
+        assert meeting_id == MEETING_ID
+        return recap()
+
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult:
         assert meeting_id == MEETING_ID
         return DeliveryResult(meeting(), ())
+
+
+class MissingRecapQueries(FakeQueries):
+    async def get_recap(self, meeting_id: UUID) -> RecapArtifact:
+        assert meeting_id == MEETING_ID
+        raise ResourceNotFoundError("Recap")
 
 
 class FakeReviews:
@@ -260,10 +350,15 @@ class ChunkedBody(httpx.AsyncByteStream):
         yield b"zz"
 
 
-def dependencies(*, ready: bool = True, max_upload_bytes: int = 1024) -> ApiDependencies:
+def dependencies(
+    *,
+    ready: bool = True,
+    max_upload_bytes: int = 1024,
+    queries: FakeQueries | None = None,
+) -> ApiDependencies:
     return ApiDependencies(
         workflow=FakeWorkflow(),
-        queries=FakeQueries(),
+        queries=queries or FakeQueries(),
         reviews=FakeReviews(),
         deliveries=FakeDeliveries(),
         authenticator=FakeAuthenticator(),
@@ -394,6 +489,99 @@ async def test_create_meeting_rejects_invalid_timezone_before_ingest() -> None:
     assert isinstance(workflow, FakeWorkflow)
     assert response.status_code == 422
     assert workflow.created is None
+
+
+async def test_meeting_collection_uses_filter_bound_opaque_cursors() -> None:
+    first = await request(
+        "/v1/meetings?status=ingested&limit=1",
+        headers=authorization(),
+    )
+
+    assert first.status_code == 200
+    payload = first.json()
+    assert [item["id"] for item in payload["items"]] == [str(MEETING_ID)]
+    cursor = payload["next_cursor"]
+    assert isinstance(cursor, str)
+    assert "=" not in cursor
+
+    second = await request(
+        f"/v1/meetings?status=ingested&limit=1&cursor={cursor}",
+        headers=authorization(),
+    )
+    mismatched = await request(
+        f"/v1/meetings?status=completed&limit=1&cursor={cursor}",
+        headers=authorization(),
+    )
+
+    assert second.status_code == 200
+    assert second.json()["next_cursor"] is None
+    assert mismatched.status_code == 400
+    assert mismatched.json()["type"].endswith("invalid-page-cursor")
+
+
+async def test_meeting_collection_rejects_invalid_limits_and_cursors() -> None:
+    for query in ("limit=0", "limit=101"):
+        response = await request(f"/v1/meetings?{query}", headers=authorization())
+        assert response.status_code == 422
+
+    malformed = await request(
+        "/v1/meetings?cursor=not-a-valid-cursor",
+        headers=authorization(),
+    )
+    assert malformed.status_code == 400
+
+
+async def test_processing_read_excludes_worker_and_lease_state() -> None:
+    response = await request(
+        f"/v1/meetings/{MEETING_ID}/processing",
+        headers=authorization(),
+    )
+    removed_mutation = await request(
+        f"/v1/meetings/{MEETING_ID}/processing",
+        method="POST",
+        headers=authorization(),
+    )
+
+    assert response.status_code == 200
+    job = response.json()["jobs"][0]
+    assert job["id"] == str(JOB_ID)
+    assert job["status"] == "running"
+    assert "lease_owner" not in job
+    assert "lease_expires_at" not in job
+    retrying = response.json()["jobs"][1]
+    assert retrying["failure"] == {
+        "code": "provider_unavailable",
+        "disposition": "retryable",
+        "message": "The provider is temporarily unavailable",
+        "occurred_at": "2026-08-07T09:00:00Z",
+    }
+    assert removed_mutation.status_code == 405
+
+
+async def test_recap_read_returns_the_canonical_artifact_etag() -> None:
+    response = await request(
+        f"/v1/meetings/{MEETING_ID}/recap",
+        headers=authorization(),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["etag"] == f'"{recap().sha256}"'
+    assert response.json() == {
+        "id": str(RECAP_ID),
+        "meeting_id": str(MEETING_ID),
+        "approval_id": str(APPROVAL_ID),
+        "format": "markdown",
+        "content": review().recap_markdown,
+        "sha256": recap().sha256,
+        "created_at": "2026-08-07T09:00:00Z",
+    }
+
+    missing = await request(
+        f"/v1/meetings/{MEETING_ID}/recap",
+        services=dependencies(queries=MissingRecapQueries()),
+        headers=authorization(),
+    )
+    assert missing.status_code == 404
 
 
 async def test_read_endpoints_return_strong_etags() -> None:

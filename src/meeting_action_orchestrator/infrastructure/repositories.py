@@ -7,8 +7,10 @@ from datetime import datetime
 from types import TracebackType
 from uuid import UUID
 
+from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.domain.enums import (
     FailureDisposition,
+    MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
     WriteStatus,
@@ -78,6 +80,54 @@ class SqliteMeetingRepository:
         ).fetchone()
         return self._from_row(row) if row is not None else None
 
+    def list_page(
+        self,
+        *,
+        status: MeetingStatus | None,
+        cursor: MeetingListCursor | None,
+        limit: int,
+    ) -> Sequence[Meeting]:
+        if limit <= 0:
+            return ()
+        if status is not None and cursor is not None:
+            cursor_time = str(cursor.created_at)
+            rows = self._connection.execute(
+                """
+                SELECT * FROM meetings
+                WHERE status = ?
+                  AND (created_at, id) < (?, ?)
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (status.value, cursor_time, str(cursor.id), limit),
+            ).fetchall()
+        elif status is not None:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM meetings WHERE status = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (status.value, limit),
+            ).fetchall()
+        elif cursor is not None:
+            cursor_time = str(cursor.created_at)
+            rows = self._connection.execute(
+                """
+                SELECT * FROM meetings
+                WHERE (created_at, id) < (?, ?)
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (cursor_time, str(cursor.id), limit),
+            ).fetchall()
+        else:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM meetings
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
     def save(self, meeting: Meeting, expected_version: int) -> None:
         values = self._values(meeting)
         cursor = self._connection.execute(
@@ -86,10 +136,10 @@ class SqliteMeetingRepository:
                 ingest_key = ?, title = ?, audio_asset_id = ?, occurred_at = ?, timezone = ?,
                 participants_json = ?, status = ?, current_transcript_id = ?,
                 current_review_id = ?, approved_review_id = ?, failure_json = ?, version = ?,
-                created_at = ?, updated_at = ?
-            WHERE id = ? AND version = ?
+                updated_at = ?
+            WHERE id = ? AND version = ? AND created_at = ?
             """,
-            (*values[1:], values[0], expected_version),
+            (*values[1:13], values[14], values[0], expected_version, values[13]),
         )
         if cursor.rowcount != 1:
             raise PersistenceConflictError("The meeting was changed by another operation")
