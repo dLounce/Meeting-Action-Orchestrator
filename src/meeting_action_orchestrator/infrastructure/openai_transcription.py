@@ -64,12 +64,14 @@ class OpenAITranscriber:
         api_key: str,
         model: str,
         timeout_seconds: float = 120.0,
-        max_retries: int = 2,
+        max_retries: int = 0,
         client: Any = None,
     ) -> None:
         if not api_key and client is None:
             raise OpenAITranscriptionConfigurationError
         if not model:
+            raise OpenAITranscriptionConfigurationError
+        if max_retries != 0:
             raise OpenAITranscriptionConfigurationError
         self._api_key = api_key
         self._model = model

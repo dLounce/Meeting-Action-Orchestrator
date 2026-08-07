@@ -153,6 +153,11 @@ def test_transcript_requires_contiguous_ordered_segments() -> None:
         Transcript.model_validate(transcript.model_dump() | {"segments": (segment,)})
 
 
+def test_transcript_rejects_content_beyond_agent_input_boundary() -> None:
+    with pytest.raises(ValidationError, match="at most 250000"):
+        Transcript.model_validate(make_transcript().model_dump() | {"text": "x" * 250_001})
+
+
 def test_model_items_require_evidence_but_human_items_do_not() -> None:
     with pytest.raises(ValidationError, match="requires decision evidence"):
         Decision(id=uid(21), summary="Ship Friday", confidence=0.9)

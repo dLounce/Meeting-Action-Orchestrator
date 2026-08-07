@@ -5,6 +5,7 @@ import pytest
 
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     OpenAITranscriber,
+    OpenAITranscriptionConfigurationError,
     OpenAITranscriptionInputError,
 )
 
@@ -38,6 +39,15 @@ class FakeResponse:
     def model_dump(self, mode: str) -> dict[str, Any]:
         assert mode == "json"
         return self._payload
+
+
+def test_transcriber_rejects_hidden_sdk_retries() -> None:
+    with pytest.raises(OpenAITranscriptionConfigurationError):
+        OpenAITranscriber(
+            api_key="test",
+            model="gpt-4o-transcribe",
+            max_retries=1,
+        )
 
 
 @pytest.mark.asyncio

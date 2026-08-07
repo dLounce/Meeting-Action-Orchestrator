@@ -52,10 +52,12 @@ class OpenAIAgentsRunner:
         self,
         api_key: str,
         timeout_seconds: float = 120.0,
-        max_retries: int = 2,
+        max_retries: int = 0,
         tracing_enabled: bool = False,
     ) -> None:
         if not api_key:
+            raise OpenAIAgentConfigurationError
+        if max_retries != 0:
             raise OpenAIAgentConfigurationError
         self._api_key = api_key
         self._timeout_seconds = timeout_seconds

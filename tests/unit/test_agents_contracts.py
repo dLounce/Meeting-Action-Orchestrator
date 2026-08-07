@@ -32,6 +32,29 @@ def test_agent_contracts_reject_unknown_fields() -> None:
         )
 
 
+def test_transcript_input_rejects_oversized_content() -> None:
+    with pytest.raises(ValidationError, match="at most 250000"):
+        TranscriptInput(
+            language="en",
+            text="x" * 250_001,
+            sha256="a" * 64,
+            segments=[
+                TranscriptSegmentInput(
+                    id="segment_1",
+                    start_ms=0,
+                    end_ms=1000,
+                    speaker=None,
+                    text="x",
+                )
+            ],
+        )
+
+
+def test_structured_outputs_enforce_total_size_without_schema_constraints() -> None:
+    with pytest.raises(ValidationError, match="exceeds the allowed size"):
+        RecapDraft(title="Recap", overview="x" * 50_001, highlights=[])
+
+
 def test_extraction_request_serializes_timezone_aware_timestamp() -> None:
     request = ExtractionRequest(
         meeting_id="meeting_1",

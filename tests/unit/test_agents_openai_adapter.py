@@ -1,8 +1,18 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from meeting_action_orchestrator.agents import TranscriptInput, TranscriptSegmentInput
-from meeting_action_orchestrator.infrastructure.openai_agents import OpenAIAgentsRunner
+from meeting_action_orchestrator.infrastructure.openai_agents import (
+    OpenAIAgentConfigurationError,
+    OpenAIAgentsRunner,
+)
+
+
+def test_openai_adapter_rejects_hidden_sdk_retries() -> None:
+    with pytest.raises(OpenAIAgentConfigurationError):
+        OpenAIAgentsRunner(api_key="test", max_retries=1)
 
 
 def test_openai_adapter_serializes_payload_canonically() -> None:

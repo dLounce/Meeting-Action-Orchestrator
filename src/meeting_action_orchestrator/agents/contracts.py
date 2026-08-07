@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Generic, Literal, Protocol, TypeVar
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
+
+
+ModelT = TypeVar("ModelT", bound=StrictModel)
 
 
 class EvidenceRef(StrictModel):
@@ -20,14 +23,14 @@ class TranscriptSegmentInput(StrictModel):
     start_ms: int = Field(ge=0)
     end_ms: int | None = Field(default=None, ge=0)
     speaker: str | None = Field(default=None, max_length=200)
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=10_000)
 
 
 class TranscriptInput(StrictModel):
     language: str | None = Field(default=None, max_length=32)
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=250_000)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    segments: list[TranscriptSegmentInput] = Field(min_length=1)
+    segments: list[TranscriptSegmentInput] = Field(min_length=1, max_length=5_000)
 
 
 class ExtractionRequest(StrictModel):
@@ -83,6 +86,10 @@ class MeetingExtraction(StrictModel):
     risks: list[RiskCandidate]
     warnings: list[str]
 
+    @model_validator(mode="after")
+    def validate_encoded_size(self) -> MeetingExtraction:
+        return _bounded_output(self, 100_000)
+
 
 class RecordItem(StrictModel):
     id: str = Field(min_length=1, max_length=128)
@@ -97,9 +104,9 @@ class RecordItem(StrictModel):
 class CanonicalMeetingRecord(StrictModel):
     title: str = Field(min_length=1, max_length=300)
     purpose: str | None = Field(default=None, max_length=2000)
-    participants: list[str]
-    items: list[RecordItem]
-    warnings: list[str]
+    participants: list[str] = Field(max_length=200)
+    items: list[RecordItem] = Field(max_length=2000)
+    warnings: list[str] = Field(max_length=100)
 
 
 class RecapRequest(StrictModel):
@@ -116,6 +123,10 @@ class RecapDraft(StrictModel):
     title: str
     overview: str
     highlights: list[ReferencedText]
+
+    @model_validator(mode="after")
+    def validate_encoded_size(self) -> RecapDraft:
+        return _bounded_output(self, 50_000)
 
 
 class VerificationRequest(StrictModel):
@@ -147,6 +158,16 @@ class VerificationFinding(StrictModel):
 class VerificationReport(StrictModel):
     verdict: Literal["pass", "review_required"]
     findings: list[VerificationFinding]
+
+    @model_validator(mode="after")
+    def validate_encoded_size(self) -> VerificationReport:
+        return _bounded_output(self, 100_000)
+
+
+def _bounded_output(model: ModelT, max_characters: int) -> ModelT:
+    if len(model.model_dump_json()) > max_characters:
+        raise ValueError("Structured agent output exceeds the allowed size")
+    return model
 
 
 OutputT = TypeVar("OutputT", bound=StrictModel)

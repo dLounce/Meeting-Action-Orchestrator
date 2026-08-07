@@ -264,8 +264,8 @@ class Transcript(DomainModel):
     provider: ShortText
     model: ShortText
     language: ShortText
-    text: Annotated[str, StringConstraints(min_length=1, max_length=2_000_000)]
-    segments: tuple[TranscriptSegment, ...] = Field(min_length=1)
+    text: Annotated[str, StringConstraints(min_length=1, max_length=250_000)]
+    segments: tuple[TranscriptSegment, ...] = Field(min_length=1, max_length=5_000)
     sha256: str = ""
     provider_request_id: ShortText | None = None
     created_at: AwareDatetime
@@ -278,6 +278,8 @@ class Transcript(DomainModel):
         starts = tuple(segment.start_ms for segment in self.segments)
         if starts != tuple(sorted(starts)):
             raise DomainInvariantError(InvariantCode.SEGMENT_ORDER)
+        if sum(len(segment.text) for segment in self.segments) > 300_000:
+            raise DomainInvariantError(InvariantCode.TRANSCRIPT_SIZE)
         expected = text_sha256(self.text)
         if self.sha256 and self.sha256 != expected:
             raise DomainInvariantError(InvariantCode.TRANSCRIPT_HASH)

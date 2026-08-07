@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     openai_worker_model: str = "gpt-5.4-mini"
     openai_transcription_model: str = "gpt-4o-transcribe-diarize"
     openai_timeout_seconds: float = Field(default=120.0, gt=0)
-    openai_max_retries: int = Field(default=2, ge=0, le=5)
+    openai_max_retries: int = Field(default=0, ge=0, le=0)
     openai_max_requests_per_run: int = Field(default=5, ge=3, le=20)
     openai_max_output_tokens_per_run: int = Field(default=12_000, ge=1_000)
     openai_extractor_max_output_tokens: int = Field(default=6_500, ge=500)

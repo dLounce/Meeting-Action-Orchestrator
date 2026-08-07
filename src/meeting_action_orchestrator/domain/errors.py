@@ -28,6 +28,7 @@ class InvariantCode(str, Enum):
     SEGMENT_ORDINALS = "transcript segment ordinals must be contiguous"
     SEGMENT_ORDER = "transcript segment start times must be ordered"
     TRANSCRIPT_HASH = "transcript hash does not match transcript text"
+    TRANSCRIPT_SIZE = "transcript segments exceed the supported size"
     DECISION_EVIDENCE = "model output requires decision evidence"
     ACTION_EVIDENCE = "model output requires action item evidence"
     QUESTION_EVIDENCE = "model output requires open question evidence"
