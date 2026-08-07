@@ -39,6 +39,11 @@ class ProcessingJobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class DeliveryOperationKind(str, Enum):
+    RETRY = "retry"
+    RECONCILE = "reconcile"
+
+
 class ReviewOrigin(str, Enum):
     MODEL = "model"
     HUMAN = "human"

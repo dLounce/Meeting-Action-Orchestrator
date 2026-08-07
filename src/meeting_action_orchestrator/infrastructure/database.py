@@ -162,7 +162,20 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_meeting_sequence
 ON workflow_events (meeting_id, sequence);
 """
 
-MIGRATIONS = ((1, SCHEMA_V1),)
+SCHEMA_V2 = """
+CREATE TABLE delivery_operation_bindings (
+    request_key TEXT PRIMARY KEY,
+    meeting_id TEXT NOT NULL REFERENCES meetings (id),
+    operation TEXT NOT NULL CHECK (operation IN ('retry', 'reconcile')),
+    actor_id TEXT NOT NULL CHECK (length(actor_id) BETWEEN 1 AND 200),
+    selection_fingerprint TEXT NOT NULL CHECK (length(selection_fingerprint) = 64),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_delivery_operation_bindings_meeting
+ON delivery_operation_bindings (meeting_id, created_at);
+"""
+
+MIGRATIONS = ((1, SCHEMA_V1), (2, SCHEMA_V2))
 
 
 class Database:

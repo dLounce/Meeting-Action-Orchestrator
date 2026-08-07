@@ -17,6 +17,7 @@ from meeting_action_orchestrator.domain.hashing import canonical_json
 from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
+    DeliveryOperationBinding,
     Meeting,
     ProcessingJob,
     RecapArtifact,
@@ -393,6 +394,38 @@ class SqliteRecapRepository:
                 "created_at": row["created_at"],
             }
         )
+
+
+class SqliteDeliveryOperationRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, binding: DeliveryOperationBinding) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO delivery_operation_bindings (
+                request_key, meeting_id, operation, actor_id,
+                selection_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                binding.request_key,
+                str(binding.meeting_id),
+                binding.operation.value,
+                binding.actor_id,
+                binding.selection_fingerprint,
+                str(binding.created_at),
+            ),
+        )
+
+    def get(self, request_key: str) -> DeliveryOperationBinding | None:
+        row = self._connection.execute(
+            "SELECT * FROM delivery_operation_bindings WHERE request_key = ?",
+            (request_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return DeliveryOperationBinding.model_validate(dict(row))
 
 
 class SqliteProcessingJobRepository:
@@ -824,8 +857,9 @@ class SqliteWriteReceiptRepository:
 
 
 class SqliteUnitOfWork:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, *, immediate: bool = True) -> None:
         self._database = database
+        self._immediate = immediate
         self._connection: sqlite3.Connection | None = None
         self._committed = False
         self.meetings: SqliteMeetingRepository
@@ -834,13 +868,14 @@ class SqliteUnitOfWork:
         self.reviews: SqliteReviewRepository
         self.approvals: SqliteApprovalRepository
         self.recaps: SqliteRecapRepository
+        self.delivery_operations: SqliteDeliveryOperationRepository
         self.processing_jobs: SqliteProcessingJobRepository
         self.write_intents: SqliteWriteIntentRepository
         self.write_receipts: SqliteWriteReceiptRepository
 
     def __enter__(self) -> SqliteUnitOfWork:
         connection = self._database.connect()
-        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("BEGIN IMMEDIATE" if self._immediate else "BEGIN")
         self._connection = connection
         self._committed = False
         self.meetings = SqliteMeetingRepository(connection)
@@ -849,6 +884,7 @@ class SqliteUnitOfWork:
         self.reviews = SqliteReviewRepository(connection)
         self.approvals = SqliteApprovalRepository(connection)
         self.recaps = SqliteRecapRepository(connection)
+        self.delivery_operations = SqliteDeliveryOperationRepository(connection)
         self.processing_jobs = SqliteProcessingJobRepository(connection)
         self.write_intents = SqliteWriteIntentRepository(connection)
         self.write_receipts = SqliteWriteReceiptRepository(connection)

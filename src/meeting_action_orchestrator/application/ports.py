@@ -13,6 +13,7 @@ from meeting_action_orchestrator.domain.enums import (
 from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
+    DeliveryOperationBinding,
     Meeting,
     ProcessingJob,
     RecapArtifact,
@@ -108,6 +109,12 @@ class RecapRepository(Protocol):
     def for_approval(self, approval_id: UUID) -> RecapArtifact | None: ...
 
 
+class DeliveryOperationRepository(Protocol):
+    def add(self, binding: DeliveryOperationBinding) -> None: ...
+
+    def get(self, request_key: str) -> DeliveryOperationBinding | None: ...
+
+
 class ProcessingJobRepository(Protocol):
     def add(self, job: ProcessingJob) -> None: ...
 
@@ -190,6 +197,7 @@ class UnitOfWork(Protocol):
     reviews: ReviewRepository
     approvals: ApprovalRepository
     recaps: RecapRepository
+    delivery_operations: DeliveryOperationRepository
     processing_jobs: ProcessingJobRepository
     write_intents: WriteIntentRepository
     write_receipts: WriteReceiptRepository

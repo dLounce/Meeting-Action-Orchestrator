@@ -21,6 +21,7 @@ from meeting_action_orchestrator.domain.enums import (
     AudioMediaType,
     DeadlineKind,
     DeadlineResolution,
+    DeliveryOperationKind,
     FailureCode,
     FailureDisposition,
     IssueSeverity,
@@ -74,6 +75,15 @@ class WorkflowFailure(DomainModel):
     safe_message: MediumText
     provider_request_id: ShortText | None = None
     occurred_at: AwareDatetime
+
+
+class DeliveryOperationBinding(DomainModel):
+    request_key: ShortText
+    meeting_id: UUID
+    operation: DeliveryOperationKind
+    actor_id: ShortText
+    selection_fingerprint: Sha256Digest
+    created_at: AwareDatetime
 
 
 PROCESSING_MAX_ATTEMPTS = {

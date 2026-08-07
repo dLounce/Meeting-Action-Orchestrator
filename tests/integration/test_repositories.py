@@ -146,3 +146,13 @@ def test_rejects_stale_meeting_update(tmp_path: Path) -> None:
     competing = transition_meeting(original, MeetingStatus.TRANSCRIBING, NOW)
     with pytest.raises(PersistenceConflictError), SqliteUnitOfWork(database) as uow:
         uow.meetings.save(competing, expected_version=0)
+
+
+def test_read_only_unit_of_work_does_not_reserve_the_writer(tmp_path: Path) -> None:
+    database = Database(tmp_path / "application.sqlite3")
+    database.migrate()
+
+    with SqliteUnitOfWork(database, immediate=False) as reader:
+        assert reader.meetings.get(MEETING_ID) is None
+        with SqliteUnitOfWork(database) as writer:
+            writer.commit()

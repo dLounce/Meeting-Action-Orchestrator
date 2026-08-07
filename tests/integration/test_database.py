@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from meeting_action_orchestrator.infrastructure.database import Database
+from meeting_action_orchestrator.infrastructure.database import SCHEMA_V1, Database
 
 
 def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
@@ -18,10 +18,11 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 1
+    assert version == 2
     assert {
         "approvals",
         "audio_assets",
+        "delivery_operation_bindings",
         "meetings",
         "processing_jobs",
         "recap_artifacts",
@@ -37,9 +38,27 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 1
-    assert database.migrate() == 1
+    assert database.migrate() == 2
+    assert database.migrate() == 2
     assert database.healthcheck()
+
+
+def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
+    path = tmp_path / "application.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(SCHEMA_V1)
+        connection.execute("PRAGMA user_version = 1")
+    database = Database(path)
+
+    assert database.migrate() == 2
+    with database.connect() as connection:
+        table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'delivery_operation_bindings'
+            """
+        ).fetchone()
+    assert table is not None
 
 
 def test_transaction_rolls_back_on_failure(tmp_path: Path) -> None:
