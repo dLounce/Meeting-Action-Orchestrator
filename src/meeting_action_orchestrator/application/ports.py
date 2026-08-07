@@ -67,6 +67,21 @@ class StoredAudio:
     metadata: AudioMetadata
 
 
+@dataclass(frozen=True, slots=True)
+class WalCheckpointResult:
+    busy: int
+    log_frames: int
+    checkpointed_frames: int
+
+    def __post_init__(self) -> None:
+        if self.busy < 0 or self.log_frames < 0 or self.checkpointed_frames < 0:
+            raise ValueError("WAL checkpoint counters cannot be negative")
+
+    @property
+    def truncated(self) -> bool:
+        return self.busy == 0 and self.log_frames == 0 and self.checkpointed_frames == 0
+
+
 class TranscriptionSegmentLike(Protocol):
     id: str
     start_ms: int
@@ -88,6 +103,43 @@ class RecordingStore(Protocol):
     def put(self, stream: BinaryIO, original_name: str) -> StoredAudio: ...
 
     def path(self, storage_key: str) -> Path: ...
+
+
+class DatabaseCheckpoint(Protocol):
+    def truncate_wal(self) -> WalCheckpointResult: ...
+
+
+class ErasureTokenCodec(Protocol):
+    @property
+    def key_ids(self) -> tuple[str, ...]: ...
+
+    def meeting_token(self, meeting_id: UUID) -> ErasureToken: ...
+
+    def meeting_tokens(self, meeting_id: UUID) -> tuple[ErasureToken, ...]: ...
+
+    def ingest_key_token(self, ingest_key: str) -> ErasureToken: ...
+
+    def ingest_key_tokens(self, ingest_key: str) -> tuple[ErasureToken, ...]: ...
+
+    def request_key_token(self, request_key: str) -> ErasureToken: ...
+
+    def request_key_tokens(self, request_key: str) -> tuple[ErasureToken, ...]: ...
+
+    def actor_token(self, actor_id: str) -> ErasureToken: ...
+
+    def actor_tokens(self, actor_id: str) -> tuple[ErasureToken, ...]: ...
+
+    def erasure_job_token(self, erasure_job_id: UUID) -> ErasureToken: ...
+
+    def erasure_job_tokens(self, erasure_job_id: UUID) -> tuple[ErasureToken, ...]: ...
+
+    def verifiers(self, created_at: datetime) -> tuple[ErasureKeyVerifier, ...]: ...
+
+    def validate_verifiers(
+        self,
+        persisted: Sequence[ErasureKeyVerifier],
+        referenced_tokens: Sequence[ErasureTokenIdentity] = (),
+    ) -> None: ...
 
 
 class TranscriptionProvider(Protocol):
@@ -265,6 +317,26 @@ class MeetingErasureTombstoneRepository(Protocol):
         self,
         tokens: Sequence[ErasureToken],
     ) -> MeetingErasureTombstone | None: ...
+
+
+class MeetingErasurePurgeRepository(Protocol):
+    def has_active_work(self, meeting_id: UUID, now: datetime) -> bool: ...
+
+    def meeting_graph_is_consistent(
+        self,
+        meeting_id: UUID,
+        audio_asset_id: UUID,
+    ) -> bool: ...
+
+    def audio_has_other_references(
+        self,
+        audio_asset_id: UUID,
+        meeting_id: UUID,
+    ) -> bool: ...
+
+    def delete_meeting_graph(self, meeting_id: UUID) -> bool: ...
+
+    def delete_audio_asset(self, audio_asset_id: UUID) -> bool: ...
 
 
 class TranscriptRepository(Protocol):
@@ -454,6 +526,7 @@ class UnitOfWork(Protocol):
     meeting_erasures: MeetingErasureRepository
     meeting_erasure_operations: MeetingErasureOperationRepository
     meeting_erasure_tombstones: MeetingErasureTombstoneRepository
+    meeting_erasure_purge: MeetingErasurePurgeRepository
     transcripts: TranscriptRepository
     reviews: ReviewRepository
     approvals: ApprovalRepository

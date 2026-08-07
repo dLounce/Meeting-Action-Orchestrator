@@ -5,6 +5,8 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from pathlib import Path
 
+from meeting_action_orchestrator.application.ports import WalCheckpointResult
+
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS audio_assets (
     id TEXT PRIMARY KEY,
@@ -1226,6 +1228,20 @@ class Database:
             _verify_connection_pragmas(connection)
             result = connection.execute("SELECT 1").fetchone()
         return result is not None and result[0] == 1
+
+    def truncate_wal(self) -> WalCheckpointResult:
+        with closing(self.connect()) as connection:
+            row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if row is None or len(row) != 3:
+            raise RuntimeError("SQLite WAL checkpoint returned an invalid result")
+        values = tuple(row)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise RuntimeError("SQLite WAL checkpoint returned an invalid result")
+        return WalCheckpointResult(
+            busy=values[0],
+            log_frames=values[1],
+            checkpointed_frames=values[2],
+        )
 
 
 def _verify_connection_pragmas(connection: sqlite3.Connection) -> None:

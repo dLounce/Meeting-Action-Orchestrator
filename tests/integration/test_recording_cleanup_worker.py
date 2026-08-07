@@ -256,9 +256,16 @@ def add_cleanup(database: Database, job: RecordingCleanupJob) -> None:
         uow.commit()
 
 
-def get_cleanup(database: Database, job_id: UUID = JOB_ID) -> RecordingCleanupJob:
+def find_cleanup(
+    database: Database,
+    job_id: UUID = JOB_ID,
+) -> RecordingCleanupJob | None:
     with SqliteUnitOfWork(database, immediate=False) as uow:
-        persisted = uow.recording_cleanups.get(job_id)
+        return uow.recording_cleanups.get(job_id)
+
+
+def get_cleanup(database: Database, job_id: UUID = JOB_ID) -> RecordingCleanupJob:
+    persisted = find_cleanup(database, job_id)
     assert persisted is not None
     return persisted
 
@@ -335,7 +342,9 @@ async def test_cleanup_worker_retries_then_succeeds(tmp_path: Path) -> None:
     assert retrying.last_failure.safe_message == "Recording cleanup could not finish"
     assert scheduler.attempts == [1]
     assert second[0].outcome is RecordingCleanupOutcome.SUCCEEDED
-    assert get_cleanup(database).attempt_count == 2
+    assert second[0].job is not None
+    assert second[0].job.attempt_count == 2
+    assert find_cleanup(database) is None
 
 
 async def test_unexpected_cleanup_error_is_persisted_without_private_details(
@@ -438,7 +447,7 @@ async def test_cleanup_worker_drains_execution_and_publication_on_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(running, timeout=1)
 
-    assert get_cleanup(database).status is RecordingCleanupStatus.SUCCEEDED
+    assert find_cleanup(database) is None
 
 
 async def test_reclaimed_cleanup_rejects_the_stale_worker_publication(
@@ -465,7 +474,7 @@ async def test_reclaimed_cleanup_rejects_the_stale_worker_publication(
     assert replacement[0].outcome is RecordingCleanupOutcome.SUCCEEDED
     assert stale[0].outcome is RecordingCleanupOutcome.LEASE_LOST
     assert stale[0].job is None
-    assert get_cleanup(database).status is RecordingCleanupStatus.SUCCEEDED
+    assert find_cleanup(database) is None
 
 
 async def test_heartbeat_database_failure_stops_publication(tmp_path: Path) -> None:
@@ -525,7 +534,9 @@ async def test_cleanup_publication_failure_is_reclaimed_idempotently(tmp_path: P
 
     assert observed == [True, False]
     assert second[0].outcome is RecordingCleanupOutcome.SUCCEEDED
-    assert get_cleanup(database).attempt_count == 1
+    assert second[0].job is not None
+    assert second[0].job.attempt_count == 1
+    assert find_cleanup(database) is None
 
 
 def test_cleanup_worker_validates_lease_and_batch_limits(tmp_path: Path) -> None:

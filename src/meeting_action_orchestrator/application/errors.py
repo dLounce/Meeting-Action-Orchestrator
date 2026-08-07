@@ -17,6 +17,21 @@ class OperationConflictError(ApplicationError):
     pass
 
 
+class MeetingErasureBlockedError(OperationConflictError):
+    def __init__(self) -> None:
+        super().__init__("Meeting erasure is blocked by active or unresolved work")
+
+
+class MeetingErasureRequestConflictError(OperationConflictError):
+    def __init__(self) -> None:
+        super().__init__("The erasure request conflicts with an existing operation")
+
+
+class MeetingErasureIntegrityError(ApplicationError):
+    def __init__(self) -> None:
+        super().__init__("Meeting erasure state failed an integrity check")
+
+
 class ReviewDigestMismatchError(OperationConflictError):
     def __init__(self) -> None:
         super().__init__("The review changed before approval")

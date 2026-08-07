@@ -489,33 +489,7 @@ class SqliteRecordingCleanupRepository:
             and current.reason is RecordingCleanupReason.MEETING_ERASURE
             and current.status in {RecordingCleanupStatus.SUCCEEDED, RecordingCleanupStatus.FAILED}
         ):
-            linked = self._connection.execute(
-                """
-                SELECT status, recording_state FROM meeting_erasure_jobs
-                WHERE cleanup_job_id = ?
-                """,
-                (str(job.id),),
-            ).fetchall()
-            valid_group_reset = (
-                current.status is RecordingCleanupStatus.FAILED
-                and job.status is RecordingCleanupStatus.READY
-                and job.attempt_count == 0
-                and job.next_attempt_at is None
-                and job.lease_owner is None
-                and job.lease_expires_at is None
-                and job.last_failure is None
-                and job.completed_at is None
-                and bool(linked)
-                and all(
-                    row["status"] == MeetingErasureStatus.ACTIVE.value
-                    and row["recording_state"] == MeetingErasureRecordingState.CLEANUP_PENDING.value
-                    for row in linked
-                )
-            )
-            if not valid_group_reset:
-                raise PersistenceConflictError(
-                    "The recording cleanup terminal state cannot be reset"
-                )
+            raise PersistenceConflictError("The recording cleanup terminal state cannot be reset")
         cursor = self._connection.execute(
             """
             UPDATE recording_cleanup_jobs
@@ -784,25 +758,34 @@ class SqliteMeetingErasureRepository:
             )
             if cursor.rowcount != len(jobs):
                 raise PersistenceConflictError("The cleanup remediation group changed")
-            requeued = RecordingCleanupJob.model_validate(
-                cleanup.model_dump(mode="python")
-                | {
-                    "status": RecordingCleanupStatus.READY,
-                    "attempt_count": 0,
-                    "next_attempt_at": None,
-                    "lease_owner": None,
-                    "lease_expires_at": None,
-                    "last_failure": None,
-                    "updated_at": now,
-                    "completed_at": None,
-                }
+            reset = self._connection.execute(
+                """
+                UPDATE recording_cleanup_jobs
+                SET status = 'ready', attempt_count = 0, next_attempt_at = NULL,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    last_failure_json = NULL, updated_at = ?, completed_at = NULL
+                WHERE id = ? AND storage_key = ? AND expected_sha256 = ?
+                  AND expected_size_bytes = ? AND reason = 'meeting_erasure'
+                  AND status = 'failed' AND attempt_count = ? AND max_attempts = ?
+                  AND next_attempt_at IS NULL AND lease_owner IS NULL
+                  AND lease_expires_at IS NULL AND last_failure_json IS NOT NULL
+                  AND created_at = ? AND updated_at = ? AND completed_at IS ?
+                """,
+                (
+                    str(now),
+                    str(cleanup.id),
+                    cleanup.storage_key,
+                    cleanup.expected_sha256,
+                    cleanup.expected_size_bytes,
+                    cleanup.attempt_count,
+                    cleanup.max_attempts,
+                    str(cleanup.created_at),
+                    str(cleanup.updated_at),
+                    _as_text(cleanup.completed_at),
+                ),
             )
-            SqliteRecordingCleanupRepository(self._connection).save(
-                requeued,
-                RecordingCleanupStatus.FAILED,
-                None,
-                None,
-            )
+            if reset.rowcount != 1:
+                raise PersistenceConflictError("The cleanup remediation group changed")
             updated = tuple(
                 self._from_row(row)
                 for row in self._connection.execute(
@@ -1237,6 +1220,226 @@ class SqliteMeetingErasureTombstoneRepository:
     @staticmethod
     def _from_row(row: sqlite3.Row) -> MeetingErasureTombstone:
         return MeetingErasureTombstone.model_validate(dict(row))
+
+
+class SqliteMeetingErasurePurgeRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def has_active_work(self, meeting_id: UUID, now: datetime) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM processing_jobs
+                    WHERE meeting_id = ?
+                      AND (
+                          status = 'running'
+                          OR status NOT IN (
+                              'ready', 'running', 'retry_wait',
+                              'succeeded', 'failed', 'cancelled'
+                          )
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM delivery_operation_bindings
+                    WHERE meeting_id = ? AND status = 'running'
+                      AND (
+                          lease_expires_at IS NULL
+                          OR julianday(lease_expires_at) IS NULL
+                          OR julianday(lease_expires_at) > julianday(?)
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM write_intents
+                    WHERE meeting_id = ?
+                      AND (
+                          status IN ('in_flight', 'unknown')
+                          OR status NOT IN (
+                              'pending', 'in_flight', 'retry_wait',
+                              'unknown', 'succeeded', 'permanent_failed'
+                          )
+                      )
+                )
+            """,
+            (str(meeting_id), str(meeting_id), str(now), str(meeting_id)),
+        ).fetchone()
+        return row is not None and bool(row[0])
+
+    def meeting_graph_is_consistent(
+        self,
+        meeting_id: UUID,
+        audio_asset_id: UUID,
+    ) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT NOT (
+                EXISTS (
+                    SELECT 1 FROM meetings meeting
+                    WHERE meeting.id = ?
+                      AND meeting.current_transcript_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM transcripts transcript
+                          WHERE transcript.id = meeting.current_transcript_id
+                            AND transcript.meeting_id = meeting.id
+                            AND transcript.audio_asset_id = ?
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM meetings meeting
+                    WHERE meeting.id = ?
+                      AND meeting.current_review_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM review_revisions review
+                          WHERE review.id = meeting.current_review_id
+                            AND review.meeting_id = meeting.id
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM meetings meeting
+                    WHERE meeting.id = ?
+                      AND meeting.approved_review_id IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM review_revisions review
+                          WHERE review.id = meeting.approved_review_id
+                            AND review.meeting_id = meeting.id
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM meetings other
+                    JOIN transcripts transcript
+                      ON transcript.id = other.current_transcript_id
+                    WHERE other.id <> ? AND transcript.meeting_id = ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM meetings other
+                    JOIN review_revisions review
+                      ON review.id IN (other.current_review_id, other.approved_review_id)
+                    WHERE other.id <> ? AND review.meeting_id = ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM transcripts transcript
+                    WHERE transcript.meeting_id = ? AND transcript.audio_asset_id <> ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM review_revisions review
+                    LEFT JOIN transcripts transcript ON transcript.id = review.transcript_id
+                    WHERE (review.meeting_id = ? OR transcript.meeting_id = ?)
+                      AND (
+                          transcript.id IS NULL
+                          OR review.meeting_id <> transcript.meeting_id
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM approvals approval
+                    LEFT JOIN review_revisions review
+                      ON review.id = approval.review_revision_id
+                    WHERE (approval.meeting_id = ? OR review.meeting_id = ?)
+                      AND (
+                          review.id IS NULL
+                          OR approval.meeting_id <> review.meeting_id
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM recap_artifacts recap
+                    LEFT JOIN approvals approval ON approval.id = recap.approval_id
+                    WHERE (recap.meeting_id = ? OR approval.meeting_id = ?)
+                      AND (
+                          approval.id IS NULL
+                          OR recap.meeting_id <> approval.meeting_id
+                      )
+                )
+                OR EXISTS (
+                    SELECT 1 FROM write_intents intent
+                    LEFT JOIN approvals approval ON approval.id = intent.approval_id
+                    WHERE (intent.meeting_id = ? OR approval.meeting_id = ?)
+                      AND (
+                          approval.id IS NULL
+                          OR intent.meeting_id <> approval.meeting_id
+                      )
+                )
+            )
+            """,
+            (
+                str(meeting_id),
+                str(audio_asset_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(audio_asset_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+                str(meeting_id),
+            ),
+        ).fetchone()
+        return row is not None and bool(row[0])
+
+    def audio_has_other_references(
+        self,
+        audio_asset_id: UUID,
+        meeting_id: UUID,
+    ) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT
+                EXISTS (
+                    SELECT 1 FROM meetings
+                    WHERE audio_asset_id = ? AND id <> ?
+                )
+                OR EXISTS (
+                    SELECT 1 FROM transcripts
+                    WHERE audio_asset_id = ? AND meeting_id <> ?
+                )
+            """,
+            (
+                str(audio_asset_id),
+                str(meeting_id),
+                str(audio_asset_id),
+                str(meeting_id),
+            ),
+        ).fetchone()
+        return row is not None and bool(row[0])
+
+    def delete_meeting_graph(self, meeting_id: UUID) -> bool:
+        self._connection.execute("SAVEPOINT meeting_erasure_graph_delete")
+        try:
+            self._connection.execute(
+                "DELETE FROM delivery_operation_bindings WHERE meeting_id = ?",
+                (str(meeting_id),),
+            )
+            cursor = self._connection.execute(
+                "DELETE FROM meetings WHERE id = ?",
+                (str(meeting_id),),
+            )
+        except sqlite3.IntegrityError:
+            self._connection.execute("ROLLBACK TO meeting_erasure_graph_delete")
+            self._connection.execute("RELEASE meeting_erasure_graph_delete")
+            return False
+        if cursor.rowcount != 1:
+            self._connection.execute("ROLLBACK TO meeting_erasure_graph_delete")
+            self._connection.execute("RELEASE meeting_erasure_graph_delete")
+            return False
+        self._connection.execute("RELEASE meeting_erasure_graph_delete")
+        return True
+
+    def delete_audio_asset(self, audio_asset_id: UUID) -> bool:
+        try:
+            cursor = self._connection.execute(
+                "DELETE FROM audio_assets WHERE id = ?",
+                (str(audio_asset_id),),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return cursor.rowcount == 1
 
 
 class SqliteTranscriptRepository:
@@ -2161,6 +2364,7 @@ class SqliteUnitOfWork:
         self.meeting_erasures: SqliteMeetingErasureRepository
         self.meeting_erasure_operations: SqliteMeetingErasureOperationRepository
         self.meeting_erasure_tombstones: SqliteMeetingErasureTombstoneRepository
+        self.meeting_erasure_purge: SqliteMeetingErasurePurgeRepository
         self.transcripts: SqliteTranscriptRepository
         self.reviews: SqliteReviewRepository
         self.approvals: SqliteApprovalRepository
@@ -2184,6 +2388,7 @@ class SqliteUnitOfWork:
         self.meeting_erasures = SqliteMeetingErasureRepository(connection)
         self.meeting_erasure_operations = SqliteMeetingErasureOperationRepository(connection)
         self.meeting_erasure_tombstones = SqliteMeetingErasureTombstoneRepository(connection)
+        self.meeting_erasure_purge = SqliteMeetingErasurePurgeRepository(connection)
         self.transcripts = SqliteTranscriptRepository(connection)
         self.reviews = SqliteReviewRepository(connection)
         self.approvals = SqliteApprovalRepository(connection)

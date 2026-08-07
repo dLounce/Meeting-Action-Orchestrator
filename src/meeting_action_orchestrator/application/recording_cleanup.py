@@ -326,6 +326,7 @@ class RecordingCleanupWorker:
                 current.lease_owner,
                 current.lease_expires_at,
             )
+            uow.recording_cleanups.delete_succeeded(completed)
             uow.commit()
         return completed
 
