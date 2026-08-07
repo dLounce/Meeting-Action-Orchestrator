@@ -6,6 +6,7 @@ from contextlib import AbstractAsyncContextManager
 from fastapi import FastAPI
 
 from meeting_action_orchestrator.api.contracts import ApiDependencies
+from meeting_action_orchestrator.api.erasure_routes import erasure_router
 from meeting_action_orchestrator.api.errors import install_service_error_handlers
 from meeting_action_orchestrator.api.middleware import (
     RequestBodyLimitMiddleware,
@@ -38,6 +39,7 @@ def create_app(
     install_service_error_handlers(app)
     app.include_router(health_router)
     app.include_router(meeting_router)
+    app.include_router(erasure_router)
     app.add_middleware(
         RequestBodyLimitMiddleware,
         max_bytes=dependencies.max_upload_bytes + REQUEST_ENVELOPE_BYTES,

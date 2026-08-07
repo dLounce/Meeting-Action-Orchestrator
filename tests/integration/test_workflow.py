@@ -52,6 +52,7 @@ from meeting_action_orchestrator.domain.models import (
 )
 from meeting_action_orchestrator.infrastructure.audio import AudioMetadata, StoredAudio
 from meeting_action_orchestrator.infrastructure.database import Database
+from meeting_action_orchestrator.infrastructure.erasure_tokens import ErasureTokenKeyring
 from meeting_action_orchestrator.infrastructure.openai_transcription import (
     TranscriptionOutput,
     TranscriptionSegment,
@@ -65,6 +66,7 @@ PARTICIPANTS = (
     PersonRef(display_name="Mira", email="Mira@example.com"),
     PersonRef(display_name="Dev", email=None),
 )
+ERASURE_TOKENS = ErasureTokenKeyring("current", {"current": b"e" * 32})
 
 
 class FrozenClock:
@@ -254,6 +256,7 @@ def workflow(
     tmp_path: Path,
     *,
     recording_store: FakeRecordingStore | None = None,
+    erasure_tokens: ErasureTokenKeyring = ERASURE_TOKENS,
     specialists: FakeSpecialists | None = None,
     unit_of_work_type: type[SqliteUnitOfWork] = SqliteUnitOfWork,
     cleanup_scheduler_type: type[RecordingCleanupScheduler] = RecordingCleanupScheduler,
@@ -263,6 +266,7 @@ def workflow(
     service = MeetingWorkflow(
         unit_of_work=lambda: unit_of_work_type(database),
         recording_store=recording_store or FakeRecordingStore(tmp_path / "audio"),
+        erasure_tokens=erasure_tokens,
         transcriber=FakeTranscriber(),
         specialists=specialists or FakeSpecialists(),
         clock=FrozenClock(),
@@ -567,6 +571,7 @@ def test_ambiguous_cleanup_commit_replays_the_ingest_and_keeps_the_job(
     ambiguous = MeetingWorkflow(
         unit_of_work=lambda: CommitThenRaiseUnitOfWork(database),
         recording_store=recording_store,
+        erasure_tokens=ERASURE_TOKENS,
         transcriber=FakeTranscriber(),
         specialists=FakeSpecialists(),
         clock=FrozenClock(),

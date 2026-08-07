@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import BinaryIO, Protocol
 from uuid import UUID
 
+from meeting_action_orchestrator.application.meeting_erasure import MeetingErasureResult
 from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.application.processing_control import ProcessingControlResult
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
@@ -14,6 +15,7 @@ from meeting_action_orchestrator.application.workflow import (
 from meeting_action_orchestrator.domain.enums import MeetingStatus, WriteKind
 from meeting_action_orchestrator.domain.models import (
     Meeting,
+    MeetingErasureJob,
     ProcessingJob,
     RecapArtifact,
     ReviewRevision,
@@ -177,6 +179,28 @@ class DeliveryService(Protocol):
     ) -> DeliveryResult: ...
 
 
+class MeetingErasureApiService(Protocol):
+    async def request(
+        self,
+        meeting_id: UUID,
+        *,
+        expected_version: int,
+        request_key: str,
+        actor_id: str,
+    ) -> MeetingErasureResult: ...
+
+    async def get(self, erasure_job_id: UUID) -> MeetingErasureJob: ...
+
+    async def retry(
+        self,
+        erasure_job_id: UUID,
+        *,
+        expected_version: int,
+        request_key: str,
+        actor_id: str,
+    ) -> MeetingErasureResult: ...
+
+
 @dataclass(frozen=True, slots=True)
 class ApiDependencies:
     workflow: MeetingWorkflowService
@@ -184,6 +208,7 @@ class ApiDependencies:
     processing_controls: ProcessingController
     reviews: ReviewEditor
     deliveries: DeliveryService
+    erasures: MeetingErasureApiService
     authenticator: Authenticator
     readiness: ReadinessProbe
     max_upload_bytes: int

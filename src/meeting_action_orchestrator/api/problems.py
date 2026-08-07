@@ -133,10 +133,13 @@ async def validation_exception_handler(
         and location[0] == "header"
     }
     if "if-match" in missing_headers:
+        route = request.scope.get("route")
+        route_path = getattr(route, "path", "")
+        resource = "erasure job" if "/meeting-erasures/" in route_path else "meeting"
         return problem_response(
             create_problem(
                 428,
-                detail="If-Match must identify the meeting version being changed.",
+                detail=f"If-Match must identify the {resource} version being changed.",
                 type_uri="urn:meeting-action-orchestrator:problem:precondition-required",
                 instance=problem_instance(request),
                 request_id=_request_id(request),

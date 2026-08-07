@@ -18,10 +18,10 @@ from meeting_action_orchestrator.api.dependencies import (
     parse_meeting_precondition,
     parse_review_precondition,
 )
+from meeting_action_orchestrator.api.openapi import problem_responses
 from meeting_action_orchestrator.api.problems import (
     VALIDATION_PROBLEM_TYPE,
     FieldViolation,
-    ProblemDetail,
     ProblemError,
     create_problem,
 )
@@ -49,20 +49,7 @@ from meeting_action_orchestrator.domain.enums import IssueStatus, MeetingStatus,
 from meeting_action_orchestrator.domain.errors import DomainError
 from meeting_action_orchestrator.domain.hashing import canonical_sha256
 
-PROBLEM_SCHEMA = ProblemDetail.model_json_schema(by_alias=True)
-
-
-def _problem_response_spec(status: int) -> dict[str, Any]:
-    return {
-        "description": HTTPStatus(status).phrase,
-        "content": {"application/problem+json": {"schema": PROBLEM_SCHEMA}},
-    }
-
-
-PROBLEM_RESPONSES: dict[int | str, dict[str, Any]] = {
-    status: _problem_response_spec(status)
-    for status in (400, 401, 404, 409, 412, 413, 422, 428, 500, 502, 503)
-}
+PROBLEM_RESPONSES = problem_responses((400, 401, 404, 409, 412, 413, 422, 428, 500, 502, 503))
 ETAG_HEADER = {
     "description": "Strong validator for the returned representation.",
     "schema": {"type": "string"},

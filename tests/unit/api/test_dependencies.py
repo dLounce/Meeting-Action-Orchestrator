@@ -5,9 +5,14 @@ from uuid import UUID
 
 import pytest
 
+from meeting_action_orchestrator.api.contracts import (
+    DeliveryService,
+    MeetingErasureApiService,
+)
 from meeting_action_orchestrator.api.dependencies import (
     format_etag,
     format_meeting_cursor,
+    parse_erasure_precondition,
     parse_idempotency_key,
     parse_meeting_cursor,
     parse_meeting_precondition,
@@ -20,6 +25,22 @@ from meeting_action_orchestrator.domain.enums import MeetingStatus
 DIGEST = "a" * 64
 
 
+def test_command_service_protocols_keep_their_owned_operations() -> None:
+    delivery_methods = {
+        name
+        for name, value in vars(DeliveryService).items()
+        if not name.startswith("_") and callable(value)
+    }
+    erasure_methods = {
+        name
+        for name, value in vars(MeetingErasureApiService).items()
+        if not name.startswith("_") and callable(value)
+    }
+
+    assert delivery_methods == {"retry", "reconcile"}
+    assert erasure_methods == {"request", "get", "retry"}
+
+
 def test_review_precondition_accepts_one_strong_digest_etag() -> None:
     assert parse_review_precondition(f'"{DIGEST}"') == DIGEST
     assert format_etag(DIGEST) == f'"{DIGEST}"'
@@ -28,6 +49,11 @@ def test_review_precondition_accepts_one_strong_digest_etag() -> None:
 def test_meeting_precondition_accepts_one_strong_version_etag() -> None:
     assert parse_meeting_precondition('"meeting-0"') == 0
     assert parse_meeting_precondition('"meeting-42"') == 42
+
+
+def test_erasure_precondition_accepts_one_strong_version_etag() -> None:
+    assert parse_erasure_precondition('"erasure-0"') == 0
+    assert parse_erasure_precondition('"erasure-42"') == 42
 
 
 @pytest.mark.parametrize(
@@ -45,6 +71,23 @@ def test_meeting_precondition_accepts_one_strong_version_etag() -> None:
 def test_meeting_precondition_rejects_missing_or_ambiguous_values(value: str | None) -> None:
     with pytest.raises(ProblemError):
         parse_meeting_precondition(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "erasure-1",
+        'W/"erasure-1"',
+        "*",
+        '"erasure-01"',
+        '"erasure-1", "erasure-2"',
+        '"erasure-9999999999999999999"',
+    ],
+)
+def test_erasure_precondition_rejects_missing_or_ambiguous_values(value: str | None) -> None:
+    with pytest.raises(ProblemError):
+        parse_erasure_precondition(value)
 
 
 @pytest.mark.parametrize(

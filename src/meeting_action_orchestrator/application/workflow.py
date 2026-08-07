@@ -18,6 +18,7 @@ from meeting_action_orchestrator.agents.contracts import (
 )
 from meeting_action_orchestrator.application.errors import (
     AudioAssetIdentityMismatchError,
+    OperationConflictError,
     ProviderConfigurationError,
     ProviderError,
     ProviderInputError,
@@ -42,6 +43,7 @@ from meeting_action_orchestrator.application.mapping import (
     transcript_input,
 )
 from meeting_action_orchestrator.application.ports import (
+    ErasureTokenCodec,
     RecordingStore,
     SpecialistProvider,
     StoredAudio,
@@ -153,6 +155,7 @@ class MeetingWorkflow:
         *,
         unit_of_work: Callable[[], UnitOfWork],
         recording_store: RecordingStore,
+        erasure_tokens: ErasureTokenCodec,
         transcriber: TranscriptionProvider,
         specialists: SpecialistProvider,
         clock: Clock,
@@ -164,6 +167,7 @@ class MeetingWorkflow:
     ) -> None:
         self._unit_of_work = unit_of_work
         self._recording_store = recording_store
+        self._erasure_tokens = erasure_tokens
         self._transcriber = transcriber
         self._specialists = specialists
         self._clock = clock
@@ -198,6 +202,13 @@ class MeetingWorkflow:
             )
             now = self._clock.now()
             with self._unit_of_work() as uow:
+                tombstone = uow.meeting_erasure_tombstones.find_by_ingest_key_tokens(
+                    self._erasure_tokens.ingest_key_tokens(request.ingest_key)
+                )
+                if tombstone is not None:
+                    raise OperationConflictError(
+                        "The ingest request conflicts with the current workflow state"
+                    )
                 existing = uow.meetings.find_by_ingest_key(request.ingest_key)
                 if existing is not None:
                     binding = uow.ingest_requests.get(request.ingest_key)

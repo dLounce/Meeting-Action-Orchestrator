@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 from pathlib import Path
 from threading import get_ident
 from typing import Any
@@ -10,6 +12,9 @@ import pytest
 from fastapi import FastAPI
 
 from meeting_action_orchestrator.application.delivery import DeliveryBatch, DeliveryResult
+from meeting_action_orchestrator.application.meeting_erasure_worker import (
+    MeetingErasureWorkerResult,
+)
 from meeting_action_orchestrator.application.recording_cleanup import (
     OrphanDiscoveryBatch,
     RecordingCleanupOutcome,
@@ -106,6 +111,36 @@ class FakeOrphanDiscoveryRunner:
         return self.batch
 
 
+class FakeErasureKeyRegistry:
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = ready
+        self.registrations = 0
+        self.validations = 0
+
+    async def ensure_registered(self) -> tuple[str, ...]:
+        self.registrations += 1
+        if not self.ready:
+            raise RuntimeError("key verification failed")
+        return ("current",)
+
+    async def validate_registered(self) -> tuple[str, ...]:
+        self.validations += 1
+        if not self.ready:
+            raise RuntimeError("key verification failed")
+        return ("current",)
+
+
+class FakeMeetingErasureRunner:
+    def __init__(self) -> None:
+        self.limits: list[int] = []
+        self.called = asyncio.Event()
+
+    async def run_once(self, limit: int = 20) -> tuple[MeetingErasureWorkerResult, ...]:
+        self.limits.append(limit)
+        self.called.set()
+        return ()
+
+
 class FakeCloser:
     def __init__(self) -> None:
         self.closed = False
@@ -182,12 +217,15 @@ class DisconnectingDeliveryRunner(FakeDeliveryRunner):
 
 
 def settings(root: Path, **updates: object) -> Settings:
+    encoded_key = base64.urlsafe_b64encode(b"e" * 32).decode("ascii").rstrip("=")
     values = {
         "_env_file": None,
         "database_path": root / "runtime.sqlite3",
         "upload_directory": root / "uploads",
         "api_bearer_token": "a" * 32,
         "openai_api_key": "test-openai-key",
+        "erasure_hmac_active_key_id": "current",
+        "erasure_hmac_keys": json.dumps({"current": encoded_key}),
         "worker_poll_interval_seconds": 0.01,
     }
     return Settings(**(values | updates))
@@ -207,6 +245,8 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
     delivery = FakeDeliveryRunner()
     cleanup = FakeRecordingCleanupRunner()
     discovery = FakeOrphanDiscoveryRunner()
+    erasure = FakeMeetingErasureRunner()
+    key_registry = FakeErasureKeyRegistry()
     mcp = FakeMcpClient()
     runtime = RuntimeSupervisor(
         database=database,
@@ -214,11 +254,14 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
         recording_storage=FakeRecordingStorage(),
         recording_cleanup=cleanup,
         orphan_discovery=discovery,
+        erasure_key_registry=key_registry,
+        meeting_erasure=erasure,
         delivery=delivery,
         mcp_client=mcp,
         poll_interval_seconds=0.01,
         processing_batch_size=2,
         recording_cleanup_batch_size=3,
+        meeting_erasure_batch_size=5,
         orphan_scan_interval_seconds=0.01,
         orphan_scan_batch_size=11,
         delivery_batch_size=7,
@@ -229,6 +272,7 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
         await asyncio.wait_for(delivery.called.wait(), timeout=1)
         await asyncio.wait_for(cleanup.called.wait(), timeout=1)
         await asyncio.wait_for(discovery.called.wait(), timeout=1)
+        await asyncio.wait_for(erasure.called.wait(), timeout=1)
         assert runtime.started
         assert runtime.delivery_ready
 
@@ -240,6 +284,8 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
     assert delivery.limits == [1]
     assert cleanup.limits == [3]
     assert discovery.limits == [11]
+    assert erasure.limits == [5]
+    assert key_registry.registrations == 1
     assert mcp.events == ["start", "close"]
     assert not runtime.started
     assert not runtime.delivery_ready
@@ -259,7 +305,9 @@ async def test_application_lifespan_is_offline_when_delivery_is_disabled(
         assert [check.name for check in readiness.checks] == [
             "database",
             "recording_storage",
+            "erasure_keys",
             "runtime",
+            "erasure_worker",
             "delivery:disabled",
         ]
 
@@ -278,11 +326,14 @@ async def test_connector_outage_does_not_block_processing_startup() -> None:
         recording_storage=FakeRecordingStorage(),
         recording_cleanup=FakeRecordingCleanupRunner(),
         orphan_discovery=FakeOrphanDiscoveryRunner(),
+        erasure_key_registry=FakeErasureKeyRegistry(),
+        meeting_erasure=FakeMeetingErasureRunner(),
         delivery=delivery,
         mcp_client=mcp,
         poll_interval_seconds=0.01,
         processing_batch_size=1,
         recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
         orphan_scan_interval_seconds=0.01,
         orphan_scan_batch_size=1,
     )
@@ -307,11 +358,14 @@ async def test_connector_readiness_tracks_disconnection_and_recovery() -> None:
         recording_storage=FakeRecordingStorage(),
         recording_cleanup=FakeRecordingCleanupRunner(),
         orphan_discovery=FakeOrphanDiscoveryRunner(),
+        erasure_key_registry=FakeErasureKeyRegistry(),
+        meeting_erasure=FakeMeetingErasureRunner(),
         delivery=delivery,
         mcp_client=mcp,
         poll_interval_seconds=0.01,
         processing_batch_size=1,
         recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
         orphan_scan_interval_seconds=0.01,
         orphan_scan_batch_size=1,
         delivery_batch_size=3,
@@ -357,9 +411,12 @@ async def test_storage_preflight_failure_closes_resources_without_starting_worke
         recording_storage=storage,
         recording_cleanup=cleanup,
         orphan_discovery=discovery,
+        erasure_key_registry=FakeErasureKeyRegistry(),
+        meeting_erasure=FakeMeetingErasureRunner(),
         poll_interval_seconds=0.01,
         processing_batch_size=1,
         recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
         orphan_scan_interval_seconds=0.01,
         orphan_scan_batch_size=1,
         closeables=(closer,),
@@ -374,6 +431,38 @@ async def test_storage_preflight_failure_closes_resources_without_starting_worke
     assert not cleanup.limits
     assert not discovery.limits
     assert closer.closed
+
+
+async def test_key_verification_fails_before_storage_and_workers() -> None:
+    storage = FakeRecordingStorage()
+    processing = FakeProcessingRunner()
+    cleanup = FakeRecordingCleanupRunner()
+    discovery = FakeOrphanDiscoveryRunner()
+    erasure = FakeMeetingErasureRunner()
+    runtime = RuntimeSupervisor(
+        database=FakeDatabase(),
+        processing=processing,
+        recording_storage=storage,
+        recording_cleanup=cleanup,
+        orphan_discovery=discovery,
+        erasure_key_registry=FakeErasureKeyRegistry(ready=False),
+        meeting_erasure=erasure,
+        poll_interval_seconds=0.01,
+        processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match="key verification"):
+        await runtime.start()
+
+    assert not storage.thread_ids
+    assert not processing.calls
+    assert not cleanup.limits
+    assert not discovery.limits
+    assert not erasure.limits
 
 
 async def test_partial_worker_startup_is_cancelled_and_resources_are_closed(
@@ -401,9 +490,12 @@ async def test_partial_worker_startup_is_cancelled_and_resources_are_closed(
         recording_storage=FakeRecordingStorage(),
         recording_cleanup=FakeRecordingCleanupRunner(),
         orphan_discovery=FakeOrphanDiscoveryRunner(),
+        erasure_key_registry=FakeErasureKeyRegistry(),
+        meeting_erasure=FakeMeetingErasureRunner(),
         poll_interval_seconds=0.01,
         processing_batch_size=1,
         recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
         orphan_scan_interval_seconds=0.01,
         orphan_scan_batch_size=1,
         closeables=(closer,),
@@ -436,9 +528,12 @@ async def test_permanent_cleanup_result_does_not_change_readiness() -> None:
         recording_storage=storage,
         recording_cleanup=cleanup,
         orphan_discovery=FakeOrphanDiscoveryRunner(),
+        erasure_key_registry=FakeErasureKeyRegistry(),
+        meeting_erasure=FakeMeetingErasureRunner(),
         poll_interval_seconds=0.01,
         processing_batch_size=1,
         recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
         orphan_scan_interval_seconds=0.01,
         orphan_scan_batch_size=1,
     )
@@ -452,6 +547,50 @@ async def test_permanent_cleanup_result_does_not_change_readiness() -> None:
     assert result.ready
     assert storage.thread_ids
     assert loop_thread not in storage.thread_ids
+
+
+async def test_readiness_tracks_key_validation_and_erasure_worker_liveness() -> None:
+    database = FakeDatabase()
+    key_registry = FakeErasureKeyRegistry()
+    erasure = FakeMeetingErasureRunner()
+    runtime = RuntimeSupervisor(
+        database=database,
+        processing=FakeProcessingRunner(),
+        recording_storage=FakeRecordingStorage(),
+        recording_cleanup=FakeRecordingCleanupRunner(),
+        orphan_discovery=FakeOrphanDiscoveryRunner(),
+        erasure_key_registry=key_registry,
+        meeting_erasure=erasure,
+        poll_interval_seconds=0.01,
+        processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        meeting_erasure_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
+    )
+    readiness = RuntimeReadinessProbe(database, runtime)
+
+    async with runtime.lifespan(FastAPI()):
+        await asyncio.wait_for(erasure.called.wait(), timeout=1)
+        key_registry.ready = False
+        invalid_keys = await readiness.check()
+        invalid_checks = {check.name: check.ready for check in invalid_keys.checks}
+        assert not invalid_keys.ready
+        assert not invalid_checks["erasure_keys"]
+        assert invalid_checks["erasure_worker"]
+
+        key_registry.ready = True
+        erasure_task = next(
+            task for task in runtime._tasks if task.get_name() == "meeting-erasure-worker"
+        )
+        erasure_task.cancel()
+        await asyncio.gather(erasure_task, return_exceptions=True)
+        stopped_worker = await readiness.check()
+        stopped_checks = {check.name: check.ready for check in stopped_worker.checks}
+        assert not stopped_worker.ready
+        assert stopped_checks["erasure_keys"]
+        assert not stopped_checks["erasure_worker"]
+        assert not stopped_checks["runtime"]
 
 
 async def test_mcp_url_without_targets_keeps_delivery_disabled(tmp_path: Path) -> None:

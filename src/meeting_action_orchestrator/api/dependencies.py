@@ -20,6 +20,7 @@ from meeting_action_orchestrator.domain.enums import MeetingStatus
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._~:+/-]{0,199}")
 REVIEW_ETAG_PATTERN = re.compile(r'"([0-9a-f]{64})"')
 MEETING_ETAG_PATTERN = re.compile(r'"meeting-(0|[1-9][0-9]{0,18})"')
+ERASURE_ETAG_PATTERN = re.compile(r'"erasure-(0|[1-9][0-9]{0,18})"')
 MEETING_CURSOR_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 MEETING_CURSOR_VERSION = 1
 MEETING_CURSOR_STATUS_BYTES = 8
@@ -111,6 +112,36 @@ def parse_meeting_precondition(if_match: str | None) -> int:
             create_problem(
                 400,
                 detail="If-Match contains an unsupported meeting version.",
+                type_uri="urn:meeting-action-orchestrator:problem:invalid-precondition",
+            )
+        )
+    return version
+
+
+def parse_erasure_precondition(if_match: str | None) -> int:
+    if if_match is None:
+        raise ProblemError(
+            create_problem(
+                428,
+                detail="If-Match must identify the erasure job version being changed.",
+                type_uri="urn:meeting-action-orchestrator:problem:precondition-required",
+            )
+        )
+    match = ERASURE_ETAG_PATTERN.fullmatch(if_match.strip())
+    if match is None:
+        raise ProblemError(
+            create_problem(
+                400,
+                detail="If-Match must contain one strong erasure ETag.",
+                type_uri="urn:meeting-action-orchestrator:problem:invalid-precondition",
+            )
+        )
+    version = int(match.group(1))
+    if version > 9_223_372_036_854_775_807:
+        raise ProblemError(
+            create_problem(
+                400,
+                detail="If-Match contains an unsupported erasure job version.",
                 type_uri="urn:meeting-action-orchestrator:problem:invalid-precondition",
             )
         )

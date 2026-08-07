@@ -29,6 +29,7 @@ from meeting_action_orchestrator.api.contracts import (
     ReadinessCheck,
     ReadinessResult,
 )
+from meeting_action_orchestrator.api.erasure_adapters import AsyncErasureFacade
 from meeting_action_orchestrator.application.delivery import (
     ApprovedOutboxExecutor,
     DeliveryBatch,
@@ -40,6 +41,15 @@ from meeting_action_orchestrator.application.delivery import (
 from meeting_action_orchestrator.application.delivery_control import DeliveryControlService
 from meeting_action_orchestrator.application.errors import OperationConflictError
 from meeting_action_orchestrator.application.mapping import DeliveryTargets
+from meeting_action_orchestrator.application.meeting_erasure import (
+    ErasureKeyRegistry,
+    MeetingErasureRemediationService,
+    MeetingErasureService,
+)
+from meeting_action_orchestrator.application.meeting_erasure_worker import (
+    MeetingErasureWorker,
+    MeetingErasureWorkerResult,
+)
 from meeting_action_orchestrator.application.processing import (
     FullJitterRetryScheduler as ProcessingRetryScheduler,
 )
@@ -64,6 +74,7 @@ from meeting_action_orchestrator.infrastructure.audio import (
     LocalAudioStore,
 )
 from meeting_action_orchestrator.infrastructure.database import Database
+from meeting_action_orchestrator.infrastructure.erasure_tokens import ErasureTokenKeyring
 from meeting_action_orchestrator.infrastructure.mcp_client import ManagedMcpHttpClient
 from meeting_action_orchestrator.infrastructure.mcp_gateway import McpGateway, McpToolNames
 from meeting_action_orchestrator.infrastructure.openai_agents import OpenAIAgentsRunner
@@ -103,6 +114,16 @@ class OrphanDiscoveryRunner(Protocol):
     async def run_once(self, limit: int = 100) -> OrphanDiscoveryBatch: ...
 
 
+class ErasureKeyRegistryLifecycle(Protocol):
+    async def ensure_registered(self) -> tuple[str, ...]: ...
+
+    async def validate_registered(self) -> tuple[str, ...]: ...
+
+
+class MeetingErasureRunner(Protocol):
+    async def run_once(self, limit: int = 20) -> tuple[MeetingErasureWorkerResult, ...]: ...
+
+
 class RecordingStorage(Protocol):
     def healthcheck(self) -> bool: ...
 
@@ -127,9 +148,12 @@ class RuntimeSupervisor:
     recording_storage: RecordingStorage
     recording_cleanup: RecordingCleanupRunner
     orphan_discovery: OrphanDiscoveryRunner
+    erasure_key_registry: ErasureKeyRegistryLifecycle
+    meeting_erasure: MeetingErasureRunner
     poll_interval_seconds: float
     processing_batch_size: int
     recording_cleanup_batch_size: int
+    meeting_erasure_batch_size: int
     orphan_scan_interval_seconds: float
     orphan_scan_batch_size: int
     delivery: DeliveryRunner | None = None
@@ -152,6 +176,8 @@ class RuntimeSupervisor:
             raise ValueError("delivery_batch_size must be between one and 100")
         if not 1 <= self.recording_cleanup_batch_size <= 100:
             raise ValueError("recording_cleanup_batch_size must be between one and 100")
+        if not 1 <= self.meeting_erasure_batch_size <= 100:
+            raise ValueError("meeting_erasure_batch_size must be between one and 100")
         if not math.isfinite(self.orphan_scan_interval_seconds) or not (
             0 < self.orphan_scan_interval_seconds <= 86_400
         ):
@@ -177,6 +203,19 @@ class RuntimeSupervisor:
     def worker_ready(self) -> bool:
         return self._started and bool(self._tasks) and all(not task.done() for task in self._tasks)
 
+    @property
+    def erasure_worker_ready(self) -> bool:
+        return self._started and any(
+            task.get_name() == "meeting-erasure-worker" and not task.done() for task in self._tasks
+        )
+
+    async def erasure_keys_ready(self) -> bool:
+        try:
+            await self.erasure_key_registry.validate_registered()
+        except Exception:
+            return False
+        return True
+
     async def start(self) -> None:
         async with self._lock:
             if self._started:
@@ -185,6 +224,7 @@ class RuntimeSupervisor:
                 raise RuntimeError("The runtime supervisor cannot be restarted after shutdown")
             try:
                 version = await asyncio.to_thread(self.database.migrate)
+                key_ids = await self.erasure_key_registry.ensure_registered()
                 storage_ready = await asyncio.to_thread(self.storage_healthcheck)
                 if not storage_ready:
                     raise RuntimeError("Recording storage preflight failed")
@@ -198,6 +238,12 @@ class RuntimeSupervisor:
                     asyncio.create_task(
                         self._recording_cleanup_loop(),
                         name="recording-cleanup-worker",
+                    )
+                )
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._meeting_erasure_loop(),
+                        name="meeting-erasure-worker",
                     )
                 )
                 self._tasks.append(
@@ -225,6 +271,7 @@ class RuntimeSupervisor:
                     "fields": {
                         "database_version": version,
                         "delivery_mode": self.delivery_mode,
+                        "erasure_key_count": len(key_ids),
                         "worker_count": len(self._tasks),
                     }
                 },
@@ -348,6 +395,24 @@ class RuntimeSupervisor:
                 )
             await asyncio.sleep(self.orphan_scan_interval_seconds)
 
+    async def _meeting_erasure_loop(self) -> None:
+        while True:
+            try:
+                results = await self.meeting_erasure.run_once(self.meeting_erasure_batch_size)
+                if results:
+                    logger.info(
+                        "meeting erasure batch completed",
+                        extra={"fields": {"job_count": len(results)}},
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "meeting erasure worker cycle failed",
+                    extra={"fields": {"worker": "meeting_erasure"}},
+                )
+            await asyncio.sleep(self.poll_interval_seconds)
+
     async def _connect_mcp(self) -> None:
         if self.mcp_client is None or self.mcp_client.connected:
             return
@@ -404,16 +469,19 @@ class RuntimeReadinessProbe:
         self._runtime = runtime
 
     async def check(self) -> ReadinessResult:
-        database_ready, storage_ready = await asyncio.gather(
+        database_ready, storage_ready, erasure_keys_ready = await asyncio.gather(
             asyncio.to_thread(self._healthcheck),
             asyncio.to_thread(self._runtime.storage_healthcheck),
+            self._runtime.erasure_keys_ready(),
         )
         delivery_name = f"delivery:{self._runtime.delivery_mode}"
         return ReadinessResult(
             (
                 ReadinessCheck("database", database_ready),
                 ReadinessCheck("recording_storage", storage_ready),
+                ReadinessCheck("erasure_keys", erasure_keys_ready),
                 ReadinessCheck("runtime", self._runtime.worker_ready),
+                ReadinessCheck("erasure_worker", self._runtime.erasure_worker_ready),
                 ReadinessCheck(delivery_name, self._runtime.delivery_ready),
             )
         )
@@ -451,6 +519,11 @@ class UnavailableDeliveryService:
 
 def create_application(settings: Settings | None = None) -> FastAPI:
     configured = settings or get_settings()
+    active_erasure_key_id, encoded_erasure_keys = configured.require_erasure_hmac_configuration()
+    erasure_tokens = ErasureTokenKeyring.from_encoded(
+        active_erasure_key_id,
+        encoded_erasure_keys,
+    )
     api_token = configured.require_api_bearer_token()
     openai_key = configured.require_openai_api_key()
     database = Database(configured.database_path)
@@ -462,6 +535,25 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         return SqliteUnitOfWork(database, immediate=False)
 
     clock = SystemClock()
+    erasure_key_registry = ErasureKeyRegistry(
+        unit_of_work=write_unit_of_work,
+        validation_unit_of_work=read_unit_of_work,
+        tokens=erasure_tokens,
+        clock=clock,
+    )
+    erasure_requests = MeetingErasureService(
+        unit_of_work=write_unit_of_work,
+        tokens=erasure_tokens,
+        key_registry=erasure_key_registry,
+        clock=clock,
+        max_remediations=configured.meeting_erasure_max_remediations,
+    )
+    erasure_remediations = MeetingErasureRemediationService(
+        unit_of_work=write_unit_of_work,
+        tokens=erasure_tokens,
+        key_registry=erasure_key_registry,
+        clock=clock,
+    )
     targets = _delivery_targets(configured)
     recording_store = LocalAudioStore(
         configured.upload_directory,
@@ -496,6 +588,7 @@ def create_application(settings: Settings | None = None) -> FastAPI:
     workflow = MeetingWorkflow(
         unit_of_work=write_unit_of_work,
         recording_store=recording_store,
+        erasure_tokens=erasure_tokens,
         transcriber=transcriber,
         specialists=specialists,
         clock=clock,
@@ -519,6 +612,14 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         worker_id=_worker_id("recording-cleanup"),
         lease_duration=timedelta(seconds=configured.recording_cleanup_lease_seconds),
     )
+    meeting_erasure = MeetingErasureWorker(
+        unit_of_work=write_unit_of_work,
+        checkpoint=database,
+        clock=clock,
+        retry_scheduler=ProcessingRetryScheduler(),
+        worker_id=_worker_id("meeting-erasure"),
+        lease_duration=timedelta(seconds=configured.meeting_erasure_lease_seconds),
+    )
     orphan_discovery = RecordingOrphanDiscoverer(
         unit_of_work=read_unit_of_work,
         scheduler=recording_cleanup_scheduler,
@@ -538,9 +639,12 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         recording_storage=recording_quarantine,
         recording_cleanup=recording_cleanup,
         orphan_discovery=orphan_discovery,
+        erasure_key_registry=erasure_key_registry,
+        meeting_erasure=meeting_erasure,
         poll_interval_seconds=configured.worker_poll_interval_seconds,
         processing_batch_size=configured.processing_batch_size,
         recording_cleanup_batch_size=configured.recording_cleanup_batch_size,
+        meeting_erasure_batch_size=configured.meeting_erasure_batch_size,
         orphan_scan_interval_seconds=configured.recording_orphan_scan_interval_seconds,
         orphan_scan_batch_size=configured.recording_orphan_scan_batch_size,
         delivery=delivery_executor,
@@ -570,6 +674,11 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         ),
         reviews=workflow_facade,
         deliveries=delivery_service,
+        erasures=AsyncErasureFacade(
+            erasure_requests,
+            erasure_remediations,
+            read_unit_of_work,
+        ),
         authenticator=StaticBearerAuthenticator(
             api_token,
             configured.api_actor_subject,

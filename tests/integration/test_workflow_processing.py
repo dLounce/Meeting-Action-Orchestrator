@@ -57,6 +57,7 @@ from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.openai_transcription import TranscriptionOutput
 from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOfWork
 from tests.integration.test_workflow import (
+    ERASURE_TOKENS,
     NOW,
     FakeRecordingStore,
     FakeSpecialists,
@@ -136,6 +137,7 @@ def create_workflow(
     service = MeetingWorkflow(
         unit_of_work=unit_of_work,
         recording_store=FakeRecordingStore(tmp_path / "audio"),
+        erasure_tokens=ERASURE_TOKENS,
         transcriber=transcriber or FakeTranscriber(),
         specialists=specialists or FakeSpecialists(),
         clock=clock,
