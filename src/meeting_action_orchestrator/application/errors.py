@@ -63,6 +63,20 @@ class ProviderOutputError(ProviderError):
     pass
 
 
+class RecordingCleanupError(ApplicationError):
+    pass
+
+
+class RetryableRecordingCleanupError(RecordingCleanupError):
+    def __init__(self) -> None:
+        super().__init__("Recording cleanup can be retried")
+
+
+class PermanentRecordingCleanupError(RecordingCleanupError):
+    def __init__(self) -> None:
+        super().__init__("Recording cleanup was rejected for safety")
+
+
 class DeliveryGatewayError(RuntimeError):
     def __init__(
         self,
