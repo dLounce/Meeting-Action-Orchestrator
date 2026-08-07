@@ -13,6 +13,11 @@ class MissingOpenAIAPIKeyError(ValueError):
         super().__init__("OPENAI_API_KEY is required")
 
 
+class MissingApiBearerTokenError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("API_BEARER_TOKEN is required")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -28,6 +33,8 @@ class Settings(BaseSettings):
     database_path: Path = Path("runtime/orchestrator.sqlite3")
     upload_directory: Path = Path("uploads")
     max_upload_bytes: int = Field(default=26_214_400, gt=0)
+    api_bearer_token: SecretStr | None = None
+    api_actor_subject: str = Field(default="portfolio-owner", min_length=1, max_length=200)
 
     openai_api_key: SecretStr | None = None
     openai_recap_model: str = "gpt-5.6-terra"
@@ -49,7 +56,7 @@ class Settings(BaseSettings):
     mcp_task_tool: str = "create_task"
     mcp_lookup_tool: str = "find_action_by_idempotency_key"
 
-    @field_validator("openai_api_key", "mcp_auth_token", mode="before")
+    @field_validator("api_bearer_token", "openai_api_key", "mcp_auth_token", mode="before")
     @classmethod
     def empty_secret_is_none(cls, value: object) -> object:
         if value == "":
@@ -67,6 +74,11 @@ class Settings(BaseSettings):
         if self.openai_api_key is None:
             raise MissingOpenAIAPIKeyError
         return self.openai_api_key.get_secret_value()
+
+    def require_api_bearer_token(self) -> str:
+        if self.api_bearer_token is None:
+            raise MissingApiBearerTokenError
+        return self.api_bearer_token.get_secret_value()
 
 
 @lru_cache(maxsize=1)
