@@ -18,6 +18,7 @@ class DomainValueCode(str, Enum):
     CANONICAL_DATETIME = "canonical datetime must include a UTC offset"
     CANONICAL_TYPE = "canonical JSON received an unsupported value type"
     INGEST_FINGERPRINT_VERSION = "ingest request fingerprint version is unsupported"
+    ERASURE_IDENTITY_INPUT = "erasure identity input is invalid"
 
 
 class InvariantCode(str, Enum):
@@ -118,6 +119,16 @@ class InvariantCode(str, Enum):
     CLEANUP_RETRY_DISPOSITION = "recording cleanup retry requires a retryable failure"
     CLEANUP_COMPLETION_REQUIRED = "terminal recording cleanup requires a completion time"
     CLEANUP_COMPLETION_FORBIDDEN = "unfinished recording cleanup cannot be completed"
+    ERASURE_TIMESTAMPS = "meeting erasure timestamps are inconsistent"
+    ERASURE_RESOURCES = "meeting erasure recording state has inconsistent resources"
+    ERASURE_LEASE = "meeting erasure lease state is inconsistent"
+    ERASURE_RETRY = "meeting erasure retry state is inconsistent"
+    ERASURE_FAILURE = "meeting erasure failure state is inconsistent"
+    ERASURE_FAILURE_DISPOSITION = "meeting erasure failure disposition is invalid"
+    ERASURE_STATUS = "meeting erasure aggregate state is inconsistent"
+    ERASURE_REMEDIATIONS = "meeting erasure remediation count exceeds its limit"
+    ERASURE_OPERATION_FINGERPRINT = "meeting erasure operation fingerprint is invalid"
+    ERASURE_KEY_IDENTITY = "meeting erasure key identities are inconsistent"
     MEETING_OPERATION_STAGE = "meeting operation stage does not match its operation"
     MEETING_OPERATION_FINGERPRINT = "meeting operation fingerprint does not match its request"
 

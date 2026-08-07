@@ -19,12 +19,16 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
         ).fetchall()
     names = {row["name"] for row in rows}
-    assert version == 8
+    assert version == 9
     assert {
         "approvals",
         "audio_assets",
         "delivery_operation_bindings",
+        "erasure_key_verifiers",
         "ingest_request_bindings",
+        "meeting_erasure_jobs",
+        "meeting_erasure_operation_bindings",
+        "meeting_erasure_tombstones",
         "meeting_operation_bindings",
         "meetings",
         "processing_jobs",
@@ -42,8 +46,8 @@ def test_migrate_creates_expected_schema(tmp_path: Path) -> None:
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     database = Database(tmp_path / "application.sqlite3")
 
-    assert database.migrate() == 8
-    assert database.migrate() == 8
+    assert database.migrate() == 9
+    assert database.migrate() == 9
     assert database.healthcheck()
 
 
@@ -255,7 +259,7 @@ def test_migrate_upgrades_existing_version_one_database(tmp_path: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
     database = Database(path)
 
-    assert database.migrate() == 8
+    assert database.migrate() == 9
     with database.connect() as connection:
         tables = connection.execute(
             """
@@ -328,7 +332,9 @@ def test_v8_migration_leaves_legacy_meetings_unbound(
             ),
         )
 
-    assert database.migrate() == 8
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(database_module, "MIGRATIONS", database_module.MIGRATIONS[:8])
+        assert database.migrate() == 8
     with database.connect() as connection:
         binding_count = connection.execute(
             "SELECT COUNT(*) FROM ingest_request_bindings"

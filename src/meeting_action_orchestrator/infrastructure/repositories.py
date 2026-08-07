@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from types import TracebackType
 from uuid import UUID
 
 from meeting_action_orchestrator.application.ports import MeetingListCursor
 from meeting_action_orchestrator.domain.enums import (
     FailureDisposition,
+    MeetingErasureRecordingState,
+    MeetingErasureStatus,
     MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
+    RecordingCleanupReason,
     RecordingCleanupStatus,
     WriteStatus,
 )
@@ -21,8 +24,15 @@ from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
     DeliveryOperationBinding,
+    ErasureKeyVerifier,
+    ErasureToken,
+    ErasureTokenIdentity,
     IngestRequestBinding,
     Meeting,
+    MeetingErasureFailure,
+    MeetingErasureJob,
+    MeetingErasureOperationBinding,
+    MeetingErasureTombstone,
     MeetingOperationBinding,
     ProcessingJob,
     RecapArtifact,
@@ -40,10 +50,22 @@ class PersistenceConflictError(RuntimeError):
     pass
 
 
+class PersistenceIntegrityError(RuntimeError):
+    pass
+
+
 def _as_text(value: object | None) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _as_erasure_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Meeting erasure timestamps must be timezone-aware")
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _as_json(value: object) -> str:
@@ -54,6 +76,39 @@ def _load_json(value: str | None, default: object = None) -> object:
     if value is None:
         return default
     return json.loads(value)
+
+
+def _token_candidates(tokens: Sequence[ErasureToken]) -> tuple[ErasureToken, ...]:
+    if len(tokens) > 8:
+        raise ValueError("Erasure token candidate limit exceeded")
+    unique: dict[tuple[int, str, str], ErasureToken] = {}
+    for token in tokens:
+        unique[(token.token_version, token.key_id, token.digest)] = token
+    return tuple(unique.values())
+
+
+def _erasure_failure_values(
+    failure: MeetingErasureFailure | None,
+) -> tuple[str | None, str | None, str | None]:
+    if failure is None:
+        return (None, None, None)
+    return (
+        failure.code.value,
+        failure.disposition.value,
+        _as_erasure_datetime(failure.occurred_at),
+    )
+
+
+def _erasure_failure_from_row(row: sqlite3.Row) -> MeetingErasureFailure | None:
+    if row["last_failure_code"] is None:
+        return None
+    return MeetingErasureFailure.model_validate(
+        {
+            "code": row["last_failure_code"],
+            "disposition": row["last_failure_disposition"],
+            "occurred_at": row["last_failure_occurred_at"],
+        }
+    )
 
 
 class SqliteMeetingRepository:
@@ -306,6 +361,38 @@ class SqliteRecordingCleanupRepository:
         ).fetchone()
         return self._from_row(row) if row is not None else None
 
+    def list_by_expected_sha256(self, digest: str) -> Sequence[RecordingCleanupJob]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM recording_cleanup_jobs
+            WHERE expected_sha256 = ? ORDER BY status, id
+            """,
+            (digest,),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
+    def delete_succeeded(self, job: RecordingCleanupJob) -> bool:
+        if job.status is not RecordingCleanupStatus.SUCCEEDED:
+            raise ValueError("Only successful recording cleanup can be removed")
+        values = self._values(job)
+        cursor = self._connection.execute(
+            """
+            DELETE FROM recording_cleanup_jobs
+            WHERE id = ? AND storage_key = ? AND expected_sha256 = ?
+              AND expected_size_bytes = ? AND reason = ? AND status = ?
+              AND attempt_count = ? AND max_attempts = ?
+              AND next_attempt_at IS ? AND lease_owner IS ? AND lease_expires_at IS ?
+              AND last_failure_json IS ? AND created_at = ? AND updated_at = ?
+              AND completed_at IS ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM meeting_erasure_jobs erasure
+                  WHERE erasure.cleanup_job_id = recording_cleanup_jobs.id
+              )
+            """,
+            values,
+        )
+        return cursor.rowcount == 1
+
     def claim_due(
         self,
         worker_id: str,
@@ -396,6 +483,39 @@ class SqliteRecordingCleanupRepository:
         expected_lease_owner: str | None,
         expected_lease_expires_at: datetime | None,
     ) -> None:
+        current = self.get(job.id)
+        if (
+            current is not None
+            and current.reason is RecordingCleanupReason.MEETING_ERASURE
+            and current.status in {RecordingCleanupStatus.SUCCEEDED, RecordingCleanupStatus.FAILED}
+        ):
+            linked = self._connection.execute(
+                """
+                SELECT status, recording_state FROM meeting_erasure_jobs
+                WHERE cleanup_job_id = ?
+                """,
+                (str(job.id),),
+            ).fetchall()
+            valid_group_reset = (
+                current.status is RecordingCleanupStatus.FAILED
+                and job.status is RecordingCleanupStatus.READY
+                and job.attempt_count == 0
+                and job.next_attempt_at is None
+                and job.lease_owner is None
+                and job.lease_expires_at is None
+                and job.last_failure is None
+                and job.completed_at is None
+                and bool(linked)
+                and all(
+                    row["status"] == MeetingErasureStatus.ACTIVE.value
+                    and row["recording_state"] == MeetingErasureRecordingState.CLEANUP_PENDING.value
+                    for row in linked
+                )
+            )
+            if not valid_group_reset:
+                raise PersistenceConflictError(
+                    "The recording cleanup terminal state cannot be reset"
+                )
         cursor = self._connection.execute(
             """
             UPDATE recording_cleanup_jobs
@@ -472,6 +592,651 @@ class SqliteRecordingCleanupRepository:
                 "completed_at": row["completed_at"],
             }
         )
+
+
+class SqliteErasureKeyVerifierRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, verifier: ErasureKeyVerifier) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO erasure_key_verifiers (
+                key_id, verifier_version, verifier_digest, created_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                verifier.key_id,
+                verifier.verifier_version,
+                verifier.verifier_digest,
+                _as_erasure_datetime(verifier.created_at),
+            ),
+        )
+
+    def get(self, key_id: str) -> ErasureKeyVerifier | None:
+        row = self._connection.execute(
+            "SELECT * FROM erasure_key_verifiers WHERE key_id = ?",
+            (key_id,),
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def list_all(self) -> Sequence[ErasureKeyVerifier]:
+        rows = self._connection.execute(
+            "SELECT * FROM erasure_key_verifiers ORDER BY key_id"
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
+    def list_referenced_tokens(self) -> Sequence[ErasureTokenIdentity]:
+        rows = self._connection.execute(
+            """
+            SELECT token_version, token_key_id
+            FROM meeting_erasure_jobs
+            UNION
+            SELECT token_version, token_key_id
+            FROM meeting_erasure_tombstones
+            UNION
+            SELECT token_version, token_key_id
+            FROM meeting_erasure_operation_bindings
+            ORDER BY token_version, token_key_id
+            """
+        ).fetchall()
+        return tuple(
+            ErasureTokenIdentity(
+                token_version=row["token_version"],
+                key_id=row["token_key_id"],
+            )
+            for row in rows
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> ErasureKeyVerifier:
+        return ErasureKeyVerifier.model_validate(dict(row))
+
+
+class SqliteMeetingErasureRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, job: MeetingErasureJob) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO meeting_erasure_jobs (
+                id, token_version, token_key_id, meeting_token, reason,
+                erased_meeting_version, status, recording_state,
+                pending_audio_asset_id, cleanup_job_id, database_checkpointed_at,
+                retry_count, next_attempt_at, lease_owner, lease_expires_at,
+                last_failure_code, last_failure_disposition, last_failure_occurred_at,
+                remediation_count, max_remediations, version, created_at,
+                updated_at, completed_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            self._values(job),
+        )
+
+    def get(self, job_id: UUID) -> MeetingErasureJob | None:
+        row = self._connection.execute(
+            "SELECT * FROM meeting_erasure_jobs WHERE id = ?",
+            (str(job_id),),
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def find_by_meeting_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureJob | None:
+        matches: dict[str, sqlite3.Row] = {}
+        for token in _token_candidates(tokens):
+            row = self._connection.execute(
+                """
+                SELECT * FROM meeting_erasure_jobs
+                WHERE token_version = ? AND token_key_id = ? AND meeting_token = ?
+                """,
+                (token.token_version, token.key_id, token.digest),
+            ).fetchone()
+            if row is not None:
+                matches[row["id"]] = row
+        if len(matches) > 1:
+            raise PersistenceIntegrityError("Erasure token candidates matched multiple jobs")
+        row = next(iter(matches.values()), None)
+        return self._from_row(row) if row is not None else None
+
+    def list_by_pending_audio_asset_id(
+        self,
+        audio_asset_id: UUID,
+    ) -> Sequence[MeetingErasureJob]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM meeting_erasure_jobs
+            WHERE pending_audio_asset_id = ?
+            ORDER BY created_at, id
+            """,
+            (str(audio_asset_id),),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
+    def list_by_cleanup_job_id(self, cleanup_job_id: UUID) -> Sequence[MeetingErasureJob]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM meeting_erasure_jobs
+            WHERE cleanup_job_id = ?
+            ORDER BY created_at, id
+            """,
+            (str(cleanup_job_id),),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
+    def reactivate_failed_cleanup_group(
+        self,
+        cleanup_job_id: UUID,
+        now: datetime,
+    ) -> Sequence[MeetingErasureJob]:
+        normalized_now = _as_erasure_datetime(now)
+        self._connection.execute("SAVEPOINT meeting_erasure_group_remediation")
+        try:
+            cleanup_row = self._connection.execute(
+                "SELECT * FROM recording_cleanup_jobs WHERE id = ?",
+                (str(cleanup_job_id),),
+            ).fetchone()
+            cleanup = (
+                SqliteRecordingCleanupRepository._from_row(cleanup_row)
+                if cleanup_row is not None
+                else None
+            )
+            rows = self._connection.execute(
+                """
+                SELECT * FROM meeting_erasure_jobs
+                WHERE cleanup_job_id = ? ORDER BY created_at, id
+                """,
+                (str(cleanup_job_id),),
+            ).fetchall()
+            jobs = tuple(self._from_row(row) for row in rows)
+            if (
+                cleanup is None
+                or cleanup.reason is not RecordingCleanupReason.MEETING_ERASURE
+                or cleanup.status is not RecordingCleanupStatus.FAILED
+                or cleanup.updated_at > now
+                or not jobs
+                or any(
+                    job.status is not MeetingErasureStatus.FAILED
+                    or job.recording_state is not MeetingErasureRecordingState.FAILED
+                    or job.database_checkpointed_at is None
+                    or job.remediation_count >= job.max_remediations
+                    or job.updated_at > now
+                    for job in jobs
+                )
+            ):
+                raise PersistenceConflictError("The cleanup remediation group is not eligible")
+            cursor = self._connection.execute(
+                """
+                UPDATE meeting_erasure_jobs
+                SET status = 'active', recording_state = 'cleanup_pending',
+                    last_failure_code = NULL, last_failure_disposition = NULL,
+                    last_failure_occurred_at = NULL,
+                    remediation_count = remediation_count + 1,
+                    version = version + 1, updated_at = ?, completed_at = NULL
+                WHERE cleanup_job_id = ? AND status = 'failed'
+                  AND recording_state = 'failed'
+                  AND remediation_count < max_remediations
+                """,
+                (normalized_now, str(cleanup_job_id)),
+            )
+            if cursor.rowcount != len(jobs):
+                raise PersistenceConflictError("The cleanup remediation group changed")
+            requeued = RecordingCleanupJob.model_validate(
+                cleanup.model_dump(mode="python")
+                | {
+                    "status": RecordingCleanupStatus.READY,
+                    "attempt_count": 0,
+                    "next_attempt_at": None,
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                    "last_failure": None,
+                    "updated_at": now,
+                    "completed_at": None,
+                }
+            )
+            SqliteRecordingCleanupRepository(self._connection).save(
+                requeued,
+                RecordingCleanupStatus.FAILED,
+                None,
+                None,
+            )
+            updated = tuple(
+                self._from_row(row)
+                for row in self._connection.execute(
+                    """
+                    SELECT * FROM meeting_erasure_jobs
+                    WHERE cleanup_job_id = ? ORDER BY created_at, id
+                    """,
+                    (str(cleanup_job_id),),
+                ).fetchall()
+            )
+        except BaseException:
+            self._connection.execute("ROLLBACK TO meeting_erasure_group_remediation")
+            self._connection.execute("RELEASE meeting_erasure_group_remediation")
+            raise
+        self._connection.execute("RELEASE meeting_erasure_group_remediation")
+        return updated
+
+    def claim_actionable(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[MeetingErasureJob]:
+        normalized_worker_id = worker_id.strip()
+        if not normalized_worker_id:
+            raise ValueError("Worker ID cannot be empty")
+        if len(normalized_worker_id) > 200:
+            raise ValueError("Worker ID exceeds the supported length")
+        if lease_until <= now:
+            raise ValueError("Lease expiry must follow the claim time")
+        if limit <= 0:
+            return ()
+        normalized_now = _as_erasure_datetime(now)
+        normalized_lease_until = _as_erasure_datetime(lease_until)
+        rows = self._connection.execute(
+            """
+            SELECT id, version, lease_owner, lease_expires_at
+            FROM meeting_erasure_jobs
+            WHERE status = 'active'
+              AND ? >= updated_at
+              AND (lease_owner IS NULL OR lease_expires_at <= ?)
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+              AND (
+                  database_checkpointed_at IS NULL
+                  OR (
+                      recording_state = 'cleanup_pending'
+                      AND EXISTS (
+                          SELECT 1 FROM recording_cleanup_jobs cleanup
+                          WHERE cleanup.id = meeting_erasure_jobs.cleanup_job_id
+                            AND cleanup.status IN ('succeeded', 'failed')
+                      )
+                  )
+              )
+            ORDER BY
+                CASE WHEN database_checkpointed_at IS NULL THEN 0 ELSE 1 END,
+                COALESCE(next_attempt_at, created_at),
+                created_at,
+                id
+            LIMIT ?
+            """,
+            (normalized_now, normalized_now, normalized_now, limit),
+        ).fetchall()
+        claimed: list[MeetingErasureJob] = []
+        for row in rows:
+            cursor = self._connection.execute(
+                """
+                UPDATE meeting_erasure_jobs
+                SET next_attempt_at = NULL, lease_owner = ?, lease_expires_at = ?,
+                    version = version + 1, updated_at = ?
+                WHERE id = ? AND status = 'active' AND version = ?
+                  AND ? >= updated_at
+                  AND lease_owner IS ? AND lease_expires_at IS ?
+                  AND (
+                      lease_owner IS NULL
+                      OR lease_expires_at <= ?
+                  )
+                  AND (
+                      next_attempt_at IS NULL
+                      OR next_attempt_at <= ?
+                  )
+                  AND (
+                      database_checkpointed_at IS NULL
+                      OR (
+                          recording_state = 'cleanup_pending'
+                          AND EXISTS (
+                              SELECT 1 FROM recording_cleanup_jobs cleanup
+                              WHERE cleanup.id = meeting_erasure_jobs.cleanup_job_id
+                                AND cleanup.status IN ('succeeded', 'failed')
+                          )
+                      )
+                  )
+                """,
+                (
+                    normalized_worker_id,
+                    normalized_lease_until,
+                    normalized_now,
+                    row["id"],
+                    row["version"],
+                    normalized_now,
+                    row["lease_owner"],
+                    row["lease_expires_at"],
+                    normalized_now,
+                    normalized_now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            job = self.get(UUID(row["id"]))
+            if job is not None:
+                claimed.append(job)
+        return tuple(claimed)
+
+    def save(
+        self,
+        job: MeetingErasureJob,
+        expected_version: int,
+        expected_lease_owner: str | None,
+        expected_lease_expires_at: datetime | None,
+    ) -> None:
+        row = self._connection.execute(
+            "SELECT * FROM meeting_erasure_jobs WHERE id = ?",
+            (str(job.id),),
+        ).fetchone()
+        current = self._from_row(row) if row is not None else None
+        cleanup_row = self._connection.execute(
+            """
+            SELECT reason, status FROM recording_cleanup_jobs
+            WHERE id = ?
+            """,
+            (_as_text(job.cleanup_job_id or (current.cleanup_job_id if current else None)),),
+        ).fetchone()
+        cleanup_reason = cleanup_row["reason"] if cleanup_row is not None else None
+        cleanup_status = cleanup_row["status"] if cleanup_row is not None else None
+        waiting_to_cleanup = (
+            current is not None
+            and current.recording_state is MeetingErasureRecordingState.WAITING_SHARED
+            and job.recording_state is MeetingErasureRecordingState.CLEANUP_PENDING
+            and current.pending_audio_asset_id is not None
+            and job.pending_audio_asset_id is None
+            and current.cleanup_job_id is None
+            and job.cleanup_job_id is not None
+            and job.database_checkpointed_at is None
+            and cleanup_reason == RecordingCleanupReason.MEETING_ERASURE.value
+        )
+        cleanup_to_removed = (
+            current is not None
+            and current.recording_state
+            in {
+                MeetingErasureRecordingState.CLEANUP_PENDING,
+                MeetingErasureRecordingState.FAILED,
+            }
+            and job.recording_state is MeetingErasureRecordingState.REMOVED
+            and current.pending_audio_asset_id is None
+            and job.pending_audio_asset_id is None
+            and current.cleanup_job_id is not None
+            and job.cleanup_job_id is None
+            and job.database_checkpointed_at is None
+            and cleanup_reason == RecordingCleanupReason.MEETING_ERASURE.value
+            and cleanup_status == RecordingCleanupStatus.SUCCEEDED.value
+        )
+        cleanup_to_failed = (
+            current is not None
+            and current.recording_state is MeetingErasureRecordingState.CLEANUP_PENDING
+            and job.recording_state is MeetingErasureRecordingState.FAILED
+            and current.cleanup_job_id is not None
+            and job.cleanup_job_id == current.cleanup_job_id
+            and cleanup_reason == RecordingCleanupReason.MEETING_ERASURE.value
+            and cleanup_status == RecordingCleanupStatus.FAILED.value
+        )
+        same_recording_state = (
+            current is not None and job.recording_state is current.recording_state
+        )
+        if (
+            current is None
+            or current.version != expected_version
+            or job.version != expected_version + 1
+            or not current.retry_count <= job.retry_count <= current.retry_count + 1
+            or current.status is MeetingErasureStatus.COMPLETED
+            or current.status is MeetingErasureStatus.FAILED
+            or job.remediation_count != current.remediation_count
+            or not (
+                same_recording_state
+                or waiting_to_cleanup
+                or cleanup_to_removed
+                or cleanup_to_failed
+            )
+            or (
+                current.database_checkpointed_at is not None
+                and job.database_checkpointed_at != current.database_checkpointed_at
+                and not waiting_to_cleanup
+                and not cleanup_to_removed
+            )
+            or job.token_version != current.token_version
+            or job.token_key_id != current.token_key_id
+            or job.meeting_token != current.meeting_token
+            or job.reason is not current.reason
+            or job.erased_meeting_version != current.erased_meeting_version
+            or job.max_remediations != current.max_remediations
+            or job.created_at != current.created_at
+            or job.updated_at < current.updated_at
+        ):
+            raise PersistenceConflictError("The meeting erasure job is no longer current")
+        failure = _erasure_failure_values(job.last_failure)
+        cursor = self._connection.execute(
+            """
+            UPDATE meeting_erasure_jobs SET
+                status = ?, recording_state = ?, pending_audio_asset_id = ?,
+                cleanup_job_id = ?, database_checkpointed_at = ?, retry_count = ?,
+                next_attempt_at = ?, lease_owner = ?, lease_expires_at = ?,
+                last_failure_code = ?, last_failure_disposition = ?,
+                last_failure_occurred_at = ?, remediation_count = ?, version = ?,
+                updated_at = ?, completed_at = ?
+            WHERE id = ? AND version = ?
+              AND lease_owner IS ? AND lease_expires_at IS ?
+            """,
+            (
+                job.status.value,
+                job.recording_state.value,
+                _as_text(job.pending_audio_asset_id),
+                _as_text(job.cleanup_job_id),
+                _as_erasure_datetime(job.database_checkpointed_at),
+                job.retry_count,
+                _as_erasure_datetime(job.next_attempt_at),
+                job.lease_owner,
+                _as_erasure_datetime(job.lease_expires_at),
+                *failure,
+                job.remediation_count,
+                job.version,
+                _as_erasure_datetime(job.updated_at),
+                _as_erasure_datetime(job.completed_at),
+                str(job.id),
+                expected_version,
+                expected_lease_owner,
+                _as_erasure_datetime(expected_lease_expires_at),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise PersistenceConflictError("The meeting erasure lease is no longer current")
+
+    @staticmethod
+    def _values(job: MeetingErasureJob) -> tuple[object, ...]:
+        failure = _erasure_failure_values(job.last_failure)
+        return (
+            str(job.id),
+            job.token_version,
+            job.token_key_id,
+            job.meeting_token,
+            job.reason.value,
+            job.erased_meeting_version,
+            job.status.value,
+            job.recording_state.value,
+            _as_text(job.pending_audio_asset_id),
+            _as_text(job.cleanup_job_id),
+            _as_erasure_datetime(job.database_checkpointed_at),
+            job.retry_count,
+            _as_erasure_datetime(job.next_attempt_at),
+            job.lease_owner,
+            _as_erasure_datetime(job.lease_expires_at),
+            *failure,
+            job.remediation_count,
+            job.max_remediations,
+            job.version,
+            _as_erasure_datetime(job.created_at),
+            _as_erasure_datetime(job.updated_at),
+            _as_erasure_datetime(job.completed_at),
+        )
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> MeetingErasureJob:
+        return MeetingErasureJob.model_validate(
+            {
+                "id": row["id"],
+                "token_version": row["token_version"],
+                "token_key_id": row["token_key_id"],
+                "meeting_token": row["meeting_token"],
+                "reason": row["reason"],
+                "erased_meeting_version": row["erased_meeting_version"],
+                "status": row["status"],
+                "recording_state": row["recording_state"],
+                "pending_audio_asset_id": row["pending_audio_asset_id"],
+                "cleanup_job_id": row["cleanup_job_id"],
+                "database_checkpointed_at": row["database_checkpointed_at"],
+                "retry_count": row["retry_count"],
+                "next_attempt_at": row["next_attempt_at"],
+                "lease_owner": row["lease_owner"],
+                "lease_expires_at": row["lease_expires_at"],
+                "last_failure": _erasure_failure_from_row(row),
+                "remediation_count": row["remediation_count"],
+                "max_remediations": row["max_remediations"],
+                "version": row["version"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "completed_at": row["completed_at"],
+            }
+        )
+
+
+class SqliteMeetingErasureOperationRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, binding: MeetingErasureOperationBinding) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO meeting_erasure_operation_bindings (
+                token_version, token_key_id, request_token, actor_token,
+                resource_token, erasure_job_id, operation, expected_version,
+                request_fingerprint, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                binding.token_version,
+                binding.token_key_id,
+                binding.request_token,
+                binding.actor_token,
+                binding.resource_token,
+                str(binding.erasure_job_id),
+                binding.operation.value,
+                binding.expected_version,
+                binding.request_fingerprint,
+                _as_erasure_datetime(binding.created_at),
+            ),
+        )
+
+    def find_by_request_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureOperationBinding | None:
+        matches: dict[tuple[int, str, str], sqlite3.Row] = {}
+        for token in _token_candidates(tokens):
+            row = self._connection.execute(
+                """
+                SELECT * FROM meeting_erasure_operation_bindings
+                WHERE token_version = ? AND token_key_id = ? AND request_token = ?
+                """,
+                (token.token_version, token.key_id, token.digest),
+            ).fetchone()
+            if row is not None:
+                identity = (row["token_version"], row["token_key_id"], row["request_token"])
+                matches[identity] = row
+        if len(matches) > 1:
+            raise PersistenceIntegrityError("Erasure request candidates matched multiple bindings")
+        row = next(iter(matches.values()), None)
+        return self._from_row(row) if row is not None else None
+
+    def list_for_job(self, job_id: UUID) -> Sequence[MeetingErasureOperationBinding]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM meeting_erasure_operation_bindings
+            WHERE erasure_job_id = ?
+            ORDER BY created_at, token_version, token_key_id, request_token
+            """,
+            (str(job_id),),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> MeetingErasureOperationBinding:
+        return MeetingErasureOperationBinding.model_validate(dict(row))
+
+
+class SqliteMeetingErasureTombstoneRepository:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def add(self, tombstone: MeetingErasureTombstone) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO meeting_erasure_tombstones (
+                erasure_job_id, token_version, token_key_id, meeting_token,
+                ingest_key_token, erased_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(tombstone.erasure_job_id),
+                tombstone.token_version,
+                tombstone.token_key_id,
+                tombstone.meeting_token,
+                tombstone.ingest_key_token,
+                _as_erasure_datetime(tombstone.erased_at),
+            ),
+        )
+
+    def get_for_job(self, job_id: UUID) -> MeetingErasureTombstone | None:
+        row = self._connection.execute(
+            "SELECT * FROM meeting_erasure_tombstones WHERE erasure_job_id = ?",
+            (str(job_id),),
+        ).fetchone()
+        return self._from_row(row) if row is not None else None
+
+    def find_by_meeting_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureTombstone | None:
+        return self._find_by_tokens("meeting_token", tokens)
+
+    def find_by_ingest_key_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureTombstone | None:
+        return self._find_by_tokens("ingest_key_token", tokens)
+
+    def _find_by_tokens(
+        self,
+        column: str,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureTombstone | None:
+        if column == "meeting_token":
+            query = """
+                SELECT * FROM meeting_erasure_tombstones
+                WHERE token_version = ? AND token_key_id = ? AND meeting_token = ?
+            """
+        else:
+            query = """
+                SELECT * FROM meeting_erasure_tombstones
+                WHERE token_version = ? AND token_key_id = ? AND ingest_key_token = ?
+            """
+        matches: dict[str, sqlite3.Row] = {}
+        for token in _token_candidates(tokens):
+            row = self._connection.execute(
+                query,
+                (token.token_version, token.key_id, token.digest),
+            ).fetchone()
+            if row is not None:
+                matches[row["erasure_job_id"]] = row
+        if len(matches) > 1:
+            raise PersistenceIntegrityError("Erasure token candidates matched multiple tombstones")
+        row = next(iter(matches.values()), None)
+        return self._from_row(row) if row is not None else None
+
+    @staticmethod
+    def _from_row(row: sqlite3.Row) -> MeetingErasureTombstone:
+        return MeetingErasureTombstone.model_validate(dict(row))
 
 
 class SqliteTranscriptRepository:
@@ -1392,6 +2157,10 @@ class SqliteUnitOfWork:
         self.ingest_requests: SqliteIngestRequestBindingRepository
         self.audio_assets: SqliteAudioAssetRepository
         self.recording_cleanups: SqliteRecordingCleanupRepository
+        self.erasure_key_verifiers: SqliteErasureKeyVerifierRepository
+        self.meeting_erasures: SqliteMeetingErasureRepository
+        self.meeting_erasure_operations: SqliteMeetingErasureOperationRepository
+        self.meeting_erasure_tombstones: SqliteMeetingErasureTombstoneRepository
         self.transcripts: SqliteTranscriptRepository
         self.reviews: SqliteReviewRepository
         self.approvals: SqliteApprovalRepository
@@ -1411,6 +2180,10 @@ class SqliteUnitOfWork:
         self.ingest_requests = SqliteIngestRequestBindingRepository(connection)
         self.audio_assets = SqliteAudioAssetRepository(connection)
         self.recording_cleanups = SqliteRecordingCleanupRepository(connection)
+        self.erasure_key_verifiers = SqliteErasureKeyVerifierRepository(connection)
+        self.meeting_erasures = SqliteMeetingErasureRepository(connection)
+        self.meeting_erasure_operations = SqliteMeetingErasureOperationRepository(connection)
+        self.meeting_erasure_tombstones = SqliteMeetingErasureTombstoneRepository(connection)
         self.transcripts = SqliteTranscriptRepository(connection)
         self.reviews = SqliteReviewRepository(connection)
         self.approvals = SqliteApprovalRepository(connection)

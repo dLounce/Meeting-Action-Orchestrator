@@ -20,12 +20,18 @@ class MissingApiBearerTokenError(ValueError):
         super().__init__("API_BEARER_TOKEN is required")
 
 
+class MissingErasureHMACConfigurationError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("Erasure HMAC key ID and keyring are required")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        hide_input_in_errors=True,
     )
 
     app_env: Literal["development", "test", "production"] = "development"
@@ -70,12 +76,44 @@ class Settings(BaseSettings):
     recording_orphan_scan_interval_seconds: float = Field(default=300.0, gt=0, le=86_400)
     recording_orphan_grace_seconds: float = Field(default=86_400.0, ge=300, le=604_800)
     recording_orphan_scan_batch_size: int = Field(default=100, ge=1, le=1_000)
+    erasure_hmac_active_key_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+    )
+    erasure_hmac_keys: SecretStr | None = None
+    meeting_erasure_batch_size: int = Field(default=20, ge=1, le=100)
+    meeting_erasure_lease_seconds: float = Field(default=300.0, ge=30, le=3_600)
+    meeting_erasure_max_remediations: int = Field(default=3, ge=1, le=10)
 
-    @field_validator("api_bearer_token", "openai_api_key", "mcp_auth_token", mode="before")
+    @field_validator(
+        "api_bearer_token",
+        "openai_api_key",
+        "mcp_auth_token",
+        mode="before",
+    )
     @classmethod
     def empty_secret_is_none(cls, value: object) -> object:
         if value == "":
             return None
+        return value
+
+    @field_validator("erasure_hmac_keys", mode="before")
+    @classmethod
+    def normalize_erasure_keyring(cls, value: object) -> object:
+        if value == "" or value is None:
+            return None
+        if isinstance(value, str | SecretStr):
+            return value
+        return None
+
+    @field_validator("erasure_hmac_active_key_id", mode="before")
+    @classmethod
+    def normalize_erasure_key_id(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized or None
         return value
 
     @field_validator(
@@ -118,6 +156,14 @@ class Settings(BaseSettings):
         if self.api_bearer_token is None:
             raise MissingApiBearerTokenError
         return self.api_bearer_token.get_secret_value()
+
+    def require_erasure_hmac_configuration(self) -> tuple[str, str]:
+        if self.erasure_hmac_active_key_id is None or self.erasure_hmac_keys is None:
+            raise MissingErasureHMACConfigurationError
+        return (
+            self.erasure_hmac_active_key_id,
+            self.erasure_hmac_keys.get_secret_value(),
+        )
 
 
 @lru_cache(maxsize=1)

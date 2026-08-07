@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hmac
 import re
+from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -27,6 +29,11 @@ from meeting_action_orchestrator.domain.enums import (
     FailureDisposition,
     IssueSeverity,
     IssueStatus,
+    MeetingErasureFailureCode,
+    MeetingErasureOperation,
+    MeetingErasureReason,
+    MeetingErasureRecordingState,
+    MeetingErasureStatus,
     MeetingOperationKind,
     MeetingStatus,
     Priority,
@@ -51,8 +58,18 @@ MediumText = Annotated[str, StringConstraints(min_length=1, max_length=1_000)]
 DetailedText = Annotated[str, StringConstraints(min_length=1, max_length=2_000)]
 LongText = Annotated[str, StringConstraints(min_length=1, max_length=10_000)]
 Sha256Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+ErasureKeyId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+    ),
+]
 Confidence = Annotated[float, Field(ge=0.0, le=1.0)]
 INGEST_REQUEST_FINGERPRINT_VERSION = 1
+ERASURE_TOKEN_VERSION = 1
+ERASURE_VERIFIER_VERSION = 1
 
 
 def _validate_timezone(value: str) -> str:
@@ -399,6 +416,268 @@ class IngestRequestBinding(DomainModel):
             fingerprint_version=fingerprint_version,
             request_fingerprint=request.fingerprint(audio, fingerprint_version),
             created_at=created_at,
+        )
+
+
+class ErasureTokenIdentity(DomainModel):
+    token_version: int = Field(gt=0)
+    key_id: ErasureKeyId
+
+
+class ErasureToken(ErasureTokenIdentity):
+    digest: Sha256Digest = Field(repr=False)
+
+
+class ErasureKeyVerifier(DomainModel):
+    key_id: ErasureKeyId
+    verifier_version: int = Field(gt=0)
+    verifier_digest: Sha256Digest = Field(repr=False)
+    created_at: AwareDatetime
+
+
+class MeetingErasureFailure(DomainModel):
+    code: MeetingErasureFailureCode
+    disposition: FailureDisposition
+    occurred_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_disposition(self) -> MeetingErasureFailure:
+        expected = {
+            MeetingErasureFailureCode.DATABASE_SANITATION_DEFERRED: (FailureDisposition.RETRYABLE),
+            MeetingErasureFailureCode.RECORDING_CLEANUP_REJECTED: FailureDisposition.PERMANENT,
+            MeetingErasureFailureCode.ERASURE_INTEGRITY_FAILED: FailureDisposition.PERMANENT,
+        }
+        if self.disposition is not expected[self.code]:
+            raise DomainInvariantError(InvariantCode.ERASURE_FAILURE_DISPOSITION)
+        return self
+
+
+class MeetingErasureJob(DomainModel):
+    id: UUID
+    token_version: int = Field(gt=0)
+    token_key_id: ErasureKeyId
+    meeting_token: Sha256Digest = Field(repr=False)
+    reason: MeetingErasureReason
+    erased_meeting_version: int = Field(ge=0)
+    status: MeetingErasureStatus = MeetingErasureStatus.ACTIVE
+    recording_state: MeetingErasureRecordingState
+    pending_audio_asset_id: UUID | None = None
+    cleanup_job_id: UUID | None = None
+    database_checkpointed_at: AwareDatetime | None = None
+    retry_count: int = Field(default=0, ge=0)
+    next_attempt_at: AwareDatetime | None = None
+    lease_owner: ShortText | None = None
+    lease_expires_at: AwareDatetime | None = None
+    last_failure: MeetingErasureFailure | None = None
+    remediation_count: int = Field(default=0, ge=0)
+    max_remediations: int = Field(default=3, ge=1, le=10)
+    version: int = Field(default=0, ge=0)
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    completed_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def validate_timestamps(self) -> MeetingErasureJob:
+        checkpoint = self.database_checkpointed_at
+        if self.updated_at < self.created_at:
+            raise DomainInvariantError(InvariantCode.ERASURE_TIMESTAMPS)
+        if checkpoint is not None and not self.created_at <= checkpoint <= self.updated_at:
+            raise DomainInvariantError(InvariantCode.ERASURE_TIMESTAMPS)
+        if self.completed_at is not None and self.completed_at < self.updated_at:
+            raise DomainInvariantError(InvariantCode.ERASURE_TIMESTAMPS)
+        return self
+
+    @model_validator(mode="after")
+    def validate_resources(self) -> MeetingErasureJob:
+        if self.recording_state is MeetingErasureRecordingState.WAITING_SHARED:
+            valid = self.pending_audio_asset_id is not None and self.cleanup_job_id is None
+        elif self.recording_state in {
+            MeetingErasureRecordingState.CLEANUP_PENDING,
+            MeetingErasureRecordingState.FAILED,
+        }:
+            valid = self.pending_audio_asset_id is None and self.cleanup_job_id is not None
+        else:
+            valid = self.pending_audio_asset_id is None and self.cleanup_job_id is None
+        if not valid:
+            raise DomainInvariantError(InvariantCode.ERASURE_RESOURCES)
+        return self
+
+    @model_validator(mode="after")
+    def validate_lease_and_retry(self) -> MeetingErasureJob:
+        leased = self.lease_owner is not None or self.lease_expires_at is not None
+        if leased and (
+            self.status is not MeetingErasureStatus.ACTIVE
+            or self.lease_owner is None
+            or self.lease_expires_at is None
+            or self.lease_expires_at <= self.updated_at
+        ):
+            raise DomainInvariantError(InvariantCode.ERASURE_LEASE)
+        if self.next_attempt_at is not None and (
+            self.status is not MeetingErasureStatus.ACTIVE
+            or leased
+            or self.database_checkpointed_at is not None
+            or self.next_attempt_at < self.updated_at
+        ):
+            raise DomainInvariantError(InvariantCode.ERASURE_RETRY)
+        return self
+
+    @model_validator(mode="after")
+    def validate_failure(self) -> MeetingErasureJob:
+        if self.recording_state is MeetingErasureRecordingState.FAILED:
+            if (
+                self.last_failure is None
+                or self.last_failure.disposition is not FailureDisposition.PERMANENT
+            ):
+                raise DomainInvariantError(InvariantCode.ERASURE_FAILURE)
+        elif self.status is MeetingErasureStatus.ACTIVE:
+            if self.last_failure is not None and (
+                self.database_checkpointed_at is not None
+                or self.last_failure.disposition is not FailureDisposition.RETRYABLE
+            ):
+                raise DomainInvariantError(InvariantCode.ERASURE_FAILURE)
+        elif self.last_failure is not None:
+            raise DomainInvariantError(InvariantCode.ERASURE_FAILURE)
+        return self
+
+    @model_validator(mode="after")
+    def validate_status(self) -> MeetingErasureJob:
+        checkpointed = self.database_checkpointed_at is not None
+        if self.status is MeetingErasureStatus.ACTIVE:
+            if self.completed_at is not None:
+                raise DomainInvariantError(InvariantCode.ERASURE_STATUS)
+            if checkpointed and self.recording_state in {
+                MeetingErasureRecordingState.REMOVED,
+                MeetingErasureRecordingState.FAILED,
+            }:
+                raise DomainInvariantError(InvariantCode.ERASURE_STATUS)
+        elif self.status is MeetingErasureStatus.COMPLETED:
+            if (
+                self.recording_state is not MeetingErasureRecordingState.REMOVED
+                or not checkpointed
+                or self.completed_at is None
+                or self.last_failure is not None
+            ):
+                raise DomainInvariantError(InvariantCode.ERASURE_STATUS)
+        elif (
+            self.recording_state is not MeetingErasureRecordingState.FAILED
+            or not checkpointed
+            or self.completed_at is None
+        ):
+            raise DomainInvariantError(InvariantCode.ERASURE_STATUS)
+        if self.status is not MeetingErasureStatus.ACTIVE and (
+            self.lease_owner is not None
+            or self.lease_expires_at is not None
+            or self.next_attempt_at is not None
+        ):
+            raise DomainInvariantError(InvariantCode.ERASURE_STATUS)
+        return self
+
+    @model_validator(mode="after")
+    def validate_remediations(self) -> MeetingErasureJob:
+        if self.remediation_count > self.max_remediations:
+            raise DomainInvariantError(InvariantCode.ERASURE_REMEDIATIONS)
+        return self
+
+
+class MeetingErasureOperationBinding(DomainModel):
+    token_version: int = Field(gt=0)
+    token_key_id: ErasureKeyId
+    request_token: Sha256Digest = Field(repr=False)
+    actor_token: Sha256Digest = Field(repr=False)
+    resource_token: Sha256Digest = Field(repr=False)
+    erasure_job_id: UUID
+    operation: MeetingErasureOperation
+    expected_version: int = Field(ge=0)
+    request_fingerprint: Sha256Digest = Field(repr=False)
+    created_at: AwareDatetime
+
+    @classmethod
+    def create(
+        cls,
+        request_token: ErasureToken,
+        actor_token: ErasureToken,
+        resource_token: ErasureToken,
+        erasure_job_id: UUID,
+        operation: MeetingErasureOperation,
+        expected_version: int,
+        created_at: datetime,
+    ) -> MeetingErasureOperationBinding:
+        identities = {
+            (request_token.token_version, request_token.key_id),
+            (actor_token.token_version, actor_token.key_id),
+            (resource_token.token_version, resource_token.key_id),
+        }
+        if len(identities) != 1:
+            raise DomainInvariantError(InvariantCode.ERASURE_KEY_IDENTITY)
+        token_version, token_key_id = identities.pop()
+        values = {
+            "token_version": token_version,
+            "token_key_id": token_key_id,
+            "request_token": request_token.digest,
+            "actor_token": actor_token.digest,
+            "resource_token": resource_token.digest,
+            "erasure_job_id": erasure_job_id,
+            "operation": operation,
+            "expected_version": expected_version,
+        }
+        return cls(
+            **values,
+            request_fingerprint=cls._fingerprint_v1(values),
+            created_at=created_at,
+        )
+
+    @model_validator(mode="after")
+    def validate_fingerprint(self) -> MeetingErasureOperationBinding:
+        if self.token_version != 1:
+            raise DomainInvariantError(InvariantCode.ERASURE_OPERATION_FINGERPRINT)
+        values = {
+            "token_version": self.token_version,
+            "token_key_id": self.token_key_id,
+            "request_token": self.request_token,
+            "actor_token": self.actor_token,
+            "resource_token": self.resource_token,
+            "erasure_job_id": self.erasure_job_id,
+            "operation": self.operation,
+            "expected_version": self.expected_version,
+        }
+        expected = self._fingerprint_v1(values)
+        if not hmac.compare_digest(self.request_fingerprint, expected):
+            raise DomainInvariantError(InvariantCode.ERASURE_OPERATION_FINGERPRINT)
+        return self
+
+    @staticmethod
+    def _fingerprint_v1(values: Mapping[str, object]) -> str:
+        return canonical_sha256({"schema": "meeting-erasure-operation/v1", **dict(values)})
+
+
+class MeetingErasureTombstone(DomainModel):
+    erasure_job_id: UUID
+    token_version: int = Field(gt=0)
+    token_key_id: ErasureKeyId
+    meeting_token: Sha256Digest = Field(repr=False)
+    ingest_key_token: Sha256Digest = Field(repr=False)
+    erased_at: AwareDatetime
+
+    @classmethod
+    def create(
+        cls,
+        erasure_job_id: UUID,
+        meeting_token: ErasureToken,
+        ingest_key_token: ErasureToken,
+        erased_at: datetime,
+    ) -> MeetingErasureTombstone:
+        if (
+            meeting_token.token_version != ingest_key_token.token_version
+            or meeting_token.key_id != ingest_key_token.key_id
+        ):
+            raise DomainInvariantError(InvariantCode.ERASURE_KEY_IDENTITY)
+        return cls(
+            erasure_job_id=erasure_job_id,
+            token_version=meeting_token.token_version,
+            token_key_id=meeting_token.key_id,
+            meeting_token=meeting_token.digest,
+            ingest_key_token=ingest_key_token.digest,
+            erased_at=erased_at,
         )
 
 

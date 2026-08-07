@@ -28,8 +28,14 @@ from meeting_action_orchestrator.domain.models import (
     Approval,
     AudioAsset,
     DeliveryOperationBinding,
+    ErasureKeyVerifier,
+    ErasureToken,
+    ErasureTokenIdentity,
     IngestRequestBinding,
     Meeting,
+    MeetingErasureJob,
+    MeetingErasureOperationBinding,
+    MeetingErasureTombstone,
     MeetingOperationBinding,
     ProcessingJob,
     RecapArtifact,
@@ -163,6 +169,10 @@ class RecordingCleanupRepository(Protocol):
 
     def find_by_storage_key(self, storage_key: str) -> RecordingCleanupJob | None: ...
 
+    def list_by_expected_sha256(self, digest: str) -> Sequence[RecordingCleanupJob]: ...
+
+    def delete_succeeded(self, job: RecordingCleanupJob) -> bool: ...
+
     def claim_due(
         self,
         worker_id: str,
@@ -178,6 +188,83 @@ class RecordingCleanupRepository(Protocol):
         expected_lease_owner: str | None,
         expected_lease_expires_at: datetime | None,
     ) -> None: ...
+
+
+class ErasureKeyVerifierRepository(Protocol):
+    def add(self, verifier: ErasureKeyVerifier) -> None: ...
+
+    def get(self, key_id: str) -> ErasureKeyVerifier | None: ...
+
+    def list_all(self) -> Sequence[ErasureKeyVerifier]: ...
+
+    def list_referenced_tokens(self) -> Sequence[ErasureTokenIdentity]: ...
+
+
+class MeetingErasureRepository(Protocol):
+    def add(self, job: MeetingErasureJob) -> None: ...
+
+    def get(self, job_id: UUID) -> MeetingErasureJob | None: ...
+
+    def find_by_meeting_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureJob | None: ...
+
+    def list_by_pending_audio_asset_id(
+        self,
+        audio_asset_id: UUID,
+    ) -> Sequence[MeetingErasureJob]: ...
+
+    def list_by_cleanup_job_id(self, cleanup_job_id: UUID) -> Sequence[MeetingErasureJob]: ...
+
+    def reactivate_failed_cleanup_group(
+        self,
+        cleanup_job_id: UUID,
+        now: datetime,
+    ) -> Sequence[MeetingErasureJob]: ...
+
+    def claim_actionable(
+        self,
+        worker_id: str,
+        now: datetime,
+        lease_until: datetime,
+        limit: int,
+    ) -> Sequence[MeetingErasureJob]: ...
+
+    def save(
+        self,
+        job: MeetingErasureJob,
+        expected_version: int,
+        expected_lease_owner: str | None,
+        expected_lease_expires_at: datetime | None,
+    ) -> None: ...
+
+
+class MeetingErasureOperationRepository(Protocol):
+    def add(self, binding: MeetingErasureOperationBinding) -> None: ...
+
+    def find_by_request_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureOperationBinding | None: ...
+
+    def list_for_job(self, job_id: UUID) -> Sequence[MeetingErasureOperationBinding]: ...
+
+
+class MeetingErasureTombstoneRepository(Protocol):
+    def add(self, tombstone: MeetingErasureTombstone) -> None: ...
+
+    def get_for_job(self, job_id: UUID) -> MeetingErasureTombstone | None: ...
+
+    def find_by_meeting_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureTombstone | None: ...
+
+    def find_by_ingest_key_tokens(
+        self,
+        tokens: Sequence[ErasureToken],
+    ) -> MeetingErasureTombstone | None: ...
 
 
 class TranscriptRepository(Protocol):
@@ -363,6 +450,10 @@ class UnitOfWork(Protocol):
     ingest_requests: IngestRequestBindingRepository
     audio_assets: AudioAssetRepository
     recording_cleanups: RecordingCleanupRepository
+    erasure_key_verifiers: ErasureKeyVerifierRepository
+    meeting_erasures: MeetingErasureRepository
+    meeting_erasure_operations: MeetingErasureOperationRepository
+    meeting_erasure_tombstones: MeetingErasureTombstoneRepository
     transcripts: TranscriptRepository
     reviews: ReviewRepository
     approvals: ApprovalRepository

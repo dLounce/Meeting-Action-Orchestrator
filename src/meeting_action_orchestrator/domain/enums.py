@@ -42,6 +42,7 @@ class ProcessingJobStatus(str, Enum):
 class RecordingCleanupReason(str, Enum):
     ABANDONED_INGEST = "abandoned_ingest"
     ORPHAN_RECONCILIATION = "orphan_reconciliation"
+    MEETING_ERASURE = "meeting_erasure"
 
 
 class RecordingCleanupStatus(str, Enum):
@@ -50,6 +51,35 @@ class RecordingCleanupStatus(str, Enum):
     RETRY_WAIT = "retry_wait"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class MeetingErasureReason(str, Enum):
+    USER_REQUEST = "user_request"
+    RETENTION = "retention"
+
+
+class MeetingErasureStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class MeetingErasureRecordingState(str, Enum):
+    WAITING_SHARED = "waiting_shared"
+    CLEANUP_PENDING = "cleanup_pending"
+    REMOVED = "removed"
+    FAILED = "failed"
+
+
+class MeetingErasureOperation(str, Enum):
+    REQUEST = "request"
+    RETRY = "retry"
+
+
+class MeetingErasureFailureCode(str, Enum):
+    DATABASE_SANITATION_DEFERRED = "database_sanitation_deferred"
+    RECORDING_CLEANUP_REJECTED = "recording_cleanup_rejected"
+    ERASURE_INTEGRITY_FAILED = "erasure_integrity_failed"
 
 
 class DeliveryOperationKind(str, Enum):
