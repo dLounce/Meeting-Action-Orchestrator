@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from threading import get_ident
+from typing import Any
 from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
 
 from meeting_action_orchestrator.application.delivery import DeliveryBatch, DeliveryResult
+from meeting_action_orchestrator.application.recording_cleanup import (
+    OrphanDiscoveryBatch,
+    RecordingCleanupOutcome,
+    RecordingCleanupResult,
+)
 from meeting_action_orchestrator.bootstrap import (
     RuntimeReadinessProbe,
     RuntimeSupervisor,
@@ -57,6 +64,54 @@ class FakeDeliveryRunner:
         self.limits.append(limit)
         self.called.set()
         return DeliveryBatch(recovered=(), results=())
+
+
+class FakeRecordingStorage:
+    def __init__(self, ready: bool = True, error: Exception | None = None) -> None:
+        self.ready = ready
+        self.error = error
+        self.thread_ids: list[int] = []
+
+    def healthcheck(self) -> bool:
+        self.thread_ids.append(get_ident())
+        if self.error is not None:
+            raise self.error
+        return self.ready
+
+
+class FakeRecordingCleanupRunner:
+    def __init__(
+        self,
+        results: tuple[RecordingCleanupResult, ...] = (),
+    ) -> None:
+        self.results = results
+        self.limits: list[int] = []
+        self.called = asyncio.Event()
+
+    async def run_once(self, limit: int = 20) -> tuple[RecordingCleanupResult, ...]:
+        self.limits.append(limit)
+        self.called.set()
+        return self.results
+
+
+class FakeOrphanDiscoveryRunner:
+    def __init__(self, batch: OrphanDiscoveryBatch | None = None) -> None:
+        self.batch = batch or OrphanDiscoveryBatch()
+        self.limits: list[int] = []
+        self.called = asyncio.Event()
+
+    async def run_once(self, limit: int = 100) -> OrphanDiscoveryBatch:
+        self.limits.append(limit)
+        self.called.set()
+        return self.batch
+
+
+class FakeCloser:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeMcpClient:
@@ -150,20 +205,30 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
     database = FakeDatabase()
     processing = FakeProcessingRunner()
     delivery = FakeDeliveryRunner()
+    cleanup = FakeRecordingCleanupRunner()
+    discovery = FakeOrphanDiscoveryRunner()
     mcp = FakeMcpClient()
     runtime = RuntimeSupervisor(
         database=database,
         processing=processing,
+        recording_storage=FakeRecordingStorage(),
+        recording_cleanup=cleanup,
+        orphan_discovery=discovery,
         delivery=delivery,
         mcp_client=mcp,
         poll_interval_seconds=0.01,
         processing_batch_size=2,
+        recording_cleanup_batch_size=3,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=11,
         delivery_batch_size=7,
     )
 
     async with runtime.lifespan(FastAPI()):
         await asyncio.wait_for(processing.called.wait(), timeout=1)
         await asyncio.wait_for(delivery.called.wait(), timeout=1)
+        await asyncio.wait_for(cleanup.called.wait(), timeout=1)
+        await asyncio.wait_for(discovery.called.wait(), timeout=1)
         assert runtime.started
         assert runtime.delivery_ready
 
@@ -173,6 +238,8 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
         (ProcessingStage.EXTRACTION, 2),
     ]
     assert delivery.limits == [1]
+    assert cleanup.limits == [3]
+    assert discovery.limits == [11]
     assert mcp.events == ["start", "close"]
     assert not runtime.started
     assert not runtime.delivery_ready
@@ -191,6 +258,7 @@ async def test_application_lifespan_is_offline_when_delivery_is_disabled(
         assert readiness.ready
         assert [check.name for check in readiness.checks] == [
             "database",
+            "recording_storage",
             "runtime",
             "delivery:disabled",
         ]
@@ -207,10 +275,16 @@ async def test_connector_outage_does_not_block_processing_startup() -> None:
     runtime = RuntimeSupervisor(
         database=database,
         processing=processing,
+        recording_storage=FakeRecordingStorage(),
+        recording_cleanup=FakeRecordingCleanupRunner(),
+        orphan_discovery=FakeOrphanDiscoveryRunner(),
         delivery=delivery,
         mcp_client=mcp,
         poll_interval_seconds=0.01,
         processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
     )
 
     async with runtime.lifespan(FastAPI()):
@@ -230,10 +304,16 @@ async def test_connector_readiness_tracks_disconnection_and_recovery() -> None:
     runtime = RuntimeSupervisor(
         database=database,
         processing=processing,
+        recording_storage=FakeRecordingStorage(),
+        recording_cleanup=FakeRecordingCleanupRunner(),
+        orphan_discovery=FakeOrphanDiscoveryRunner(),
         delivery=delivery,
         mcp_client=mcp,
         poll_interval_seconds=0.01,
         processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
         delivery_batch_size=3,
     )
     readiness = RuntimeReadinessProbe(database, runtime)
@@ -255,6 +335,123 @@ async def test_connector_readiness_tracks_disconnection_and_recovery() -> None:
         assert delivery.limits[:2] == [1, 1]
 
     assert mcp.events == ["start", "start", "close"]
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        FakeRecordingStorage(ready=False),
+        FakeRecordingStorage(error=OSError("storage unavailable")),
+    ],
+)
+async def test_storage_preflight_failure_closes_resources_without_starting_workers(
+    storage: FakeRecordingStorage,
+) -> None:
+    processing = FakeProcessingRunner()
+    cleanup = FakeRecordingCleanupRunner()
+    discovery = FakeOrphanDiscoveryRunner()
+    closer = FakeCloser()
+    runtime = RuntimeSupervisor(
+        database=FakeDatabase(),
+        processing=processing,
+        recording_storage=storage,
+        recording_cleanup=cleanup,
+        orphan_discovery=discovery,
+        poll_interval_seconds=0.01,
+        processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
+        closeables=(closer,),
+    )
+
+    with pytest.raises(RuntimeError, match="storage preflight"):
+        await runtime.start()
+
+    assert not runtime.started
+    assert not runtime.worker_ready
+    assert not processing.calls
+    assert not cleanup.limits
+    assert not discovery.limits
+    assert closer.closed
+
+
+async def test_partial_worker_startup_is_cancelled_and_resources_are_closed(
+    monkeypatch: Any,
+) -> None:
+    original_create_task = asyncio.create_task
+    created: list[asyncio.Task[Any]] = []
+    attempts = 0
+
+    def create_task(coroutine: Any, *, name: str | None = None) -> asyncio.Task[Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            coroutine.close()
+            raise RuntimeError("task startup unavailable")
+        task = original_create_task(coroutine, name=name)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", create_task)
+    closer = FakeCloser()
+    runtime = RuntimeSupervisor(
+        database=FakeDatabase(),
+        processing=FakeProcessingRunner(),
+        recording_storage=FakeRecordingStorage(),
+        recording_cleanup=FakeRecordingCleanupRunner(),
+        orphan_discovery=FakeOrphanDiscoveryRunner(),
+        poll_interval_seconds=0.01,
+        processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
+        closeables=(closer,),
+    )
+
+    with pytest.raises(RuntimeError, match="task startup"):
+        await runtime.start()
+
+    assert len(created) == 1
+    assert created[0].cancelled()
+    assert closer.closed
+    assert not runtime.worker_ready
+
+
+async def test_permanent_cleanup_result_does_not_change_readiness() -> None:
+    database = FakeDatabase()
+    storage = FakeRecordingStorage()
+    cleanup = FakeRecordingCleanupRunner(
+        (
+            RecordingCleanupResult(
+                job_id=UUID(int=10),
+                outcome=RecordingCleanupOutcome.FAILED,
+                job=None,
+            ),
+        )
+    )
+    runtime = RuntimeSupervisor(
+        database=database,
+        processing=FakeProcessingRunner(),
+        recording_storage=storage,
+        recording_cleanup=cleanup,
+        orphan_discovery=FakeOrphanDiscoveryRunner(),
+        poll_interval_seconds=0.01,
+        processing_batch_size=1,
+        recording_cleanup_batch_size=1,
+        orphan_scan_interval_seconds=0.01,
+        orphan_scan_batch_size=1,
+    )
+    readiness = RuntimeReadinessProbe(database, runtime)
+    loop_thread = get_ident()
+
+    async with runtime.lifespan(FastAPI()):
+        await asyncio.wait_for(cleanup.called.wait(), timeout=1)
+        result = await readiness.check()
+
+    assert result.ready
+    assert storage.thread_ids
+    assert loop_thread not in storage.thread_ids
 
 
 async def test_mcp_url_without_targets_keeps_delivery_disabled(tmp_path: Path) -> None:

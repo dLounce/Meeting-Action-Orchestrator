@@ -47,6 +47,14 @@ from meeting_action_orchestrator.application.processing import (
     ProcessingWorker,
 )
 from meeting_action_orchestrator.application.processing_control import ProcessingControlService
+from meeting_action_orchestrator.application.recording_cleanup import (
+    OrphanDiscoveryBatch,
+    RecordingCleanupOutcome,
+    RecordingCleanupResult,
+    RecordingCleanupScheduler,
+    RecordingCleanupWorker,
+    RecordingOrphanDiscoverer,
+)
 from meeting_action_orchestrator.application.workflow import MeetingWorkflow, SystemClock
 from meeting_action_orchestrator.config import Settings, get_settings
 from meeting_action_orchestrator.domain.enums import ProcessingStage
@@ -60,6 +68,9 @@ from meeting_action_orchestrator.infrastructure.mcp_client import ManagedMcpHttp
 from meeting_action_orchestrator.infrastructure.mcp_gateway import McpGateway, McpToolNames
 from meeting_action_orchestrator.infrastructure.openai_agents import OpenAIAgentsRunner
 from meeting_action_orchestrator.infrastructure.openai_transcription import OpenAITranscriber
+from meeting_action_orchestrator.infrastructure.recording_quarantine import (
+    LocalRecordingQuarantine,
+)
 from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOfWork
 
 logger = logging.getLogger(__name__)
@@ -84,6 +95,18 @@ class DeliveryRunner(Protocol):
     async def run_once(self, limit: int = 20) -> DeliveryBatch: ...
 
 
+class RecordingCleanupRunner(Protocol):
+    async def run_once(self, limit: int = 20) -> tuple[RecordingCleanupResult, ...]: ...
+
+
+class OrphanDiscoveryRunner(Protocol):
+    async def run_once(self, limit: int = 100) -> OrphanDiscoveryBatch: ...
+
+
+class RecordingStorage(Protocol):
+    def healthcheck(self) -> bool: ...
+
+
 class McpLifecycle(Protocol):
     @property
     def connected(self) -> bool: ...
@@ -101,8 +124,14 @@ class AsyncCloser(Protocol):
 class RuntimeSupervisor:
     database: MigratableDatabase
     processing: ProcessingRunner
+    recording_storage: RecordingStorage
+    recording_cleanup: RecordingCleanupRunner
+    orphan_discovery: OrphanDiscoveryRunner
     poll_interval_seconds: float
     processing_batch_size: int
+    recording_cleanup_batch_size: int
+    orphan_scan_interval_seconds: float
+    orphan_scan_batch_size: int
     delivery: DeliveryRunner | None = None
     delivery_batch_size: int = 20
     mcp_client: McpLifecycle | None = None
@@ -121,6 +150,16 @@ class RuntimeSupervisor:
             raise ValueError("processing_batch_size must be between one and 10")
         if not 1 <= self.delivery_batch_size <= 100:
             raise ValueError("delivery_batch_size must be between one and 100")
+        if not 1 <= self.recording_cleanup_batch_size <= 100:
+            raise ValueError("recording_cleanup_batch_size must be between one and 100")
+        if not math.isfinite(self.orphan_scan_interval_seconds) or not (
+            0 < self.orphan_scan_interval_seconds <= 86_400
+        ):
+            raise ValueError(
+                "orphan_scan_interval_seconds must be greater than zero and at most 86400"
+            )
+        if not 1 <= self.orphan_scan_batch_size <= 1_000:
+            raise ValueError("orphan_scan_batch_size must be between one and 1000")
 
     @property
     def delivery_mode(self) -> str:
@@ -144,14 +183,29 @@ class RuntimeSupervisor:
                 return
             if self._stopped:
                 raise RuntimeError("The runtime supervisor cannot be restarted after shutdown")
-            version = await asyncio.to_thread(self.database.migrate)
             try:
-                self._tasks = [
+                version = await asyncio.to_thread(self.database.migrate)
+                storage_ready = await asyncio.to_thread(self.storage_healthcheck)
+                if not storage_ready:
+                    raise RuntimeError("Recording storage preflight failed")
+                self._tasks.append(
                     asyncio.create_task(
                         self._processing_loop(),
                         name="meeting-processing-worker",
                     )
-                ]
+                )
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._recording_cleanup_loop(),
+                        name="recording-cleanup-worker",
+                    )
+                )
+                self._tasks.append(
+                    asyncio.create_task(
+                        self._orphan_discovery_loop(),
+                        name="recording-orphan-discovery",
+                    )
+                )
                 if self.delivery is not None:
                     self._tasks.append(
                         asyncio.create_task(
@@ -240,11 +294,71 @@ class RuntimeSupervisor:
                 )
             await asyncio.sleep(self.poll_interval_seconds)
 
+    async def _recording_cleanup_loop(self) -> None:
+        while True:
+            try:
+                results = await self.recording_cleanup.run_once(self.recording_cleanup_batch_size)
+                if results:
+                    logger.info(
+                        "recording cleanup batch completed",
+                        extra={
+                            "fields": {
+                                "failed_count": sum(
+                                    result.outcome is RecordingCleanupOutcome.FAILED
+                                    for result in results
+                                ),
+                                "job_count": len(results),
+                                "lease_lost_count": sum(
+                                    result.outcome is RecordingCleanupOutcome.LEASE_LOST
+                                    for result in results
+                                ),
+                            }
+                        },
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "recording cleanup worker cycle failed",
+                    extra={"fields": {"worker": "recording_cleanup"}},
+                )
+            await asyncio.sleep(self.poll_interval_seconds)
+
+    async def _orphan_discovery_loop(self) -> None:
+        while True:
+            try:
+                batch = await self.orphan_discovery.run_once(self.orphan_scan_batch_size)
+                if batch.scanned:
+                    logger.info(
+                        "recording orphan scan completed",
+                        extra={
+                            "fields": {
+                                "candidate_count": batch.scanned,
+                                "rejected_count": batch.rejected,
+                                "scheduled_count": batch.scheduled,
+                            }
+                        },
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error(
+                    "recording orphan scan failed",
+                    extra={"fields": {"worker": "recording_orphan_discovery"}},
+                )
+            await asyncio.sleep(self.orphan_scan_interval_seconds)
+
     async def _connect_mcp(self) -> None:
         if self.mcp_client is None or self.mcp_client.connected:
             return
         await self.mcp_client.start()
         logger.info("delivery connector ready")
+
+    def storage_healthcheck(self) -> bool:
+        try:
+            return self.recording_storage.healthcheck() is True
+        except Exception:
+            return False
 
     async def _cancel_workers(self) -> None:
         tasks, self._tasks = self._tasks, []
@@ -290,11 +404,15 @@ class RuntimeReadinessProbe:
         self._runtime = runtime
 
     async def check(self) -> ReadinessResult:
-        database_ready = await asyncio.to_thread(self._healthcheck)
+        database_ready, storage_ready = await asyncio.gather(
+            asyncio.to_thread(self._healthcheck),
+            asyncio.to_thread(self._runtime.storage_healthcheck),
+        )
         delivery_name = f"delivery:{self._runtime.delivery_mode}"
         return ReadinessResult(
             (
                 ReadinessCheck("database", database_ready),
+                ReadinessCheck("recording_storage", storage_ready),
                 ReadinessCheck("runtime", self._runtime.worker_ready),
                 ReadinessCheck(delivery_name, self._runtime.delivery_ready),
             )
@@ -350,6 +468,11 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         FFprobeAudioInspector(),
         configured.max_upload_bytes,
     )
+    recording_quarantine = LocalRecordingQuarantine(configured.upload_directory)
+    recording_cleanup_scheduler = RecordingCleanupScheduler(
+        unit_of_work=write_unit_of_work,
+        clock=clock,
+    )
     transcriber = OpenAITranscriber(
         api_key=openai_key,
         model=configured.openai_transcription_model,
@@ -377,6 +500,7 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         specialists=specialists,
         clock=clock,
         delivery_targets=targets,
+        recording_cleanup_scheduler=recording_cleanup_scheduler,
         max_agent_requests=configured.openai_max_requests_per_run,
         max_agent_output_tokens=configured.openai_max_output_tokens_per_run,
     )
@@ -387,6 +511,22 @@ def create_application(settings: Settings | None = None) -> FastAPI:
         retry_scheduler=ProcessingRetryScheduler(),
         worker_id=_worker_id("processing"),
     )
+    recording_cleanup = RecordingCleanupWorker(
+        unit_of_work=write_unit_of_work,
+        executor=recording_quarantine,
+        clock=clock,
+        retry_scheduler=ProcessingRetryScheduler(),
+        worker_id=_worker_id("recording-cleanup"),
+        lease_duration=timedelta(seconds=configured.recording_cleanup_lease_seconds),
+    )
+    orphan_discovery = RecordingOrphanDiscoverer(
+        unit_of_work=read_unit_of_work,
+        scheduler=recording_cleanup_scheduler,
+        scanner=recording_quarantine,
+        active_recordings=recording_store,
+        clock=clock,
+        grace_period=timedelta(seconds=configured.recording_orphan_grace_seconds),
+    )
     mcp_client, delivery_executor = _delivery_runtime(
         configured,
         database,
@@ -395,8 +535,14 @@ def create_application(settings: Settings | None = None) -> FastAPI:
     runtime = RuntimeSupervisor(
         database=database,
         processing=processing,
+        recording_storage=recording_quarantine,
+        recording_cleanup=recording_cleanup,
+        orphan_discovery=orphan_discovery,
         poll_interval_seconds=configured.worker_poll_interval_seconds,
         processing_batch_size=configured.processing_batch_size,
+        recording_cleanup_batch_size=configured.recording_cleanup_batch_size,
+        orphan_scan_interval_seconds=configured.recording_orphan_scan_interval_seconds,
+        orphan_scan_batch_size=configured.recording_orphan_scan_batch_size,
         delivery=delivery_executor,
         delivery_batch_size=configured.delivery_batch_size,
         mcp_client=mcp_client,

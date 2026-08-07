@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     worker_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
     processing_batch_size: int = Field(default=1, ge=1, le=10)
     delivery_batch_size: int = Field(default=20, ge=1, le=100)
+    recording_cleanup_batch_size: int = Field(default=20, ge=1, le=100)
+    recording_cleanup_lease_seconds: float = Field(default=300.0, ge=30, le=3_600)
+    recording_orphan_scan_interval_seconds: float = Field(default=300.0, gt=0, le=86_400)
+    recording_orphan_grace_seconds: float = Field(default=86_400.0, ge=300, le=604_800)
+    recording_orphan_scan_batch_size: int = Field(default=100, ge=1, le=1_000)
 
     @field_validator("api_bearer_token", "openai_api_key", "mcp_auth_token", mode="before")
     @classmethod

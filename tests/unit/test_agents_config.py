@@ -25,6 +25,26 @@ def test_delivery_targets_are_disabled_until_resources_are_configured() -> None:
     assert settings.mcp_calendar_resource_id is None
     assert settings.processing_batch_size == 1
     assert settings.delivery_batch_size == 20
+    assert settings.recording_cleanup_batch_size == 20
+    assert settings.recording_cleanup_lease_seconds == 300
+    assert settings.recording_orphan_scan_interval_seconds == 300
+    assert settings.recording_orphan_grace_seconds == 86_400
+    assert settings.recording_orphan_scan_batch_size == 100
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("recording_cleanup_batch_size", 101),
+        ("recording_cleanup_lease_seconds", 29),
+        ("recording_orphan_scan_interval_seconds", 86_401),
+        ("recording_orphan_grace_seconds", 299),
+        ("recording_orphan_scan_batch_size", 1_001),
+    ],
+)
+def test_recording_maintenance_settings_are_bounded(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match=field):
+        Settings(_env_file=None, **{field: value})
 
 
 def test_run_budget_must_cover_all_specialist_limits() -> None:
