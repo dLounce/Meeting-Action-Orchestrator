@@ -11,14 +11,17 @@ from uuid import UUID, uuid4
 
 from meeting_action_orchestrator.application.errors import ResourceNotFoundError
 from meeting_action_orchestrator.application.ports import Clock, UnitOfWork
+from meeting_action_orchestrator.application.state_machine import transition_meeting
 from meeting_action_orchestrator.domain.enums import (
     FailureCode,
     FailureDisposition,
+    MeetingStatus,
     ProcessingJobStatus,
     ProcessingStage,
 )
 from meeting_action_orchestrator.domain.models import (
     PROCESSING_MAX_ATTEMPTS,
+    Meeting,
     ProcessingJob,
     WorkflowFailure,
 )
@@ -177,9 +180,17 @@ class ProcessingWorker:
     ) -> tuple[ProcessingResult, ...]:
         if stage not in self._handlers:
             raise ValueError(f"No handler is registered for {stage.value}")
+        batch_limit = max(0, limit)
+        if batch_limit == 0:
+            return ()
         results = []
-        for _ in range(max(0, limit)):
-            claimed = await asyncio.to_thread(self._claim, stage, 1)
+        for index in range(batch_limit):
+            claimed = await asyncio.to_thread(
+                self._claim,
+                stage,
+                1,
+                batch_limit if index == 0 else 0,
+            )
             if not claimed:
                 break
             job = claimed[0]
@@ -221,8 +232,13 @@ class ProcessingWorker:
             uow.commit()
         return renewed
 
-    def _claim(self, stage: ProcessingStage, limit: int) -> tuple[ProcessingJob, ...]:
-        if limit <= 0:
+    def _claim(
+        self,
+        stage: ProcessingStage,
+        limit: int,
+        repair_limit: int = 0,
+    ) -> tuple[ProcessingJob, ...]:
+        if limit <= 0 and repair_limit <= 0:
             return ()
         now = self._clock.now()
         expired_failure = WorkflowFailure(
@@ -231,7 +247,26 @@ class ProcessingWorker:
             safe_message="The processing lease expired before completion",
             occurred_at=now,
         )
+        inconsistent_failure = WorkflowFailure(
+            code=FailureCode.INTERNAL,
+            disposition=FailureDisposition.PERMANENT,
+            safe_message="The processing job state is inconsistent",
+            occurred_at=now,
+        )
         with self._unit_of_work() as uow:
+            expired_jobs = uow.processing_jobs.list_expired_exhausted(
+                stage,
+                now,
+                max(0, repair_limit),
+            )
+            for expired in expired_jobs:
+                self._repair_expired_exhausted(
+                    uow,
+                    expired,
+                    expired_failure,
+                    inconsistent_failure,
+                    now,
+                )
             claimed = tuple(
                 uow.processing_jobs.claim_due(
                     stage,
@@ -239,11 +274,64 @@ class ProcessingWorker:
                     now,
                     now + self._lease_duration,
                     limit,
-                    expired_failure,
                 )
             )
             uow.commit()
         return claimed
+
+    @staticmethod
+    def _repair_expired_exhausted(
+        uow: UnitOfWork,
+        job: ProcessingJob,
+        expired_failure: WorkflowFailure,
+        inconsistent_failure: WorkflowFailure,
+        now: datetime,
+    ) -> None:
+        meeting = uow.meetings.get(job.meeting_id)
+        if meeting is not None and _has_committed_artifact(uow, job, meeting):
+            status = ProcessingJobStatus.SUCCEEDED
+            job_failure = None
+            repaired_meeting = None
+        elif meeting is not None and meeting.status is MeetingStatus.CANCELLED:
+            status = ProcessingJobStatus.CANCELLED
+            job_failure = None
+            repaired_meeting = None
+        else:
+            status = ProcessingJobStatus.FAILED
+            repaired_meeting = (
+                _fail_meeting_for_expired_job(
+                    meeting,
+                    job.stage,
+                    expired_failure,
+                    now,
+                )
+                if meeting is not None
+                else None
+            )
+            failed_status = _stage_states(job.stage)[2]
+            if repaired_meeting is not None:
+                job_failure = expired_failure
+            elif meeting is not None and meeting.status is failed_status:
+                job_failure = meeting.failure or inconsistent_failure
+            else:
+                job_failure = inconsistent_failure
+        repaired_job = _replace_job(
+            job,
+            status=status,
+            updated_at=now,
+            next_attempt_at=None,
+            lease_owner=None,
+            lease_expires_at=None,
+            last_failure=job_failure,
+        )
+        if repaired_meeting is not None and meeting is not None:
+            uow.meetings.save(repaired_meeting, meeting.version)
+        uow.processing_jobs.save(
+            repaired_job,
+            job.status,
+            job.lease_owner,
+            job.lease_expires_at,
+        )
 
     async def _execute(self, job: ProcessingJob) -> WorkflowFailure | None:
         try:
@@ -331,6 +419,64 @@ class ProcessingWorker:
 
 def _replace_job(job: ProcessingJob, **updates: object) -> ProcessingJob:
     return ProcessingJob.model_validate(job.model_dump(mode="python") | updates)
+
+
+def _has_committed_artifact(
+    uow: UnitOfWork,
+    job: ProcessingJob,
+    meeting: Meeting,
+) -> bool:
+    if job.stage is ProcessingStage.TRANSCRIPTION:
+        if meeting.current_transcript_id is None:
+            return False
+        transcript = uow.transcripts.get(meeting.current_transcript_id)
+        return (
+            transcript is not None
+            and transcript.meeting_id == meeting.id
+            and transcript.audio_asset_id == meeting.audio_asset_id
+        )
+    if meeting.current_review_id is None or meeting.current_transcript_id is None:
+        return False
+    review = uow.reviews.get(meeting.current_review_id)
+    return (
+        review is not None
+        and review.meeting_id == meeting.id
+        and review.transcript_id == meeting.current_transcript_id
+    )
+
+
+def _fail_meeting_for_expired_job(
+    meeting: Meeting,
+    stage: ProcessingStage,
+    failure: WorkflowFailure,
+    now: datetime,
+) -> Meeting | None:
+    pending, active, failed = _stage_states(stage)
+    if meeting.status is failed:
+        return None
+    if meeting.status is pending:
+        meeting = transition_meeting(meeting, active, now)
+    if meeting.status is active:
+        return transition_meeting(meeting, failed, now, failure=failure)
+    return None
+
+
+def _stage_states(
+    stage: ProcessingStage,
+) -> tuple[MeetingStatus, MeetingStatus, MeetingStatus]:
+    states = {
+        ProcessingStage.TRANSCRIPTION: (
+            MeetingStatus.INGESTED,
+            MeetingStatus.TRANSCRIBING,
+            MeetingStatus.TRANSCRIPTION_FAILED,
+        ),
+        ProcessingStage.EXTRACTION: (
+            MeetingStatus.TRANSCRIBED,
+            MeetingStatus.EXTRACTING,
+            MeetingStatus.EXTRACTION_FAILED,
+        ),
+    }
+    return states[stage]
 
 
 def _outcome_for(status: ProcessingJobStatus) -> ProcessingOutcome:

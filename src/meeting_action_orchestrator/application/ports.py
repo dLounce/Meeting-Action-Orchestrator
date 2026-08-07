@@ -239,6 +239,13 @@ class ProcessingJobRepository(Protocol):
 
     def list_for_meeting(self, meeting_id: UUID) -> Sequence[ProcessingJob]: ...
 
+    def list_expired_exhausted(
+        self,
+        stage: ProcessingStage,
+        now: datetime,
+        limit: int,
+    ) -> Sequence[ProcessingJob]: ...
+
     def claim_due(
         self,
         stage: ProcessingStage,
@@ -246,7 +253,6 @@ class ProcessingJobRepository(Protocol):
         now: datetime,
         lease_until: datetime,
         limit: int,
-        expired_failure: WorkflowFailure,
     ) -> Sequence[ProcessingJob]: ...
 
     def save(

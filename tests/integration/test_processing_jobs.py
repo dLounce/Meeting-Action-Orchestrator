@@ -129,7 +129,6 @@ def test_expired_lease_is_reclaimed_until_attempts_are_exhausted(tmp_path: Path)
             NOW,
             NOW + timedelta(seconds=10),
             1,
-            retryable_failure(NOW),
         )
         uow.commit()
     with SqliteUnitOfWork(database) as uow:
@@ -139,7 +138,6 @@ def test_expired_lease_is_reclaimed_until_attempts_are_exhausted(tmp_path: Path)
             NOW + timedelta(seconds=5),
             NOW + timedelta(seconds=15),
             1,
-            retryable_failure(NOW + timedelta(seconds=5)),
         )
         uow.commit()
     with SqliteUnitOfWork(database) as uow:
@@ -149,7 +147,6 @@ def test_expired_lease_is_reclaimed_until_attempts_are_exhausted(tmp_path: Path)
             NOW + timedelta(seconds=10),
             NOW + timedelta(seconds=20),
             1,
-            retryable_failure(NOW + timedelta(seconds=10)),
         )
         uow.commit()
     with SqliteUnitOfWork(database) as uow:
@@ -159,9 +156,13 @@ def test_expired_lease_is_reclaimed_until_attempts_are_exhausted(tmp_path: Path)
             NOW + timedelta(seconds=20),
             NOW + timedelta(seconds=30),
             1,
-            retryable_failure(NOW + timedelta(seconds=20)),
         )
         current = uow.processing_jobs.get(JOB_ID)
+        expired = uow.processing_jobs.list_expired_exhausted(
+            ProcessingStage.EXTRACTION,
+            NOW + timedelta(seconds=20),
+            1,
+        )
         uow.commit()
 
     assert first[0].attempt_count == 1
@@ -169,10 +170,141 @@ def test_expired_lease_is_reclaimed_until_attempts_are_exhausted(tmp_path: Path)
     assert reclaimed[0].attempt_count == 2
     assert exhausted == ()
     assert current is not None
-    assert current.status is ProcessingJobStatus.FAILED
+    assert current.status is ProcessingJobStatus.RUNNING
     assert current.attempt_count == 2
-    assert current.last_failure is not None
-    assert current.last_failure.disposition is FailureDisposition.RETRYABLE
+    assert current.last_failure is None
+    assert expired == (current,)
+
+
+def test_expired_exhausted_lookup_filters_orders_and_limits(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    meeting_ids = tuple(UUID(f"20000000-0000-4000-8000-{index:012d}") for index in range(1, 7))
+    job_ids = tuple(UUID(f"30000000-0000-4000-8000-{index:012d}") for index in range(1, 7))
+    with SqliteUnitOfWork(database) as uow:
+        for index, meeting_id in enumerate(meeting_ids, start=1):
+            uow.meetings.add(
+                Meeting(
+                    id=meeting_id,
+                    ingest_key=f"expired-{index}",
+                    title=f"Expired {index}",
+                    audio_asset_id=ASSET_ID,
+                    occurred_at=NOW,
+                    timezone="UTC",
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+        jobs = (
+            ProcessingJob(
+                id=job_ids[3],
+                meeting_id=meeting_ids[3],
+                stage=ProcessingStage.EXTRACTION,
+                status=ProcessingJobStatus.RUNNING,
+                attempt_count=2,
+                max_attempts=2,
+                lease_owner="worker-a",
+                lease_expires_at=NOW + timedelta(seconds=4),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            ProcessingJob(
+                id=job_ids[1],
+                meeting_id=meeting_ids[1],
+                stage=ProcessingStage.EXTRACTION,
+                status=ProcessingJobStatus.RUNNING,
+                attempt_count=2,
+                max_attempts=2,
+                lease_owner="worker-a",
+                lease_expires_at=NOW + timedelta(seconds=5),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            ProcessingJob(
+                id=job_ids[0],
+                meeting_id=meeting_ids[0],
+                stage=ProcessingStage.EXTRACTION,
+                status=ProcessingJobStatus.RUNNING,
+                attempt_count=2,
+                max_attempts=2,
+                lease_owner="worker-a",
+                lease_expires_at=NOW + timedelta(seconds=5),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            ProcessingJob(
+                id=job_ids[2],
+                meeting_id=meeting_ids[2],
+                stage=ProcessingStage.EXTRACTION,
+                status=ProcessingJobStatus.RUNNING,
+                attempt_count=2,
+                max_attempts=2,
+                lease_owner="worker-a",
+                lease_expires_at=NOW + timedelta(seconds=5),
+                created_at=NOW + timedelta(seconds=1),
+                updated_at=NOW + timedelta(seconds=1),
+            ),
+            ProcessingJob(
+                id=job_ids[4],
+                meeting_id=meeting_ids[4],
+                stage=ProcessingStage.EXTRACTION,
+                status=ProcessingJobStatus.RUNNING,
+                attempt_count=1,
+                max_attempts=2,
+                lease_owner="worker-a",
+                lease_expires_at=NOW + timedelta(seconds=4),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+            ProcessingJob(
+                id=job_ids[5],
+                meeting_id=meeting_ids[5],
+                stage=ProcessingStage.TRANSCRIPTION,
+                status=ProcessingJobStatus.RUNNING,
+                attempt_count=3,
+                max_attempts=3,
+                lease_owner="worker-a",
+                lease_expires_at=NOW + timedelta(seconds=4),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        )
+        for job in jobs:
+            uow.processing_jobs.add(job)
+        exact_limited = uow.processing_jobs.list_expired_exhausted(
+            ProcessingStage.EXTRACTION,
+            NOW + timedelta(seconds=5),
+            3,
+        )
+        exact_all = uow.processing_jobs.list_expired_exhausted(
+            ProcessingStage.EXTRACTION,
+            NOW + timedelta(seconds=5),
+            10,
+        )
+        before = uow.processing_jobs.list_expired_exhausted(
+            ProcessingStage.EXTRACTION,
+            NOW + timedelta(seconds=3),
+            10,
+        )
+        empty_limit = uow.processing_jobs.list_expired_exhausted(
+            ProcessingStage.EXTRACTION,
+            NOW + timedelta(seconds=5),
+            0,
+        )
+        uow.commit()
+
+    assert tuple(job.id for job in exact_limited) == (
+        job_ids[3],
+        job_ids[0],
+        job_ids[1],
+    )
+    assert tuple(job.id for job in exact_all) == (
+        job_ids[3],
+        job_ids[0],
+        job_ids[1],
+        job_ids[2],
+    )
+    assert before == ()
+    assert empty_limit == ()
 
 
 async def test_worker_releases_claim_transaction_before_handler(tmp_path: Path) -> None:

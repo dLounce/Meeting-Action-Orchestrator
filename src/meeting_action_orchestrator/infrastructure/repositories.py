@@ -649,6 +649,31 @@ class SqliteProcessingJobRepository:
         ).fetchall()
         return tuple(self._from_row(row) for row in rows)
 
+    def list_expired_exhausted(
+        self,
+        stage: ProcessingStage,
+        now: datetime,
+        limit: int,
+    ) -> Sequence[ProcessingJob]:
+        if limit <= 0:
+            return ()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM processing_jobs
+            WHERE stage = ? AND status = ? AND lease_expires_at <= ?
+                AND attempt_count >= max_attempts
+            ORDER BY lease_expires_at, created_at, id
+            LIMIT ?
+            """,
+            (
+                stage.value,
+                ProcessingJobStatus.RUNNING.value,
+                str(now),
+                limit,
+            ),
+        ).fetchall()
+        return tuple(self._from_row(row) for row in rows)
+
     def claim_due(
         self,
         stage: ProcessingStage,
@@ -656,27 +681,9 @@ class SqliteProcessingJobRepository:
         now: datetime,
         lease_until: datetime,
         limit: int,
-        expired_failure: WorkflowFailure,
     ) -> Sequence[ProcessingJob]:
         if limit <= 0:
             return ()
-        self._connection.execute(
-            """
-            UPDATE processing_jobs SET status = ?, next_attempt_at = NULL,
-                lease_owner = NULL, lease_expires_at = NULL,
-                last_failure_json = ?, updated_at = ?
-            WHERE stage = ? AND status = ? AND lease_expires_at <= ?
-                AND attempt_count >= max_attempts
-            """,
-            (
-                ProcessingJobStatus.FAILED.value,
-                _as_json(expired_failure),
-                str(now),
-                stage.value,
-                ProcessingJobStatus.RUNNING.value,
-                str(now),
-            ),
-        )
         rows = self._connection.execute(
             """
             SELECT id FROM processing_jobs

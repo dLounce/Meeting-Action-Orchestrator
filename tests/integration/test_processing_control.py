@@ -148,7 +148,6 @@ async def test_retry_resets_failed_job_once_and_returns_authoritative_replay(
             CONTROL_NOW,
             CONTROL_NOW + timedelta(minutes=5),
             1,
-            retry_failure(),
         )
         uow.commit()
     assert len(claimed) == 1
@@ -427,7 +426,6 @@ async def test_cancellation_rejects_running_jobs_and_late_states(tmp_path: Path)
             CONTROL_NOW,
             CONTROL_NOW + timedelta(minutes=5),
             1,
-            retry_failure(),
         )
         uow.commit()
 

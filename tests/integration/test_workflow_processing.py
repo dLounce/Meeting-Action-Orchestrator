@@ -197,7 +197,6 @@ def claim_and_start(
             clock.now(),
             clock.now() + timedelta(seconds=10),
             1,
-            lease_failure(clock.now()),
         )
         assert len(claimed) == 1
         meeting = uow.meetings.get(meeting_id)
