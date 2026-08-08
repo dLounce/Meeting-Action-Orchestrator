@@ -82,7 +82,7 @@ def expire_job(
                 "next_attempt_at": None,
                 "lease_owner": "crashed-worker",
                 "lease_expires_at": clock.now() + timedelta(seconds=lease_seconds),
-                "claim_token": UUID(int=9001),
+                "claim_token": current.id,
                 "last_failure": None,
                 "updated_at": clock.now(),
             }

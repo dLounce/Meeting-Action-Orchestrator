@@ -611,7 +611,7 @@ class MeetingErasureOperationBinding(DomainModel):
     created_at: AwareDatetime
 
     @classmethod
-    def create(
+    def create(  # noqa: PLR0917
         cls,
         request_token: ErasureToken,
         actor_token: ErasureToken,

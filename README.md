@@ -60,7 +60,7 @@ normalize or transcode recordings.
 ## Setup
 
 ```bash
-uv sync --group dev
+uv sync --locked --group dev
 cp .env.example .env
 openssl rand -hex 32
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'

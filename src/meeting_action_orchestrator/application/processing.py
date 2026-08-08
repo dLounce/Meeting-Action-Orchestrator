@@ -485,15 +485,14 @@ class ProcessingWorker:
             if retryable:
                 retry_base = now
                 provider_retry_at = None
-                if effective_failure.retry_after_seconds is not None:
-                    provider_retry_at = now + timedelta(
-                        seconds=effective_failure.retry_after_seconds
-                    )
+                provider_retry_delay = effective_failure.retry_after_seconds
+                if provider_retry_delay is not None:
+                    provider_retry_at = now + timedelta(seconds=provider_retry_delay)
                     retry_base = provider_retry_at
                 retry_at = self._retry_scheduler.schedule(retry_base, current.attempt_count)
                 if provider_retry_at is not None:
                     minimum_retry_at = provider_retry_at
-                    if effective_failure.retry_after_seconds > 0:
+                    if provider_retry_delay is not None and provider_retry_delay > 0:
                         minimum_retry_at += timedelta(microseconds=1)
                     retry_at = max(retry_at, minimum_retry_at)
             failed = _replace_job(

@@ -167,19 +167,19 @@ class ProviderBudgetReservation(DomainModel):
             self.claim_token,
             self.dispatch_digest,
             self.operation_digest,
-            self.operation,
-            self.role,
-            self.model,
-            self.reserved_input_tokens,
-            self.reserved_output_tokens,
-            self.reserved_audio_duration_ms,
+            operation=self.operation,
+            role=self.role,
+            model=self.model,
+            reserved_input_tokens=self.reserved_input_tokens,
+            reserved_output_tokens=self.reserved_output_tokens,
+            reserved_audio_duration_ms=self.reserved_audio_duration_ms,
         )
         if self.request_fingerprint != expected:
             raise ValueError("Provider reservation fingerprint is invalid")
         return self
 
 
-def provider_reservation_fingerprint(
+def provider_reservation_fingerprint(  # noqa: PLR0917
     processing_job_id: UUID,
     attempt_number: int,
     claim_token: UUID,

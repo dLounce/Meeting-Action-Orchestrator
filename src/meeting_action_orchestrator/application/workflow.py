@@ -238,8 +238,14 @@ class MeetingWorkflow:
                         audio,
                     ):
                         raise IdempotencyConflictError(request.ingest_key)
-                    asset = _required(uow.audio_assets.get(existing.audio_asset_id), "Audio asset")
-                    if asset.sha256 != audio.sha256 or asset.size_bytes != audio.size_bytes:
+                    persisted_asset = _required(
+                        uow.audio_assets.get(existing.audio_asset_id),
+                        "Audio asset",
+                    )
+                    if (
+                        persisted_asset.sha256 != audio.sha256
+                        or persisted_asset.size_bytes != audio.size_bytes
+                    ):
                         raise AudioAssetIdentityMismatchError
                     meeting = existing
                 else:

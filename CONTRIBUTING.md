@@ -6,7 +6,7 @@ Install Python 3.10 through 3.13, `uv`, and `ffprobe`, then install the developm
 environment:
 
 ```bash
-uv sync --group dev
+uv sync --locked --group dev
 cp .env.example .env
 ```
 

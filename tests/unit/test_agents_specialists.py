@@ -40,7 +40,7 @@ class FakeRunner:
         output = self.outputs.pop(0)
         assert isinstance(output, definition.output_type)
         return AgentResult(
-            output=cast(OutputT, output),
+            output=output,
             usage=AgentUsage(
                 requests=1,
                 input_tokens=100,
@@ -133,7 +133,7 @@ async def test_extractor_uses_worker_model_and_typed_output() -> None:
 async def test_recap_writer_uses_recap_model_without_reasoning() -> None:
     output = RecapDraft(title="Launch review", overview="The launch is ready.", highlights=[])
     runner = FakeRunner([output])
-    specialists = MeetingSpecialists(runner, worker_model="worker", recap_model="recap")
+    specialists = MeetingSpecialists(runner, "worker", "recap")
     request = RecapRequest(meeting_id="meeting_1", record=record())
 
     result = await specialists.write_recap(request, context("recap"))

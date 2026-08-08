@@ -139,49 +139,49 @@ def build_canonical_record(
     extraction: MeetingExtraction,
 ) -> CanonicalMeetingRecord:
     items: list[RecordItem] = []
-    for index, candidate in enumerate(extraction.decisions):
+    for index, decision in enumerate(extraction.decisions):
         items.append(
             RecordItem(
-                id=str(_entity_id(meeting.id, "decision", index, candidate.statement)),
+                id=str(_entity_id(meeting.id, "decision", index, decision.statement)),
                 kind="decision",
-                text=candidate.statement,
-                owner=candidate.owner,
-                confidence=candidate.confidence,
-                evidence=candidate.evidence,
+                text=decision.statement,
+                owner=decision.owner,
+                confidence=decision.confidence,
+                evidence=decision.evidence,
             )
         )
-    for index, candidate in enumerate(extraction.action_items):
+    for index, action in enumerate(extraction.action_items):
         items.append(
             RecordItem(
-                id=str(_entity_id(meeting.id, "action", index, candidate.description)),
+                id=str(_entity_id(meeting.id, "action", index, action.description)),
                 kind="action_item",
-                text=candidate.description,
-                owner=candidate.owner,
-                due_expression=candidate.due_expression,
-                confidence=candidate.confidence,
-                evidence=candidate.evidence,
+                text=action.description,
+                owner=action.owner,
+                due_expression=action.due_expression,
+                confidence=action.confidence,
+                evidence=action.evidence,
             )
         )
-    for index, candidate in enumerate(extraction.open_questions):
+    for index, question in enumerate(extraction.open_questions):
         items.append(
             RecordItem(
-                id=str(_entity_id(meeting.id, "question", index, candidate.question)),
+                id=str(_entity_id(meeting.id, "question", index, question.question)),
                 kind="open_question",
-                text=candidate.question,
-                owner=candidate.owner,
+                text=question.question,
+                owner=question.owner,
                 confidence="medium",
-                evidence=candidate.evidence,
+                evidence=question.evidence,
             )
         )
-    for index, candidate in enumerate(extraction.risks):
+    for index, risk in enumerate(extraction.risks):
         items.append(
             RecordItem(
-                id=str(_entity_id(meeting.id, "risk", index, candidate.description)),
+                id=str(_entity_id(meeting.id, "risk", index, risk.description)),
                 kind="risk",
-                text=candidate.description,
-                owner=candidate.owner,
+                text=risk.description,
+                owner=risk.owner,
                 confidence="medium",
-                evidence=candidate.evidence,
+                evidence=risk.evidence,
             )
         )
     participants = [

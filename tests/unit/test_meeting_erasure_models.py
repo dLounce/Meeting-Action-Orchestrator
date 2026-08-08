@@ -179,8 +179,8 @@ def test_operation_factory_binds_actor_resource_and_expected_version() -> None:
             resource,
             JOB_ID,
             MeetingErasureOperation.REQUEST,
-            4,
-            NOW,
+            expected_version=4,
+            created_at=NOW,
         )
 
 

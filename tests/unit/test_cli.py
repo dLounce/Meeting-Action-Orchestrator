@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import uvicorn
+
 from meeting_action_orchestrator import cli
 from meeting_action_orchestrator.config import Settings
 
@@ -39,7 +41,7 @@ def test_serve_command_uses_configured_binding(tmp_path: Path, monkeypatch: Any)
     monkeypatch.setattr(cli, "configure_logging", lambda: None)
     monkeypatch.setattr(cli, "create_application", lambda _value: application)
     monkeypatch.setattr(
-        cli.uvicorn,
+        uvicorn,
         "run",
         lambda app, **options: calls.append((app, options)),
     )

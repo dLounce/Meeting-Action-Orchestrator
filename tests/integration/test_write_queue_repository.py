@@ -352,35 +352,42 @@ def test_version_six_migration_makes_existing_unknown_writes_due(tmp_path: Path)
             """,
             (WriteStatus.UNKNOWN.value, failure_json, str(NOW), str(INTENT_ID)),
         )
-        connection.execute("DROP INDEX idx_write_intents_reconcile")
-        connection.execute("ALTER TABLE write_intents DROP COLUMN reconcile_lease_owner")
-        connection.execute("ALTER TABLE write_intents DROP COLUMN reconcile_lease_expires_at")
-        connection.execute("ALTER TABLE write_intents DROP COLUMN next_reconcile_at")
-        connection.execute("ALTER TABLE write_intents DROP COLUMN reconcile_attempt_count")
-        connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN updated_at")
-        connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN version")
-        connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN completed_at")
-        connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN lease_owner")
-        connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN lease_expires_at")
-        connection.execute("ALTER TABLE delivery_operation_bindings DROP COLUMN status")
-        connection.execute("DROP TABLE meeting_erasure_operation_bindings")
-        connection.execute("DROP TABLE meeting_erasure_tombstones")
-        connection.execute("DROP TABLE meeting_erasure_jobs")
-        connection.execute("DROP TABLE erasure_key_verifiers")
-        connection.execute("DROP INDEX idx_write_intents_meeting_status")
-        connection.execute("DROP INDEX idx_meetings_audio_asset_id")
-        connection.execute("DROP INDEX idx_transcripts_audio_asset_id")
-        connection.execute("DROP INDEX idx_review_revisions_transcript_id")
-        connection.execute("DROP INDEX idx_approvals_review_revision_id")
-        connection.execute("DROP INDEX idx_recap_artifacts_meeting_id")
-        connection.execute("DROP TRIGGER workflow_events_reject_duplicate_id_insert")
-        connection.execute("DROP TRIGGER workflow_events_require_contiguous_insert")
-        connection.execute("DROP TRIGGER workflow_events_reject_update")
-        connection.execute("DROP TRIGGER workflow_events_reject_direct_delete")
-        connection.execute("DROP TRIGGER audio_assets_reject_cleanup_insert")
-        connection.execute("DROP TRIGGER audio_assets_reject_cleanup_update")
-        connection.execute("DROP TABLE recording_cleanup_jobs")
-        connection.execute("DROP TABLE ingest_request_bindings")
+        for statement in (
+            "DROP INDEX idx_write_intents_reconcile",
+            "ALTER TABLE write_intents DROP COLUMN reconcile_lease_owner",
+            "ALTER TABLE write_intents DROP COLUMN reconcile_lease_expires_at",
+            "ALTER TABLE write_intents DROP COLUMN next_reconcile_at",
+            "ALTER TABLE write_intents DROP COLUMN reconcile_attempt_count",
+            "ALTER TABLE delivery_operation_bindings DROP COLUMN updated_at",
+            "ALTER TABLE delivery_operation_bindings DROP COLUMN version",
+            "ALTER TABLE delivery_operation_bindings DROP COLUMN completed_at",
+            "ALTER TABLE delivery_operation_bindings DROP COLUMN lease_owner",
+            "ALTER TABLE delivery_operation_bindings DROP COLUMN lease_expires_at",
+            "ALTER TABLE delivery_operation_bindings DROP COLUMN status",
+            "DROP TABLE meeting_erasure_operation_bindings",
+            "DROP TABLE meeting_erasure_tombstones",
+            "DROP TABLE meeting_erasure_jobs",
+            "DROP TABLE erasure_key_verifiers",
+            "DROP INDEX idx_write_intents_meeting_status",
+            "DROP INDEX idx_meetings_audio_asset_id",
+            "DROP INDEX idx_transcripts_audio_asset_id",
+            "DROP INDEX idx_review_revisions_transcript_id",
+            "DROP INDEX idx_approvals_review_revision_id",
+            "DROP INDEX idx_recap_artifacts_meeting_id",
+            "DROP TRIGGER workflow_events_reject_duplicate_id_insert",
+            "DROP TRIGGER workflow_events_require_contiguous_insert",
+            "DROP TRIGGER workflow_events_reject_update",
+            "DROP TRIGGER workflow_events_reject_direct_delete",
+            "DROP TRIGGER audio_assets_reject_cleanup_insert",
+            "DROP TRIGGER audio_assets_reject_cleanup_update",
+            "DROP TRIGGER processing_jobs_reject_direct_budget_delete",
+            "DROP TABLE provider_budget_settlements",
+            "DROP TABLE provider_budget_reservations",
+            "DROP TABLE provider_budget_accounts",
+            "DROP TABLE recording_cleanup_jobs",
+            "DROP TABLE ingest_request_bindings",
+        ):
+            connection.execute(statement)
         connection.execute(
             """
             INSERT INTO delivery_operation_bindings (

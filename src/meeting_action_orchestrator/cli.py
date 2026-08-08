@@ -8,7 +8,8 @@ from collections.abc import Sequence
 import uvicorn
 
 from meeting_action_orchestrator.application.meeting_erasure import ErasureKeyRegistry
-from meeting_action_orchestrator.bootstrap import SystemClock, create_application
+from meeting_action_orchestrator.application.workflow import SystemClock
+from meeting_action_orchestrator.bootstrap import create_application
 from meeting_action_orchestrator.config import Settings, get_settings
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.erasure_tokens import ErasureTokenKeyring

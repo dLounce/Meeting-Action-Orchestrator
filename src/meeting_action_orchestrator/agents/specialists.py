@@ -23,7 +23,7 @@ from meeting_action_orchestrator.agents.prompts import (
 
 
 class MeetingSpecialists:
-    def __init__(
+    def __init__(  # noqa: PLR0917
         self,
         runner: StructuredAgentRunner,
         worker_model: str,

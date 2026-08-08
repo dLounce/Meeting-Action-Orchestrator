@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
 from enum import Enum
 from types import TracebackType
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import anyio
 import httpx
@@ -81,6 +81,9 @@ class TransportFactory(Protocol):
     ) -> TransportContext: ...
 
 
+_DEFAULT_TRANSPORT_FACTORY = cast(TransportFactory, streamable_http_client)
+
+
 class Session(Protocol):
     async def __aenter__(self) -> Session: ...
 
@@ -148,7 +151,7 @@ class ManagedMcpHttpClient:
         startup_timeout_seconds: float = 30,
         terminate_on_close: bool = True,
         http_client_factory: HttpClientFactory = _create_http_client,
-        transport_factory: TransportFactory = streamable_http_client,
+        transport_factory: TransportFactory = _DEFAULT_TRANSPORT_FACTORY,
         session_factory: SessionFactory = ClientSession,
     ) -> None:
         self._endpoint = _validated_endpoint(endpoint)

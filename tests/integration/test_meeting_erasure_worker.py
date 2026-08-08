@@ -5,10 +5,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, get_ident
 from types import TracebackType
+from typing import Literal
 from uuid import UUID
 
 import pytest
 
+import meeting_action_orchestrator.application.meeting_erasure_worker as erasure_worker_module
 from meeting_action_orchestrator.application.errors import (
     MeetingErasureBlockedError,
     MeetingErasureIntegrityError,
@@ -45,6 +47,7 @@ from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.erasure_tokens import ErasureTokenKeyring
 from meeting_action_orchestrator.infrastructure.repositories import (
     PersistenceConflictError,
+    SqliteRecordingCleanupRepository,
     SqliteUnitOfWork,
 )
 
@@ -91,17 +94,17 @@ class TrackingUnitOfWork(SqliteUnitOfWork):
         self._tracker = tracker
 
     def __enter__(self) -> TrackingUnitOfWork:
-        entered = super().__enter__()
+        super().__enter__()
         self._tracker.active += 1
         self._tracker.thread_ids.append(get_ident())
-        return entered
+        return self
 
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         try:
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
@@ -131,6 +134,16 @@ class BlockingCheckpoint:
         self.started.set()
         assert self.release.wait(timeout=2)
         return WalCheckpointResult(0, 0, 0)
+
+
+class AdvancingCheckpoint:
+    def __init__(self, clock: MutableClock, result: WalCheckpointResult) -> None:
+        self._clock = clock
+        self._result = result
+
+    def truncate_wal(self) -> WalCheckpointResult:
+        self._clock.current += timedelta(minutes=6)
+        return self._result
 
 
 def migrated_database(tmp_path: Path) -> Database:
@@ -387,9 +400,10 @@ def test_cleanup_success_fans_out_shared_group_and_requires_fresh_checkpoints(
 
     assert removed is not None
     assert removed.outcome is MeetingErasureWorkerOutcome.CLEANUP_REMOVED
-    assert all(job is not None for job in after_fanout)
-    assert all(job.recording_state is MeetingErasureRecordingState.REMOVED for job in after_fanout)
-    assert all(job.database_checkpointed_at is None for job in after_fanout)
+    for persisted in after_fanout:
+        assert persisted is not None
+        assert persisted.recording_state is MeetingErasureRecordingState.REMOVED
+        assert persisted.database_checkpointed_at is None
     assert all(result is not None for result in terminal)
     assert {result.outcome for result in terminal if result is not None} == {
         MeetingErasureWorkerOutcome.COMPLETED
@@ -605,8 +619,8 @@ def test_forged_retry_binding_cannot_return_another_erasure_job(tmp_path: Path) 
         tokens.erasure_job_token(jobs[0].id),
         jobs[1].id,
         MeetingErasureOperation.RETRY,
-        0,
-        NOW,
+        expected_version=0,
+        created_at=NOW,
     )
     with SqliteUnitOfWork(database) as uow:
         for job in jobs:
@@ -626,3 +640,178 @@ def test_forged_retry_binding_cannot_return_another_erasure_job(tmp_path: Path) 
 
     with pytest.raises(MeetingErasureIntegrityError):
         remediation._retry(jobs[0].id, 0, "forged-retry", "actor")
+
+
+def test_erasure_worker_validates_lease_identity_and_duration(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+
+    def build(
+        worker_id: str,
+        lease_duration: timedelta = timedelta(minutes=5),
+    ) -> MeetingErasureWorker:
+        return MeetingErasureWorker(
+            unit_of_work=lambda: SqliteUnitOfWork(database),
+            checkpoint=Checkpoint(),
+            clock=MutableClock(),
+            retry_scheduler=FixedRetryScheduler(),
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+        )
+
+    for worker_id in ("", " erasure-worker ", "x" * 201):
+        with pytest.raises(ValueError, match="Worker ID"):
+            build(worker_id)
+    for lease_duration in (timedelta(seconds=29), timedelta(hours=1, microseconds=1)):
+        with pytest.raises(ValueError, match="Lease duration"):
+            build("erasure-worker", lease_duration)
+
+
+async def test_erasure_worker_enforces_batch_bounds(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    erasure_worker = worker(database, Checkpoint())
+
+    assert await erasure_worker.run_once(0) == ()
+    assert await erasure_worker.run_once(-1) == ()
+    with pytest.raises(ValueError, match="cannot exceed 100"):
+        await erasure_worker.run_once(101)
+
+
+@pytest.mark.parametrize(
+    "checkpoint_result",
+    [WalCheckpointResult(1, 1, 1), WalCheckpointResult(0, 0, 0)],
+)
+def test_checkpoint_publication_rejects_an_expired_lease(
+    tmp_path: Path,
+    checkpoint_result: WalCheckpointResult,
+) -> None:
+    database = migrated_database(tmp_path)
+    tokens = keyring()
+    register(database, tokens)
+    cleanup = cleanup_job(1, RecordingCleanupStatus.READY)
+    job = erasure_job(tokens, 1, cleanup=cleanup)
+    add_group(database, cleanup, (job,))
+    clock = MutableClock()
+    erasure_worker = MeetingErasureWorker(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        checkpoint=AdvancingCheckpoint(clock, checkpoint_result),
+        clock=clock,
+        retry_scheduler=FixedRetryScheduler(),
+        worker_id="erasure-worker",
+        lease_duration=timedelta(minutes=5),
+    )
+
+    result = erasure_worker._claim_and_process()
+
+    assert result is not None
+    assert result.outcome is MeetingErasureWorkerOutcome.LEASE_LOST
+    assert result.job is None
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        persisted = uow.meeting_erasures.get(job.id)
+    assert persisted is not None
+    assert persisted.status is MeetingErasureStatus.ACTIVE
+    assert persisted.lease_owner == "erasure-worker"
+
+
+def test_checkpoint_terminalizes_a_preexisting_cleanup_failure(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    tokens = keyring()
+    register(database, tokens)
+    cleanup = cleanup_job(1, RecordingCleanupStatus.FAILED)
+    failed = erasure_job(tokens, 1, cleanup=cleanup, failed=True)
+    active = MeetingErasureJob.model_validate(
+        failed.model_dump(mode="python")
+        | {
+            "status": MeetingErasureStatus.ACTIVE,
+            "database_checkpointed_at": None,
+            "completed_at": None,
+        }
+    )
+    add_group(database, cleanup, (active,))
+
+    result = worker(database, Checkpoint())._claim_and_process()
+
+    assert result is not None
+    assert result.outcome is MeetingErasureWorkerOutcome.FAILED
+    assert result.job is not None
+    assert result.job.status is MeetingErasureStatus.FAILED
+    assert result.job.recording_state is MeetingErasureRecordingState.FAILED
+
+
+def test_nonterminal_cleanup_is_not_reconciled_as_erased(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    tokens = keyring()
+    register(database, tokens)
+    cleanup = cleanup_job(1, RecordingCleanupStatus.READY)
+    job = erasure_job(tokens, 1, cleanup=cleanup, checkpointed=True)
+    add_group(database, cleanup, (job,))
+    claimed = MeetingErasureJob.model_validate(
+        job.model_dump(mode="python")
+        | {
+            "lease_owner": "erasure-worker",
+            "lease_expires_at": NOW + timedelta(minutes=5),
+            "version": job.version + 1,
+        }
+    )
+    with SqliteUnitOfWork(database) as uow:
+        uow.meeting_erasures.save(
+            claimed,
+            job.version,
+            job.lease_owner,
+            job.lease_expires_at,
+        )
+        uow.commit()
+
+    result = worker(database, Checkpoint())._reconcile_cleanup(claimed)
+
+    assert result is not None
+    assert result.outcome is MeetingErasureWorkerOutcome.LEASE_LOST
+    assert result.job is None
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.recording_cleanups.get(cleanup.id) == cleanup
+
+
+def test_cleanup_success_requires_repository_deletion_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = migrated_database(tmp_path)
+    tokens = keyring()
+    register(database, tokens)
+    cleanup = cleanup_job(1, RecordingCleanupStatus.SUCCEEDED)
+    job = erasure_job(tokens, 1, cleanup=cleanup, checkpointed=True)
+    add_group(database, cleanup, (job,))
+    monkeypatch.setattr(
+        SqliteRecordingCleanupRepository,
+        "delete_succeeded",
+        lambda _repository, _job: False,
+    )
+
+    with pytest.raises(MeetingErasureIntegrityError):
+        worker(database, Checkpoint())._claim_and_process()
+
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.recording_cleanups.get(cleanup.id) == cleanup
+        persisted = uow.meeting_erasures.get(job.id)
+    assert persisted is not None
+    assert persisted.recording_state is MeetingErasureRecordingState.CLEANUP_PENDING
+    assert persisted.cleanup_job_id == cleanup.id
+    assert persisted.lease_owner == "erasure-worker"
+
+
+def test_cleanup_group_validation_rejects_missing_and_invalid_members() -> None:
+    tokens = keyring()
+    cleanup = cleanup_job(1, RecordingCleanupStatus.SUCCEEDED)
+    claimed = erasure_job(tokens, 1, cleanup=cleanup, checkpointed=True)
+    invalid = MeetingErasureJob.model_validate(
+        claimed.model_dump(mode="python")
+        | {
+            "recording_state": MeetingErasureRecordingState.REMOVED,
+            "cleanup_job_id": None,
+            "database_checkpointed_at": None,
+        }
+    )
+
+    with pytest.raises(MeetingErasureIntegrityError):
+        erasure_worker_module._validate_cleanup_group((), claimed, NOW)
+    with pytest.raises(MeetingErasureIntegrityError):
+        erasure_worker_module._validate_cleanup_group((invalid,), claimed, NOW)

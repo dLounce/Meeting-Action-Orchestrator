@@ -114,6 +114,7 @@ async def readiness(
     operation_id="createMeeting",
 )
 async def create_meeting(
+    *,
     response: Response,
     metadata: Annotated[str, Form(min_length=2, max_length=32_000)],
     recording: Annotated[UploadFile, File()],
@@ -215,6 +216,7 @@ async def get_processing(
 )
 async def retry_processing(
     meeting_id: UUID,
+    *,
     response: Response,
     dependencies: ApiDependenciesValue,
     principal: PrincipalValue,
@@ -242,6 +244,7 @@ async def retry_processing(
 )
 async def cancel_meeting(
     meeting_id: UUID,
+    *,
     response: Response,
     dependencies: ApiDependenciesValue,
     principal: PrincipalValue,
@@ -314,6 +317,7 @@ async def get_recap(
 async def revise_action(
     meeting_id: UUID,
     action_id: UUID,
+    *,
     request: ActionRevisionRequest,
     response: Response,
     dependencies: ApiDependenciesValue,
@@ -354,6 +358,7 @@ async def revise_action(
 async def resolve_issue(
     meeting_id: UUID,
     issue_id: UUID,
+    *,
     request: IssueResolutionRequest,
     response: Response,
     dependencies: ApiDependenciesValue,
@@ -390,6 +395,7 @@ async def select_delivery(
     meeting_id: UUID,
     action_id: UUID,
     kind: WriteKind,
+    *,
     request: DeliverySelectionRequest,
     response: Response,
     dependencies: ApiDependenciesValue,
@@ -423,6 +429,7 @@ async def select_delivery(
 )
 async def approve_review(
     meeting_id: UUID,
+    *,
     response: Response,
     dependencies: ApiDependenciesValue,
     principal: PrincipalValue,
@@ -469,6 +476,7 @@ async def get_delivery(
 )
 async def retry_delivery(
     meeting_id: UUID,
+    *,
     request: DeliveryOperationRequest,
     response: Response,
     dependencies: ApiDependenciesValue,
@@ -494,6 +502,7 @@ async def retry_delivery(
 )
 async def reconcile_delivery(
     meeting_id: UUID,
+    *,
     request: DeliveryOperationRequest,
     response: Response,
     dependencies: ApiDependenciesValue,

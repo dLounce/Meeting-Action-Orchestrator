@@ -230,6 +230,10 @@ def client(
     return managed, events, http_factory, transport_factory, session_factory, selected
 
 
+def assert_connected(client: ManagedMcpHttpClient, expected: bool) -> None:
+    assert client.connected is expected
+
+
 @pytest.mark.asyncio
 async def test_call_before_start_is_rejected() -> None:
     managed, _, _, _, _, _ = client()
@@ -247,7 +251,7 @@ async def test_start_initializes_once_and_call_tool_matches_the_mcp_protocol() -
 
     await managed.start()
     await managed.start()
-    assert managed.connected
+    assert_connected(managed, True)
     result = await managed.call_tool(
         "tasks.create",
         {"title": "Publish brief"},
@@ -255,7 +259,7 @@ async def test_start_initializes_once_and_call_tool_matches_the_mcp_protocol() -
     )
     await managed.close()
     await managed.close()
-    assert not managed.connected
+    assert_connected(managed, False)
 
     headers, timeout, auth = http_factory.calls[0]
     assert headers == {"Authorization": f"Bearer {credential}"}
@@ -359,13 +363,13 @@ async def test_failed_call_invalidates_the_session_and_reconnects_with_authoriza
         )
 
     assert captured.value is failure
-    assert not managed.connected
+    assert_connected(managed, False)
     assert len(failed.calls) == 1
     assert not healthy.calls
     assert actual_events[-3:] == ["session.exit", "transport.exit", "http.exit"]
 
     await managed.start()
-    assert managed.connected
+    assert_connected(managed, True)
     result = await managed.call_tool(
         "tasks.create",
         {"title": "Publish brief"},

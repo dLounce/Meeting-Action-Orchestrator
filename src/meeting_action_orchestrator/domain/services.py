@@ -34,13 +34,10 @@ def validate_review_evidence(review: ReviewRevision, transcript: Transcript) -> 
     if review.meeting_id != transcript.meeting_id or review.transcript_id != transcript.id:
         raise DomainInvariantError(InvariantCode.REVIEW_TRANSCRIPT)
     segments = {segment.id: segment for segment in transcript.segments}
-    review_items = (
-        *review.decisions,
-        *review.action_items,
-        *review.open_questions,
-        *review.risks,
-    )
-    evidence_groups = [item.evidence for item in review_items]
+    evidence_groups = [item.evidence for item in review.decisions]
+    evidence_groups.extend(item.evidence for item in review.action_items)
+    evidence_groups.extend(item.evidence for item in review.open_questions)
+    evidence_groups.extend(item.evidence for item in review.risks)
     for evidence_group in evidence_groups:
         for evidence in evidence_group:
             try:

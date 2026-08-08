@@ -155,14 +155,14 @@ def test_store_uses_plain_link_fallback_without_overwrite(
     def fallback_link(
         source: os.PathLike[str] | str,
         target: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
-        if kwargs:
+        if not follow_symlinks:
             raise TypeError("follow_symlinks is unavailable")
         real_link(source, target)
 
-    monkeypatch.setattr(audio.os, "link", fallback_link)
+    monkeypatch.setattr(os, "link", fallback_link)
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
 
     stored = store.put(io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"), "meeting.wav")
@@ -183,15 +183,18 @@ def test_store_detects_post_link_swap_and_preserves_replacement(
     def swapping_link(
         source: os.PathLike[str] | str,
         target: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
-        real_link(source, target, *args, **kwargs)
+        if follow_symlinks:
+            real_link(source, target)
+        else:
+            real_link(source, target, follow_symlinks=False)
         real_unlink(source)
         Path(source).write_bytes(b"replacement owner")
 
     monkeypatch.setattr(audio, "uuid4", lambda: identifier)
-    monkeypatch.setattr(audio.os, "link", swapping_link)
+    monkeypatch.setattr(os, "link", swapping_link)
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
 
     with pytest.raises(AudioValidationError, match="stored safely"):
@@ -238,17 +241,17 @@ def test_store_detects_post_link_swap_through_plain_fallback(
     def fallback_swapping_link(
         source: os.PathLike[str] | str,
         target: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
-        if kwargs:
+        if not follow_symlinks:
             raise TypeError("follow_symlinks is unavailable")
         real_link(source, target)
         real_unlink(source)
         Path(source).write_bytes(b"replacement owner")
 
     monkeypatch.setattr(audio, "uuid4", lambda: identifier)
-    monkeypatch.setattr(audio.os, "link", fallback_swapping_link)
+    monkeypatch.setattr(os, "link", fallback_swapping_link)
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
 
     with pytest.raises(AudioValidationError, match="stored safely"):
@@ -270,17 +273,20 @@ def test_store_rejects_in_place_change_during_publication(
     def changing_link(
         source: os.PathLike[str] | str,
         target: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
         with Path(source).open("ab") as changed:
             changed.write(b"changed")
             changed.flush()
             os.fsync(changed.fileno())
-        real_link(source, target, *args, **kwargs)
+        if follow_symlinks:
+            real_link(source, target)
+        else:
+            real_link(source, target, follow_symlinks=False)
 
     monkeypatch.setattr(audio, "uuid4", lambda: identifier)
-    monkeypatch.setattr(audio.os, "link", changing_link)
+    monkeypatch.setattr(os, "link", changing_link)
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
 
     with pytest.raises(AudioValidationError, match="stored safely"):
@@ -305,7 +311,7 @@ def test_store_closes_descriptor_and_preserves_orphan_when_initial_fstat_fails(
         raise OSError(errno.EIO, "private operating system message")
 
     monkeypatch.setattr(audio, "uuid4", lambda: identifier)
-    monkeypatch.setattr(audio.os, "fstat", failing_fstat)
+    monkeypatch.setattr(os, "fstat", failing_fstat)
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
 
     with pytest.raises(OSError, match="private operating system message"):
@@ -330,7 +336,7 @@ def test_store_cleans_owned_temporary_file_when_fdopen_fails(
         raise RuntimeError("fdopen failed")
 
     monkeypatch.setattr(audio, "uuid4", lambda: identifier)
-    monkeypatch.setattr(audio.os, "fdopen", failing_fdopen)
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
     store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
 
     with pytest.raises(RuntimeError, match="fdopen failed"):
@@ -385,14 +391,14 @@ def test_directory_sync_ignores_only_explicitly_unsupported_errors(
     def unsupported_sync(_descriptor: int) -> None:
         raise OSError(errno.EINVAL, "unsupported")
 
-    monkeypatch.setattr(audio.os, "fsync", unsupported_sync)
+    monkeypatch.setattr(os, "fsync", unsupported_sync)
 
     audio._sync_directory(tmp_path)
 
     def failed_sync(_descriptor: int) -> None:
         raise OSError(errno.EIO, "storage failure")
 
-    monkeypatch.setattr(audio.os, "fsync", failed_sync)
+    monkeypatch.setattr(os, "fsync", failed_sync)
     with pytest.raises(OSError, match="storage failure"):
         audio._sync_directory(tmp_path)
 
@@ -423,3 +429,196 @@ def test_ffprobe_inspector_returns_normalized_metadata(tmp_path: Path) -> None:
     result = FFprobeAudioInspector(runner=runner).inspect(tmp_path / "audio.m4a", "audio/mp4")
 
     assert result == AudioMetadata("audio/mp4", 1250, "aac", 48000, 2)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "payload", "message"),
+    [
+        (1, "{}", "could not be decoded"),
+        (0, "not-json", "metadata is incomplete"),
+        (0, '{"streams":[],"format":{}}', "metadata is incomplete"),
+        (
+            0,
+            '{"streams":[{"codec_type":"audio"}],"format":{"duration":"0"}}',
+            "duration is outside",
+        ),
+        (
+            0,
+            '{"streams":[{"codec_type":"audio"}],"format":{"duration":"7201"}}',
+            "duration is outside",
+        ),
+        (
+            0,
+            '{"streams":[{"codec_type":"audio"}],"format":{"duration":"1"}}',
+            "stream metadata is incomplete",
+        ),
+        (
+            0,
+            '{"streams":[{"codec_type":"audio","codec_name":"pcm","sample_rate":"0",'
+            '"channels":1}],"format":{"duration":"1"}}',
+            "stream metadata is invalid",
+        ),
+    ],
+)
+def test_ffprobe_inspector_rejects_untrusted_or_incomplete_metadata(
+    tmp_path: Path,
+    returncode: int,
+    payload: str,
+    message: str,
+) -> None:
+    def runner(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], returncode, payload, "private decoder detail")
+
+    inspector = FFprobeAudioInspector(runner=runner)
+
+    with pytest.raises(AudioValidationError, match=message) as captured:
+        inspector.inspect(tmp_path / "audio.wav", "audio/wav")
+
+    assert "private decoder detail" not in str(captured.value)
+
+
+def test_store_validates_configuration_filename_and_empty_content(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="max_bytes must be positive"):
+        LocalAudioStore(tmp_path, StubInspector(), max_bytes=0)
+
+    store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
+    with pytest.raises(AudioValidationError, match="filename"):
+        store.put(io.BytesIO(b"audio"), "/")
+    with pytest.raises(AudioValidationError, match="empty"):
+        store.put(io.BytesIO(), "meeting.wav")
+
+    assert list(tmp_path.iterdir()) == []
+    assert store.active_temporary_keys() == frozenset()
+
+
+def test_store_open_accepts_only_generated_recording_keys(tmp_path: Path) -> None:
+    store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
+    stored = store.put(io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"), "meeting.wav")
+
+    with store.open(stored.storage_key) as source:
+        assert source.read() == b"RIFF\x00\x00\x00\x00WAVEdata"
+    with pytest.raises(AudioValidationError, match="storage key"):
+        store.open("../meeting.wav")
+
+
+def test_store_rejects_same_inode_content_change_before_publication(tmp_path: Path) -> None:
+    class MutatingInspector:
+        def inspect(self, path: Path, detected_media_type: str) -> AudioMetadata:
+            path.write_bytes(b"RIFF\x00\x00\x00\x00WAVExxxx")
+            return AudioMetadata(detected_media_type, 1000, "pcm_s16le", 16000, 1)
+
+    store = LocalAudioStore(tmp_path, MutatingInspector(), max_bytes=1024)
+
+    with pytest.raises(AudioValidationError, match="changed before publication"):
+        store.put(io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"), "meeting.wav")
+
+    leftovers = list(tmp_path.iterdir())
+    assert len(leftovers) == 1
+    assert leftovers[0].name.endswith(".part")
+    assert leftovers[0].read_bytes() == b"RIFF\x00\x00\x00\x00WAVExxxx"
+
+
+def test_store_preserves_race_safety_when_inspector_removes_staged_file(tmp_path: Path) -> None:
+    class RemovingInspector:
+        def inspect(self, path: Path, detected_media_type: str) -> AudioMetadata:
+            path.unlink()
+            return AudioMetadata(detected_media_type, 1000, "pcm_s16le", 16000, 1)
+
+    store = LocalAudioStore(tmp_path, RemovingInspector(), max_bytes=1024)
+
+    with pytest.raises(FileNotFoundError):
+        store.put(io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"), "meeting.wav")
+
+    assert list(tmp_path.iterdir()) == []
+    assert store.active_temporary_keys() == frozenset()
+
+
+def test_store_uses_link_fallback_for_unsupported_nofollow_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_link = os.link
+
+    def unsupported_nofollow_link(
+        source: os.PathLike[str] | str,
+        target: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        if not follow_symlinks:
+            raise OSError(getattr(errno, "ENOTSUP", errno.EINVAL), "unsupported")
+        real_link(source, target)
+
+    monkeypatch.setattr(os, "link", unsupported_nofollow_link)
+    store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
+
+    stored = store.put(io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"), "meeting.wav")
+
+    assert stored.path.exists()
+
+
+def test_store_fails_closed_when_hard_links_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unsupported_link(
+        _source: os.PathLike[str] | str,
+        _target: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del follow_symlinks
+        raise NotImplementedError
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    store = LocalAudioStore(tmp_path, StubInspector(), max_bytes=1024)
+
+    with pytest.raises(AudioValidationError, match="publication is not supported"):
+        store.put(io.BytesIO(b"RIFF\x00\x00\x00\x00WAVEdata"), "meeting.wav")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_directory_sync_handles_absent_and_unsupported_directory_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "O_DIRECTORY", 0)
+    audio._sync_directory(tmp_path)
+
+    monkeypatch.undo()
+    directory_flag = os.O_DIRECTORY
+
+    def unsupported_open(
+        _path: os.PathLike[str] | str,
+        _flags: int,
+        _mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del dir_fd
+        raise OSError(errno.EINVAL, "unsupported")
+
+    assert directory_flag != 0
+    monkeypatch.setattr(os, "open", unsupported_open)
+    audio._sync_directory(tmp_path)
+
+
+def test_directory_sync_propagates_storage_open_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_open(
+        _path: os.PathLike[str] | str,
+        _flags: int,
+        _mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del dir_fd
+        raise OSError(errno.EIO, "storage failure")
+
+    monkeypatch.setattr(os, "open", failed_open)
+
+    with pytest.raises(OSError, match="storage failure"):
+        audio._sync_directory(tmp_path)

@@ -8,8 +8,10 @@ from uuid import UUID
 
 import pytest
 
+import meeting_action_orchestrator.application.processing_control as processing_control_module
 from meeting_action_orchestrator.application.errors import (
     OperationConflictError,
+    ResourceNotFoundError,
     StaleWorkflowVersionError,
     WorkflowBusyError,
 )
@@ -258,6 +260,7 @@ async def test_retry_rejects_nonterminal_jobs(
         lease_expires_at=(
             CONTROL_NOW + timedelta(minutes=5) if status is ProcessingJobStatus.RUNNING else None
         ),
+        claim_token=UUID(int=70_002) if status is ProcessingJobStatus.RUNNING else None,
         last_failure=retry_failure() if status is ProcessingJobStatus.RETRY_WAIT else None,
         created_at=NOW,
         updated_at=NOW,
@@ -276,7 +279,9 @@ async def test_retry_rejects_nonterminal_jobs(
         )
 
     with SqliteUnitOfWork(database) as uow:
-        assert uow.meetings.get(MEETING_ID).version == 4
+        persisted_meeting = uow.meetings.get(MEETING_ID)
+        assert persisted_meeting is not None
+        assert persisted_meeting.version == 4
         assert uow.processing_jobs.get(JOB_ID) == job
         assert uow.meeting_operations.get(f"retry-{status.value}") is None
 
@@ -473,4 +478,93 @@ async def test_cancellation_rejects_running_jobs_and_late_states(tmp_path: Path)
             expected_version=0,
             request_key="cancel-late",
             actor_id="owner",
+        )
+
+
+async def test_retry_requires_a_matching_failed_processing_job(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    set_meeting(database, status=MeetingStatus.TRANSCRIPTION_FAILED, version=2)
+
+    with pytest.raises(ResourceNotFoundError, match="Processing job"):
+        await service(database).retry(
+            MEETING_ID,
+            expected_version=2,
+            request_key="retry-missing-job",
+            actor_id="owner",
+        )
+
+
+async def test_retry_rejects_a_meeting_without_a_failed_stage(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+
+    with pytest.raises(OperationConflictError, match="Only failed meeting processing"):
+        await service(database).retry(
+            MEETING_ID,
+            expected_version=0,
+            request_key="retry-ingested",
+            actor_id="owner",
+        )
+
+
+@pytest.mark.parametrize(
+    ("request_key", "actor_id", "expected_version", "message"),
+    [
+        ("", "owner", 0, "request_key"),
+        (" retry ", "owner", 0, "request_key"),
+        ("retry", "", 0, "actor_id"),
+        ("retry", " owner ", 0, "actor_id"),
+        ("retry", "owner", -1, "expected_version"),
+    ],
+)
+async def test_processing_controls_validate_idempotency_identity_before_io(
+    tmp_path: Path,
+    request_key: str,
+    actor_id: str,
+    expected_version: int,
+    message: str,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+
+    with pytest.raises(ValueError, match=message):
+        await service(database).cancel(
+            MEETING_ID,
+            expected_version=expected_version,
+            request_key=request_key,
+            actor_id=actor_id,
+        )
+
+
+async def test_processing_control_rejects_naive_clock_before_mutation(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    set_meeting(database, status=MeetingStatus.TRANSCRIPTION_FAILED, version=1)
+    original = add_failed_job(database, ProcessingStage.TRANSCRIPTION)
+    controls = ProcessingControlService(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        clock=FrozenClock(CONTROL_NOW.replace(tzinfo=None)),
+    )
+
+    with pytest.raises(ValueError, match="aware datetime"):
+        await controls.retry(
+            MEETING_ID,
+            expected_version=1,
+            request_key="retry-naive-clock",
+            actor_id="owner",
+        )
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.processing_jobs.get(original.id) == original
+        assert uow.meeting_operations.get("retry-naive-clock") is None
+
+
+def test_replay_snapshot_fails_closed_when_bound_stage_disappears(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+
+    with (
+        SqliteUnitOfWork(database, immediate=False) as uow,
+        pytest.raises(OperationConflictError, match="bound processing job"),
+    ):
+        processing_control_module._snapshot(
+            uow,
+            MEETING_ID,
+            ProcessingStage.TRANSCRIPTION,
+            replayed=True,
         )

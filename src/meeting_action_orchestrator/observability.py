@@ -79,8 +79,9 @@ class JsonFormatter(logging.Formatter):
         fields = getattr(record, "fields", None)
         if isinstance(fields, Mapping):
             payload["fields"] = sanitize(fields)
-        if record.exc_info is not None:
-            payload["exception"] = record.exc_info[0].__name__
+        exception_type = record.exc_info[0] if record.exc_info is not None else None
+        if exception_type is not None:
+            payload["exception"] = exception_type.__name__
         return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 

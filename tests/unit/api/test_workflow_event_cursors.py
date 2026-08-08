@@ -49,7 +49,8 @@ def test_workflow_event_cursor_rejects_tampering_and_noncanonical_encodings() ->
         with pytest.raises(ProblemError) as failure:
             parse_workflow_event_cursor(malformed, MEETING_ID)
         assert failure.value.problem.type_uri.endswith("invalid-page-cursor")
-        assert malformed not in str(failure.value)
+        if malformed:
+            assert malformed not in str(failure.value)
 
 
 def test_workflow_event_cursor_rejects_cross_meeting_and_duplicate_values() -> None:

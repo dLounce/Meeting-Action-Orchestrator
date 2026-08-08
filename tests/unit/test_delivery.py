@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from threading import get_ident
 from types import TracebackType
+from typing import Literal
 from uuid import UUID
 
 import pytest
 
+import meeting_action_orchestrator.application.delivery as delivery_module
 from meeting_action_orchestrator.application.delivery import (
     ApprovedOutboxExecutor,
     FullJitterRetryScheduler,
@@ -25,8 +28,10 @@ from meeting_action_orchestrator.domain.enums import (
 )
 from meeting_action_orchestrator.domain.models import (
     Approval,
+    CalendarEventProposal,
     ConnectorTarget,
     DateDeadline,
+    DateTimeDeadline,
     Meeting,
     RecapArtifact,
     TaskProposal,
@@ -165,6 +170,30 @@ def make_intent(
         version=attempt_count,
         created_at=NOW - timedelta(minutes=10),
         updated_at=updated_at,
+    )
+
+
+def make_event_intent(
+    value: int = 20,
+    *,
+    status: WriteStatus = WriteStatus.PENDING,
+    attempt_count: int = 0,
+) -> WriteIntent:
+    base = make_intent(value, status=status, attempt_count=attempt_count)
+    proposal = CalendarEventProposal(
+        source_action_id=uid(100 + value),
+        target=ConnectorTarget(connector_id="calendar", resource_id="primary"),
+        title=f"Release review {value}",
+        deadline=DateTimeDeadline(
+            at=NOW + timedelta(days=1),
+            timezone="UTC",
+            source_text="tomorrow at noon",
+            resolution=DeadlineResolution.EXPLICIT,
+        ),
+        duration_minutes=30,
+    )
+    return WriteIntent.model_validate(
+        base.model_dump(mode="python") | {"proposal": proposal, "payload_digest": ""}
     )
 
 
@@ -475,7 +504,7 @@ class FakeUnitOfWork:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         self.database.transaction_depth -= 1
         return False
 
@@ -489,7 +518,7 @@ class FakeGateway:
         database: FakeDatabase,
         *,
         writes: Sequence[WriteReceipt | Exception] = (),
-        lookups: Sequence[WriteReceipt | None | Exception] = (),
+        lookups: Sequence[WriteReceipt | Exception | None] = (),
     ) -> None:
         self.database = database
         self.writes = list(writes)
@@ -1080,3 +1109,235 @@ def test_full_jitter_scheduler_uses_exponential_ceiling_and_positive_delay() -> 
 
     assert scheduler.next_attempt_at(NOW, 4) == NOW + timedelta(seconds=5)
     assert zero_scheduler.next_attempt_at(NOW, 1) > NOW
+
+
+def test_full_jitter_scheduler_rejects_invalid_configuration_and_inputs() -> None:
+    with pytest.raises(ValueError, match="base_delay"):
+        FullJitterRetryScheduler(base_delay=timedelta(0))
+    with pytest.raises(ValueError, match="maximum_delay"):
+        FullJitterRetryScheduler(
+            base_delay=timedelta(seconds=2),
+            maximum_delay=timedelta(seconds=1),
+        )
+    scheduler = FullJitterRetryScheduler(
+        base_delay=timedelta(seconds=2),
+        maximum_delay=timedelta(seconds=4),
+        random_value=lambda: 1.0,
+    )
+    with pytest.raises(ValueError, match="UTC offset"):
+        scheduler.next_attempt_at(NOW.replace(tzinfo=None), 1)
+    with pytest.raises(ValueError, match="attempt_count"):
+        scheduler.next_attempt_at(NOW, 0)
+    for sample in (-0.1, 1.1):
+        invalid = FullJitterRetryScheduler(random_value=partial(float, sample))
+        with pytest.raises(ValueError, match="between zero and one"):
+            invalid.next_attempt_at(NOW, 1)
+    assert scheduler.next_attempt_at(NOW, 100) == NOW + timedelta(seconds=4)
+
+
+def test_outbox_executor_rejects_invalid_worker_and_retry_configuration() -> None:
+    database = FakeDatabase()
+    gateway = FakeGateway(database)
+
+    def build(
+        *,
+        worker_id: str = "worker-one",
+        lease_duration: timedelta = timedelta(minutes=2),
+        reconciliation_lease_duration: timedelta = timedelta(minutes=2),
+        max_attempts: int = 5,
+    ) -> ApprovedOutboxExecutor:
+        return ApprovedOutboxExecutor(
+            unit_of_work=database.unit_of_work,
+            gateway=gateway,
+            clock=MutableClock(),
+            retry_scheduler=FixedScheduler(),
+            worker_id=worker_id,
+            lease_duration=lease_duration,
+            reconciliation_lease_duration=reconciliation_lease_duration,
+            max_attempts=max_attempts,
+        )
+
+    for worker_id in ("", " worker ", "x" * 201):
+        with pytest.raises(ValueError, match="worker_id"):
+            build(worker_id=worker_id)
+    with pytest.raises(ValueError, match="lease_duration"):
+        build(lease_duration=timedelta(0))
+    with pytest.raises(ValueError, match="reconciliation_lease_duration"):
+        build(reconciliation_lease_duration=timedelta(0))
+    for max_attempts in (0, 6):
+        with pytest.raises(ValueError, match="max_attempts"):
+            build(max_attempts=max_attempts)
+
+
+@pytest.mark.asyncio
+async def test_outbox_executor_handles_empty_batch_and_rejects_naive_clock() -> None:
+    database = FakeDatabase()
+    service = executor(database, FakeGateway(database))
+
+    assert await service.run_once(0) == delivery_module.DeliveryBatch(recovered=(), results=())
+    naive = executor(
+        database,
+        FakeGateway(database),
+        clock=MutableClock(NOW.replace(tzinfo=None)),
+    )
+    with pytest.raises(ValueError, match="aware datetime"):
+        await naive.run_once(1)
+
+
+@pytest.mark.asyncio
+async def test_calendar_delivery_and_reconciliation_use_event_operations() -> None:
+    pending = make_event_intent()
+    database = FakeDatabase(pending)
+    gateway = FakeGateway(database, writes=(make_receipt(pending),))
+
+    delivered = await executor(database, gateway).run_once(1)
+
+    assert delivered.results[0].status is WriteStatus.SUCCEEDED
+    assert gateway.calls == ["ensure_event"]
+
+    unknown = make_event_intent(21, status=WriteStatus.UNKNOWN, attempt_count=1)
+    reconcile_database = FakeDatabase(unknown)
+    reconcile_gateway = FakeGateway(
+        reconcile_database,
+        lookups=(make_receipt(unknown, reconciled=True),),
+    )
+
+    reconciled = await executor(reconcile_database, reconcile_gateway).run_once(1)
+
+    assert reconciled.results[0].status is WriteStatus.SUCCEEDED
+    assert reconcile_gateway.calls == ["find_event"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("during_reconciliation", [False, True])
+async def test_unexpected_gateway_failure_is_persisted_as_unknown_outcome(
+    during_reconciliation: bool,
+) -> None:
+    status = WriteStatus.UNKNOWN if during_reconciliation else WriteStatus.PENDING
+    intent = make_intent(status=status, attempt_count=int(during_reconciliation))
+    database = FakeDatabase(intent)
+    gateway = FakeGateway(
+        database,
+        writes=(() if during_reconciliation else (RuntimeError("private detail"),)),
+        lookups=((RuntimeError("private detail"),) if during_reconciliation else ()),
+    )
+
+    await executor(database, gateway).run_once(1)
+
+    persisted = database.intents[intent.id]
+    assert persisted.status is WriteStatus.UNKNOWN
+    assert persisted.last_failure is not None
+    assert persisted.last_failure.disposition is FailureDisposition.UNKNOWN_OUTCOME
+    assert "private detail" not in persisted.last_failure.safe_message
+    if during_reconciliation:
+        assert persisted.reconcile_attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_reconciliation_of_non_unknown_intent_returns_snapshot() -> None:
+    pending = make_intent()
+    database = FakeDatabase(pending)
+
+    result = await executor(database, FakeGateway(database)).reconcile_intent(pending.id)
+
+    assert result.status is WriteStatus.PENDING
+    assert result.replayed is False
+
+
+@pytest.mark.asyncio
+async def test_confirmed_absence_exhausts_the_lifetime_attempt_budget() -> None:
+    unknown = make_intent(status=WriteStatus.UNKNOWN, attempt_count=5)
+    database = FakeDatabase(unknown)
+
+    result = await executor(database, FakeGateway(database, lookups=(None,))).run_once(1)
+
+    assert result.results[0].status is WriteStatus.PERMANENT_FAILED
+    persisted = database.intents[unknown.id]
+    assert persisted.last_failure is not None
+    assert persisted.last_failure.disposition is FailureDisposition.PERMANENT
+    assert database.meetings[MEETING_ID].status is MeetingStatus.FILING_FAILED
+
+
+def test_delivery_publication_rejects_stale_snapshots_and_leases() -> None:
+    snapshot = make_intent(status=WriteStatus.IN_FLIGHT, attempt_count=1)
+    database = FakeDatabase(snapshot)
+    service = executor(database, FakeGateway(database))
+    changed = make_intent(status=WriteStatus.RETRY_WAIT, attempt_count=1)
+    database.intents[snapshot.id] = changed
+
+    stale_failure = service._record_failure(
+        snapshot,
+        FailureCode.PROVIDER_UNAVAILABLE,
+        FailureDisposition.RETRYABLE,
+        "The connector is temporarily unavailable",
+    )
+    assert stale_failure.status is WriteStatus.RETRY_WAIT
+
+    unknown = make_intent(11, status=WriteStatus.UNKNOWN, attempt_count=1)
+    database.intents[unknown.id] = unknown
+    claim = service._claim_unknown(unknown.id, True)
+    assert claim is not None
+    claimed = database.intents[unknown.id]
+    assert service._record_confirmed_absence(claimed, "wrong-owner").status is WriteStatus.UNKNOWN
+    assert service._refresh_unknown(claimed, "wrong-owner").status is WriteStatus.UNKNOWN
+    stale_success = service._record_success(
+        claimed,
+        make_receipt(claimed, reconciled=True),
+        reconciliation_owner="wrong-owner",
+    )
+    assert stale_success.status is WriteStatus.UNKNOWN
+
+
+def test_delivery_success_rejects_changed_binding_and_ineligible_state() -> None:
+    snapshot = make_intent(status=WriteStatus.IN_FLIGHT, attempt_count=1)
+    database = FakeDatabase(snapshot)
+    service = executor(database, FakeGateway(database))
+    changed_proposal = snapshot.proposal.model_copy(update={"title": "Changed title"})
+    changed = WriteIntent.model_validate(
+        snapshot.model_dump(mode="python") | {"proposal": changed_proposal, "payload_digest": ""}
+    )
+    database.intents[snapshot.id] = changed
+
+    assert service._record_success(snapshot, make_receipt(snapshot)).status is WriteStatus.IN_FLIGHT
+
+    retrying = make_intent(status=WriteStatus.RETRY_WAIT, attempt_count=1)
+    database.intents[snapshot.id] = retrying
+    assert (
+        service._record_success(snapshot, make_receipt(snapshot)).status is WriteStatus.RETRY_WAIT
+    )
+
+
+@pytest.mark.asyncio
+async def test_succeeded_intent_with_receipt_is_an_exact_replay() -> None:
+    succeeded = make_intent(status=WriteStatus.SUCCEEDED, attempt_count=1)
+    database = FakeDatabase(succeeded)
+    database.receipts[succeeded.id] = make_receipt(succeeded)
+
+    result = await executor(database, FakeGateway(database)).deliver_intent(succeeded.id)
+
+    assert result.status is WriteStatus.SUCCEEDED
+    assert result.replayed is True
+
+
+@pytest.mark.asyncio
+async def test_delivery_fails_closed_when_required_records_are_missing() -> None:
+    claimed = make_intent(status=WriteStatus.IN_FLIGHT, attempt_count=1)
+    database = FakeDatabase(claimed)
+    service = executor(database, FakeGateway(database))
+
+    del database.approvals[APPROVAL_ID]
+    assert (await service.deliver_intent(claimed.id)).status is WriteStatus.IN_FLIGHT
+    database.approvals[APPROVAL_ID] = make_approval()
+    del database.meetings[MEETING_ID]
+    assert (await service.deliver_intent(claimed.id)).status is WriteStatus.IN_FLIGHT
+    with pytest.raises(ValueError, match="Write intent was not found"):
+        await service.deliver_intent(uid(999))
+
+
+def test_safe_request_id_accepts_only_bounded_printable_identifiers() -> None:
+    assert delivery_module._safe_request_id("request-123") == "request-123"
+    assert delivery_module._safe_request_id(None) is None
+    assert delivery_module._safe_request_id("") is None
+    assert delivery_module._safe_request_id("x" * 201) is None
+    assert delivery_module._safe_request_id(" request ") is None
+    assert delivery_module._safe_request_id("request\n") is None

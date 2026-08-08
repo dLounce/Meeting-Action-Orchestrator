@@ -15,6 +15,7 @@ from meeting_action_orchestrator.api.contracts import (
     ProcessingResult,
     ReadinessCheck,
     ReadinessResult,
+    WorkflowEventPageResult,
 )
 from meeting_action_orchestrator.application.errors import (
     MeetingErasureBlockedError,
@@ -23,7 +24,7 @@ from meeting_action_orchestrator.application.errors import (
     StaleWorkflowVersionError,
 )
 from meeting_action_orchestrator.application.meeting_erasure import MeetingErasureResult
-from meeting_action_orchestrator.application.ports import MeetingListCursor
+from meeting_action_orchestrator.application.ports import MeetingListCursor, WorkflowEventCursor
 from meeting_action_orchestrator.application.processing_control import ProcessingControlResult
 from meeting_action_orchestrator.application.reviewing import ActionEdit, IssueResolutionEdit
 from meeting_action_orchestrator.application.workflow import (
@@ -320,6 +321,18 @@ class FakeQueries:
     async def get_delivery(self, meeting_id: UUID) -> DeliveryResult:
         assert meeting_id == MEETING_ID
         return self.delivery_result
+
+    async def list_workflow_events(
+        self,
+        meeting_id: UUID,
+        *,
+        cursor: WorkflowEventCursor | None,
+        limit: int,
+    ) -> WorkflowEventPageResult:
+        assert meeting_id == MEETING_ID
+        assert cursor is None
+        assert limit >= 1
+        return WorkflowEventPageResult(items=(), next_cursor=None)
 
 
 class MissingRecapQueries(FakeQueries):

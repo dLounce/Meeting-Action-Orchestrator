@@ -271,12 +271,12 @@ class DeliveryTransitionMetadata(SafeWorkflowEventMetadata):
             and self.failure_code is not None
             and self.failure_disposition is FailureDisposition.UNKNOWN_OUTCOME
         )
-        expected = {
+        valid_changes = {
             DeliveryChangeKind.CREATED: created,
             DeliveryChangeKind.STATUS_TRANSITION: transitioned,
             DeliveryChangeKind.RECONCILIATION_REFRESH: refreshed,
         }
-        if not expected[self.change_kind]:
+        if not valid_changes[self.change_kind]:
             raise ValueError("Workflow event delivery transition is invalid")
         if self.change_kind is not DeliveryChangeKind.CREATED and self.attempt_count == 0:
             raise ValueError("Workflow event delivery attempt count is invalid")
@@ -286,14 +286,17 @@ class DeliveryTransitionMetadata(SafeWorkflowEventMetadata):
             raise ValueError("Workflow event delivery reconciliation count is invalid")
         if (self.failure_code is None) != (self.failure_disposition is None):
             raise ValueError("Delivery audit failure metadata must be paired")
-        expected = {
+        expected_disposition = {
             WriteStatus.RETRY_WAIT: FailureDisposition.RETRYABLE,
             WriteStatus.UNKNOWN: FailureDisposition.UNKNOWN_OUTCOME,
             WriteStatus.PERMANENT_FAILED: FailureDisposition.PERMANENT,
         }.get(self.current_status)
-        if expected is None and self.failure_disposition is not None:
+        if expected_disposition is None and self.failure_disposition is not None:
             raise ValueError("Successful delivery audit transitions cannot carry failures")
-        if expected is not None and self.failure_disposition is not expected:
+        if (
+            expected_disposition is not None
+            and self.failure_disposition is not expected_disposition
+        ):
             raise ValueError("Delivery audit transition has an invalid failure disposition")
         return self
 
@@ -390,7 +393,7 @@ def workflow_write_intent_digest(write_intent_id: UUID) -> str:
 
 
 def workflow_retry_delay_ms(delta: timedelta) -> int:
-    if isinstance(delta, bool) or not isinstance(delta, timedelta):
+    if not isinstance(delta, timedelta):
         raise ValueError("Workflow retry delay must be a finite bounded duration")
     seconds = delta.total_seconds()
     if not isfinite(seconds) or seconds < 0:

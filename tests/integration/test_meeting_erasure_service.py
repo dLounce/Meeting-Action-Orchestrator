@@ -612,7 +612,13 @@ def test_unknown_legacy_work_status_fails_closed(tmp_path: Path, table: str) -> 
     else:
         add_full_graph(database, value)
     statements = {
-        "processing_jobs": "UPDATE processing_jobs SET status = 'unrecognized'",
+        "processing_jobs": """
+            UPDATE processing_jobs
+            SET status = 'unrecognized',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                claim_token = NULL
+        """,
         "write_intents": "UPDATE write_intents SET status = 'unrecognized'",
     }
     with database.transaction(immediate=True) as connection:
@@ -653,6 +659,7 @@ def test_shared_audio_waiters_promote_when_the_last_owner_is_erased(tmp_path: Pa
 
     waiting = erasures._request(first.id, 0, "erase-first", "actor").job
     final = erasures._request(second.id, 0, "erase-second", "actor").job
+    assert final.cleanup_job_id is not None
 
     with SqliteUnitOfWork(database, immediate=False) as uow:
         promoted = uow.meeting_erasures.get(waiting.id)
@@ -752,8 +759,8 @@ def test_forged_cross_resource_binding_fails_closed(tmp_path: Path) -> None:
         tokens.meeting_token(target_id),
         job.id,
         MeetingErasureOperation.REQUEST,
-        0,
-        NOW,
+        expected_version=0,
+        created_at=NOW,
     )
     with SqliteUnitOfWork(database) as uow:
         uow.meeting_erasures.add(job)

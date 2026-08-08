@@ -14,7 +14,10 @@ from pathlib import Path
 from typing import BinaryIO, ClassVar, Protocol
 from uuid import uuid4
 
-from meeting_action_orchestrator.application.ports import AudioMetadata, StoredAudio
+from meeting_action_orchestrator.application import ports as _ports
+
+AudioMetadata = _ports.AudioMetadata
+StoredAudio = _ports.StoredAudio
 
 FINAL_RECORDING_KEY_PATTERN = re.compile(r"[0-9a-f]{32}\.(?:wav|mp3|m4a)")
 TEMPORARY_RECORDING_KEY_PATTERN = re.compile(r"\.[0-9a-f]{32}\.part")

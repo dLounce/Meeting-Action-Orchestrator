@@ -29,6 +29,7 @@ from meeting_action_orchestrator.domain import (
     approve_review,
     create_recap_artifact,
     project_write_intents,
+    validate_review_evidence,
     validate_write_receipt,
 )
 
@@ -299,3 +300,180 @@ def test_receipt_must_match_intent_idempotency_binding() -> None:
     conflicting = receipt.model_copy(update={"payload_digest": "f" * 64})
     with pytest.raises(IdempotencyConflictError):
         validate_write_receipt(intent, conflicting)
+
+
+def test_review_evidence_rejects_cross_record_and_unknown_segment_references() -> None:
+    review = make_review()
+    transcript = make_transcript()
+
+    with pytest.raises(DomainInvariantError, match="review and transcript do not match"):
+        validate_review_evidence(
+            review.model_copy(update={"meeting_id": uid(999)}),
+            transcript,
+        )
+
+    action = review.action_items[0].model_copy(
+        update={"evidence": (EvidenceRef(segment_ids=(uid(999),), quote="launch brief"),)}
+    )
+    with pytest.raises(DomainInvariantError, match="unknown segment"):
+        validate_review_evidence(
+            review.model_copy(update={"action_items": (action,)}),
+            transcript,
+        )
+
+
+def test_approval_requires_an_approvable_meeting_and_current_transcript() -> None:
+    review = make_review()
+    transcript = make_transcript()
+
+    with pytest.raises(DomainInvariantError, match="not awaiting approval"):
+        approve_review(
+            approval_id=uid(40),
+            meeting=make_meeting().model_copy(update={"status": MeetingStatus.TRANSCRIBED}),
+            review=review,
+            transcript=transcript,
+            request_key="approval-request-1",
+            actor_id="shubham",
+            approved_at=NOW,
+        )
+
+    with pytest.raises(DomainInvariantError, match="current transcript"):
+        approve_review(
+            approval_id=uid(40),
+            meeting=make_meeting().model_copy(update={"current_transcript_id": uid(999)}),
+            review=review,
+            transcript=transcript,
+            request_key="approval-request-1",
+            actor_id="shubham",
+            approved_at=NOW,
+        )
+
+
+def test_recap_rejects_approval_identity_and_digest_mismatches() -> None:
+    meeting = make_meeting()
+    review = make_review()
+    approval = approve_review(
+        approval_id=uid(40),
+        meeting=meeting,
+        review=review,
+        transcript=make_transcript(),
+        request_key="approval-request-1",
+        actor_id="shubham",
+        approved_at=NOW,
+    )
+
+    with pytest.raises(DomainInvariantError, match="approval does not match"):
+        create_recap_artifact(
+            artifact_id=uid(41),
+            meeting=meeting,
+            review=review,
+            approval=approval.model_copy(update={"meeting_id": uid(999)}),
+            created_at=NOW,
+        )
+    with pytest.raises(DomainInvariantError, match="approval does not match"):
+        create_recap_artifact(
+            artifact_id=uid(41),
+            meeting=meeting,
+            review=review,
+            approval=approval.model_copy(update={"review_digest": "f" * 64}),
+            created_at=NOW,
+        )
+
+
+def test_projection_fails_closed_on_incomplete_persisted_delivery_bindings() -> None:
+    meeting = make_meeting()
+    review = make_review()
+    approval = approve_review(
+        approval_id=uid(40),
+        meeting=meeting,
+        review=review,
+        transcript=make_transcript(),
+        request_key="approval-request-1",
+        actor_id="shubham",
+        approved_at=NOW,
+    )
+    directive = review.directives[0]
+
+    with pytest.raises(DomainInvariantError, match="approval does not match"):
+        project_write_intents(
+            meeting=meeting,
+            review=review,
+            approval=approval.model_copy(update={"review_revision_id": uid(999)}),
+            created_at=NOW,
+        )
+
+    missing_task_target = review.model_copy(
+        update={"directives": (directive.model_copy(update={"task_target": None}),)}
+    )
+    with pytest.raises(DomainInvariantError, match="task target is missing"):
+        project_write_intents(
+            meeting=meeting,
+            review=missing_task_target,
+            approval=approval,
+            created_at=NOW,
+        )
+
+    missing_calendar_target = review.model_copy(
+        update={
+            "directives": (
+                directive.model_copy(
+                    update={
+                        "create_task": False,
+                        "task_target": None,
+                        "calendar_target": None,
+                    }
+                ),
+            )
+        }
+    )
+    with pytest.raises(DomainInvariantError, match="calendar details are incomplete"):
+        project_write_intents(
+            meeting=meeting,
+            review=missing_calendar_target,
+            approval=approval,
+            created_at=NOW,
+        )
+
+    action_without_description = review.action_items[0].model_copy(update={"description": None})
+    fallback_review = review.model_copy(update={"action_items": (action_without_description,)})
+    fallback = project_write_intents(
+        meeting=meeting,
+        review=fallback_review,
+        approval=approval,
+        created_at=NOW,
+    )
+    assert all(
+        intent.proposal.description == f"Follow-up from {meeting.title}" for intent in fallback
+    )
+
+
+def test_receipt_rejects_another_intent_identity_before_payload_validation() -> None:
+    meeting = make_meeting()
+    review = make_review()
+    approval = approve_review(
+        approval_id=uid(40),
+        meeting=meeting,
+        review=review,
+        transcript=make_transcript(),
+        request_key="approval-request-1",
+        actor_id="shubham",
+        approved_at=NOW,
+    )
+    intent = project_write_intents(
+        meeting=meeting,
+        review=review,
+        approval=approval,
+        created_at=NOW,
+    )[0]
+    receipt = WriteReceipt(
+        id=uid(70),
+        intent_id=uid(999),
+        idempotency_key=intent.idempotency_key,
+        payload_digest=intent.payload_digest,
+        provider="mcp",
+        external_id="task-1",
+        recorded_at=NOW,
+    )
+
+    with pytest.raises(DomainInvariantError, match="does not reference its intent"):
+        validate_write_receipt(intent, receipt)

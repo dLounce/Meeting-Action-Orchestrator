@@ -15,6 +15,7 @@ from meeting_action_orchestrator.domain import (
     DeliveryOperationBinding,
     DeliveryOperationKind,
     DeliveryOperationStatus,
+    DomainInvariantError,
     FailureCode,
     FailureDisposition,
     InvalidMeetingTransitionError,
@@ -351,3 +352,63 @@ def test_filing_status_is_derived_from_intents(
     )
 
     assert derive_filing_status(intents, recap_ready=True) is expected
+
+
+def test_transitions_reject_timestamps_before_the_current_version() -> None:
+    with pytest.raises(DomainInvariantError, match="precedes last update"):
+        transition_meeting(
+            make_meeting(MeetingStatus.INGESTED),
+            MeetingStatus.TRANSCRIBING,
+            NOW - timedelta(microseconds=1),
+        )
+
+    with pytest.raises(DomainInvariantError, match="precedes last update"):
+        transition_write_intent(
+            make_intent(),
+            WriteStatus.IN_FLIGHT,
+            NOW - timedelta(microseconds=1),
+            lease_owner="worker-1",
+            lease_expires_at=NOW + timedelta(minutes=1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("target", "provided_failure", "message"),
+    [
+        (WriteStatus.RETRY_WAIT, None, "retry requires a retryable failure"),
+        (
+            WriteStatus.UNKNOWN,
+            failure(FailureDisposition.RETRYABLE),
+            "unknown state requires unknown outcome",
+        ),
+        (
+            WriteStatus.PERMANENT_FAILED,
+            failure(FailureDisposition.RETRYABLE),
+            "failure must be permanent",
+        ),
+    ],
+)
+def test_failed_write_transitions_require_the_matching_disposition(
+    target: WriteStatus,
+    provided_failure: WorkflowFailure | None,
+    message: str,
+) -> None:
+    with pytest.raises(DomainInvariantError, match=message):
+        transition_write_intent(
+            make_intent(WriteStatus.IN_FLIGHT),
+            target,
+            NOW + timedelta(seconds=1),
+            failure=provided_failure,
+        )
+
+
+def test_write_claim_and_filing_require_runtime_prerequisites() -> None:
+    with pytest.raises(DomainInvariantError, match="requires a lease"):
+        transition_write_intent(
+            make_intent(),
+            WriteStatus.IN_FLIGHT,
+            NOW + timedelta(seconds=1),
+        )
+
+    with pytest.raises(DomainInvariantError, match="approved recap is missing"):
+        derive_filing_status((), recap_ready=False)

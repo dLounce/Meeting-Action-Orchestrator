@@ -5,6 +5,7 @@ from collections.abc import Sequence
 from datetime import date, datetime, timedelta, timezone
 from threading import get_ident
 from types import TracebackType
+from typing import Literal
 from uuid import UUID
 
 import pytest
@@ -418,7 +419,7 @@ class UnitOfWork:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         self.database.depth -= 1
         return False
 
@@ -461,6 +462,18 @@ class CrashingReconciler(Reconciler):
         self.calls.append(intent_id)
         self.actor_ids.append(actor_id)
         raise RuntimeError("connector stopped")
+
+
+class CancellingReconciler(Reconciler):
+    async def reconcile_intent(
+        self,
+        intent_id: UUID,
+        actor_id: str | None = None,
+    ) -> object:
+        assert self.database.depth == 0
+        self.calls.append(intent_id)
+        self.actor_ids.append(actor_id)
+        raise asyncio.CancelledError
 
 
 class BlockingReconciler(Reconciler):
@@ -1002,3 +1015,253 @@ async def test_request_key_is_global_across_meetings() -> None:
 
     assert reconciler.calls == [first.id]
     assert database.intents[second.id] == second
+
+
+def test_delivery_control_validates_operation_configuration() -> None:
+    database = Database()
+
+    def build(
+        *,
+        operation_lease_duration: timedelta = timedelta(minutes=2),
+        max_attempts: int = 5,
+    ) -> DeliveryControlService:
+        return DeliveryControlService(
+            unit_of_work=database.unit_of_work,
+            reconciler=Reconciler(database),
+            clock=Clock(),
+            retry_scheduler=Scheduler(),
+            operation_lease_duration=operation_lease_duration,
+            max_attempts=max_attempts,
+        )
+
+    with pytest.raises(ValueError, match="operation_lease_duration"):
+        build(operation_lease_duration=timedelta(0))
+    for max_attempts in (0, 6):
+        with pytest.raises(ValueError, match="max_attempts"):
+            build(max_attempts=max_attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["meeting", "approval"])
+async def test_delivery_control_requires_persisted_meeting_and_approval(missing: str) -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    database = Database(unknown)
+    if missing == "meeting":
+        database.meetings.clear()
+    else:
+        database.approvals.clear()
+    control, _, _ = service(database)
+
+    with pytest.raises(ResourceNotFoundError, match=missing.title()):
+        await control.reconcile(
+            MEETING_ID,
+            intent_ids=(unknown.id,),
+            request_key=f"missing-{missing}",
+            actor_id="owner",
+        )
+
+
+@pytest.mark.asyncio
+async def test_retry_releases_operation_after_unexpected_reconciler_failure() -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    database = Database(unknown)
+    control, _, _ = service(database, CrashingReconciler(database))
+
+    with pytest.raises(RuntimeError, match="connector stopped"):
+        await control.retry(
+            MEETING_ID,
+            intent_ids=(unknown.id,),
+            request_key="retry-crash",
+            actor_id="owner",
+        )
+
+    binding = database.bindings["retry-crash"]
+    assert binding.status is DeliveryOperationStatus.PENDING
+    assert binding.lease_owner is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation", [DeliveryOperationKind.RETRY, DeliveryOperationKind.RECONCILE]
+)
+async def test_cancellation_preserves_the_live_operation_lease(
+    operation: DeliveryOperationKind,
+) -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    database = Database(unknown)
+    control, reconciler, _ = service(database, CancellingReconciler(database))
+
+    with pytest.raises(asyncio.CancelledError):
+        if operation is DeliveryOperationKind.RETRY:
+            await control.retry(
+                MEETING_ID,
+                intent_ids=(unknown.id,),
+                request_key="cancelled-retry",
+                actor_id="owner",
+            )
+        else:
+            await control.reconcile(
+                MEETING_ID,
+                intent_ids=(unknown.id,),
+                request_key="cancelled-reconcile",
+                actor_id="owner",
+            )
+
+    assert reconciler.calls == [unknown.id]
+    binding = next(iter(database.bindings.values()))
+    assert binding.status is DeliveryOperationStatus.RUNNING
+    assert binding.lease_owner is not None
+
+
+def test_queue_retry_validates_current_state_and_approval_binding() -> None:
+    failed = make_intent(10, WriteStatus.PERMANENT_FAILED, attempt_count=2)
+    database = Database(failed)
+    control, _, scheduler = service(database)
+
+    database.intents.clear()
+    with pytest.raises(ResourceNotFoundError, match="Delivery state"):
+        control._queue_retry(MEETING_ID, APPROVAL_ID, failed.id, "owner")
+    database.intents[failed.id] = failed
+    with pytest.raises(OperationConflictError, match="approved delivery set changed"):
+        control._queue_retry(MEETING_ID, uid(999), failed.id, "owner")
+
+    pending = make_intent(11, WriteStatus.PENDING, attempt_count=0)
+    database.intents[pending.id] = pending
+    control._queue_retry(MEETING_ID, APPROVAL_ID, pending.id, "owner")
+    assert database.intents[pending.id] == pending
+    assert not scheduler.attempts
+
+
+def test_queue_retry_from_filing_does_not_emit_a_redundant_meeting_transition() -> None:
+    failed = make_intent(10, WriteStatus.PERMANENT_FAILED, attempt_count=2)
+    database = Database(failed, meeting=make_meeting(MeetingStatus.FILING))
+    control, _, _ = service(database)
+
+    control._queue_retry(MEETING_ID, APPROVAL_ID, failed.id, "owner")
+
+    assert database.intents[failed.id].status is WriteStatus.RETRY_WAIT
+    assert database.meetings[MEETING_ID].status is MeetingStatus.FILING
+    assert not meeting_events(database)
+
+
+def test_prepare_reconciliation_validates_and_classifies_current_state() -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    pending = make_intent(11, WriteStatus.PENDING, attempt_count=0)
+    database = Database(unknown, pending)
+    control, _, _ = service(database)
+
+    assert control._prepare_reconciliation(MEETING_ID, APPROVAL_ID, unknown.id, "owner")
+    assert not control._prepare_reconciliation(MEETING_ID, APPROVAL_ID, pending.id, "owner")
+    with pytest.raises(OperationConflictError, match="approved delivery set changed"):
+        control._prepare_reconciliation(MEETING_ID, uid(999), unknown.id, "owner")
+    database.intents.pop(pending.id)
+    with pytest.raises(ResourceNotFoundError, match="Delivery state"):
+        control._prepare_reconciliation(MEETING_ID, APPROVAL_ID, pending.id, "owner")
+
+
+def test_prepare_reconciliation_from_filing_keeps_meeting_state_stable() -> None:
+    ambiguous = make_intent(10, WriteStatus.PERMANENT_FAILED, attempt_count=2).model_copy(
+        update={
+            "last_failure": make_failure(
+                FailureDisposition.PERMANENT,
+                FailureCode.UNKNOWN_REMOTE_OUTCOME,
+            )
+        }
+    )
+    database = Database(ambiguous, meeting=make_meeting(MeetingStatus.FILING))
+    control, _, _ = service(database)
+
+    assert control._prepare_reconciliation(MEETING_ID, APPROVAL_ID, ambiguous.id, "owner")
+    assert database.intents[ambiguous.id].status is WriteStatus.UNKNOWN
+    assert database.meetings[MEETING_ID].status is MeetingStatus.FILING
+    assert not meeting_events(database)
+
+
+def test_operation_publication_requires_current_owner_and_cas() -> None:
+    unknown = make_intent(10, WriteStatus.UNKNOWN)
+    database = Database(unknown)
+    clock = MutableClock()
+    control, _, _ = service(database, clock=clock)
+    selection = control._select_and_claim(
+        MEETING_ID,
+        (unknown.id,),
+        "lease-check",
+        "owner",
+        DeliveryOperationKind.RECONCILE,
+    )
+    binding = selection.binding
+    ownerless = DeliveryOperationBinding.model_validate(
+        binding.model_dump(mode="python")
+        | {
+            "status": DeliveryOperationStatus.PENDING,
+            "lease_owner": None,
+            "lease_expires_at": None,
+        }
+    )
+
+    with pytest.raises(OperationConflictError, match="no execution owner"):
+        control._complete_operation(ownerless)
+    with pytest.raises(OperationConflictError, match="no execution owner"):
+        control._renew_operation(ownerless)
+    control._release_operation(ownerless)
+
+    clock.current += timedelta(minutes=3)
+    with pytest.raises(OperationConflictError, match="lease is no longer current"):
+        control._renew_operation(binding)
+    with pytest.raises(OperationConflictError, match="lease is no longer current"):
+        control._complete_operation(binding)
+
+
+def test_delivery_control_snapshot_requires_current_meeting_and_approval() -> None:
+    database = Database()
+    control, _, _ = service(database)
+
+    database.meetings.clear()
+    with pytest.raises(ResourceNotFoundError, match="Meeting"):
+        control._snapshot(MEETING_ID, False)
+    database.meetings[MEETING_ID] = make_meeting()
+    database.approvals.clear()
+    with pytest.raises(ResourceNotFoundError, match="Approval"):
+        control._snapshot(MEETING_ID, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_key", "actor_id", "message"),
+    [
+        ("", "owner", "request_key"),
+        (" request ", "owner", "request_key"),
+        ("request", "", "actor_id"),
+        ("request", " owner ", "actor_id"),
+    ],
+)
+async def test_delivery_control_validates_operation_identity_before_io(
+    request_key: str,
+    actor_id: str,
+    message: str,
+) -> None:
+    database = Database()
+    control, _, _ = service(database)
+
+    with pytest.raises(ValueError, match=message):
+        await control.reconcile(
+            MEETING_ID,
+            intent_ids=(),
+            request_key=request_key,
+            actor_id=actor_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_delivery_control_rejects_naive_clock_before_claiming() -> None:
+    database = Database()
+    control, _, _ = service(database, clock=MutableClock(NOW.replace(tzinfo=None)))
+
+    with pytest.raises(ValueError, match="aware datetime"):
+        await control.reconcile(
+            MEETING_ID,
+            intent_ids=(),
+            request_key="naive-clock",
+            actor_id="owner",
+        )
+    assert not database.bindings

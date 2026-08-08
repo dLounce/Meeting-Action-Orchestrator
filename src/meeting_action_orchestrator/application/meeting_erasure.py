@@ -162,10 +162,10 @@ class MeetingErasureService:
                 uow,
                 meeting_id,
                 expected_version,
-                request_key,
-                actor_id,
-                meeting_tokens,
-                now,
+                request_key=request_key,
+                actor_id=actor_id,
+                meeting_tokens=meeting_tokens,
+                now=now,
             )
             if replay is not None:
                 return replay
@@ -175,9 +175,9 @@ class MeetingErasureService:
                 uow,
                 meeting_id,
                 expected_version,
-                request_key,
-                actor_id,
-                now,
+                request_key=request_key,
+                actor_id=actor_id,
+                now=now,
             )
             uow.commit()
         return MeetingErasureResult(job=job)
@@ -187,6 +187,7 @@ class MeetingErasureService:
         uow: UnitOfWork,
         meeting_id: UUID,
         expected_version: int,
+        *,
         request_key: str,
         actor_id: str,
         meeting_tokens: Sequence[ErasureToken],
@@ -221,6 +222,7 @@ class MeetingErasureService:
         uow: UnitOfWork,
         meeting_id: UUID,
         expected_version: int,
+        *,
         request_key: str,
         actor_id: str,
         now: datetime,
@@ -252,9 +254,9 @@ class MeetingErasureService:
             meeting_token,
             meeting.version,
             audio.id,
-            cleanup,
-            self._max_remediations,
-            now,
+            cleanup=cleanup,
+            max_remediations=self._max_remediations,
+            now=now,
         )
         tombstone = MeetingErasureTombstone.create(
             job.id,
@@ -423,6 +425,7 @@ def _new_erasure_job(
     meeting_token: ErasureToken,
     erased_meeting_version: int,
     audio_asset_id: UUID,
+    *,
     cleanup: RecordingCleanupJob | None,
     max_remediations: int,
     now: datetime,
@@ -559,8 +562,8 @@ def _create_operation_binding(
         resource_token,
         erasure_job_id,
         operation,
-        expected_version,
-        created_at,
+        expected_version=expected_version,
+        created_at=created_at,
     )
 
 

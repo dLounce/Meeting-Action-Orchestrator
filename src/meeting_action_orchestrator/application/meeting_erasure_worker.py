@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Protocol
+from typing import Protocol, TypeGuard
 from uuid import UUID
 
 from meeting_action_orchestrator.application.erasure_support import (
@@ -253,7 +253,7 @@ class MeetingErasureWorker:
         self,
         job: MeetingErasureJob | None,
         now: datetime,
-    ) -> bool:
+    ) -> TypeGuard[MeetingErasureJob]:
         return (
             job is not None
             and job.status is MeetingErasureStatus.ACTIVE

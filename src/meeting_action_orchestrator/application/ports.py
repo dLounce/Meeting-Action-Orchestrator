@@ -99,21 +99,43 @@ class WalCheckpointResult:
 
 
 class TranscriptionSegmentLike(Protocol):
-    id: str
-    start_ms: int
-    end_ms: int | None
-    speaker: str | None
-    text: str
+    @property
+    def id(self) -> str: ...
+
+    @property
+    def start_ms(self) -> int: ...
+
+    @property
+    def end_ms(self) -> int | None: ...
+
+    @property
+    def speaker(self) -> str | None: ...
+
+    @property
+    def text(self) -> str: ...
 
 
 class TranscriptionOutputLike(Protocol):
-    model: str
-    provider_request_id: str | None
-    language: str | None
-    text: str
-    duration_seconds: float | None
-    segments: tuple[TranscriptionSegmentLike, ...]
-    usage: ProviderUsage | None
+    @property
+    def model(self) -> str: ...
+
+    @property
+    def provider_request_id(self) -> str | None: ...
+
+    @property
+    def language(self) -> str | None: ...
+
+    @property
+    def text(self) -> str: ...
+
+    @property
+    def duration_seconds(self) -> float | None: ...
+
+    @property
+    def segments(self) -> tuple[TranscriptionSegmentLike, ...]: ...
+
+    @property
+    def usage(self) -> ProviderUsage | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,28 +668,71 @@ class WorkflowEventRepository(Protocol):
 
 
 class UnitOfWork(Protocol):
-    meetings: MeetingRepository
-    ingest_requests: IngestRequestBindingRepository
-    audio_assets: AudioAssetRepository
-    recording_cleanups: RecordingCleanupRepository
-    erasure_key_verifiers: ErasureKeyVerifierRepository
-    meeting_erasures: MeetingErasureRepository
-    meeting_erasure_operations: MeetingErasureOperationRepository
-    meeting_erasure_tombstones: MeetingErasureTombstoneRepository
-    meeting_erasure_purge: MeetingErasurePurgeRepository
-    transcripts: TranscriptRepository
-    reviews: ReviewRepository
-    approvals: ApprovalRepository
-    recaps: RecapRepository
-    delivery_operations: DeliveryOperationRepository
-    meeting_operations: MeetingOperationRepository
-    processing_jobs: ProcessingJobRepository
-    provider_budget_accounts: ProviderBudgetAccountRepository
-    provider_budget_reservations: ProviderBudgetReservationRepository
-    provider_budget_settlements: ProviderBudgetSettlementRepository
-    write_intents: WriteIntentRepository
-    write_receipts: WriteReceiptRepository
-    workflow_events: WorkflowEventRepository
+    @property
+    def meetings(self) -> MeetingRepository: ...
+
+    @property
+    def ingest_requests(self) -> IngestRequestBindingRepository: ...
+
+    @property
+    def audio_assets(self) -> AudioAssetRepository: ...
+
+    @property
+    def recording_cleanups(self) -> RecordingCleanupRepository: ...
+
+    @property
+    def erasure_key_verifiers(self) -> ErasureKeyVerifierRepository: ...
+
+    @property
+    def meeting_erasures(self) -> MeetingErasureRepository: ...
+
+    @property
+    def meeting_erasure_operations(self) -> MeetingErasureOperationRepository: ...
+
+    @property
+    def meeting_erasure_tombstones(self) -> MeetingErasureTombstoneRepository: ...
+
+    @property
+    def meeting_erasure_purge(self) -> MeetingErasurePurgeRepository: ...
+
+    @property
+    def transcripts(self) -> TranscriptRepository: ...
+
+    @property
+    def reviews(self) -> ReviewRepository: ...
+
+    @property
+    def approvals(self) -> ApprovalRepository: ...
+
+    @property
+    def recaps(self) -> RecapRepository: ...
+
+    @property
+    def delivery_operations(self) -> DeliveryOperationRepository: ...
+
+    @property
+    def meeting_operations(self) -> MeetingOperationRepository: ...
+
+    @property
+    def processing_jobs(self) -> ProcessingJobRepository: ...
+
+    @property
+    def provider_budget_accounts(self) -> ProviderBudgetAccountRepository: ...
+
+    @property
+    def provider_budget_reservations(self) -> ProviderBudgetReservationRepository: ...
+
+    @property
+    def provider_budget_settlements(self) -> ProviderBudgetSettlementRepository: ...
+
+    @property
+    def write_intents(self) -> WriteIntentRepository: ...
+
+    @property
+    def write_receipts(self) -> WriteReceiptRepository: ...
+
+    @property
+    def workflow_events(self) -> WorkflowEventRepository: ...
 
     def __enter__(self) -> UnitOfWork: ...
 

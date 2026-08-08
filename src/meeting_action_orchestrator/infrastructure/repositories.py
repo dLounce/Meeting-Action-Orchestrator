@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from types import TracebackType
+from typing import Literal
 from uuid import UUID, uuid4
 
 from meeting_action_orchestrator.application.errors import PersistenceIntegrityError
@@ -2116,7 +2117,7 @@ class SqliteProviderBudgetReservationRepository:
             "SELECT * FROM provider_budget_reservations WHERE id = ?",
             (str(reservation_id),),
         ).fetchone()
-        return self._from_row(row)
+        return self._from_row(row) if row is not None else None
 
     def find_by_dispatch_digest(
         self,
@@ -2126,7 +2127,7 @@ class SqliteProviderBudgetReservationRepository:
             "SELECT * FROM provider_budget_reservations WHERE dispatch_digest = ?",
             (dispatch_digest,),
         ).fetchone()
-        return self._from_row(row)
+        return self._from_row(row) if row is not None else None
 
     def next_sequence(self, processing_job_id: UUID) -> int:
         row = self._connection.execute(
@@ -2149,7 +2150,7 @@ class SqliteProviderBudgetReservationRepository:
             """,
             (str(processing_job_id),),
         ).fetchall()
-        return tuple(self._from_row(row) for row in rows if row is not None)
+        return tuple(self._from_row(row) for row in rows)
 
     def usage_for_job(self, processing_job_id: UUID) -> ProviderBudgetUsage:
         row = self._connection.execute(
@@ -2205,9 +2206,7 @@ class SqliteProviderBudgetReservationRepository:
         return usage
 
     @staticmethod
-    def _from_row(row: sqlite3.Row | None) -> ProviderBudgetReservation | None:
-        if row is None:
-            return None
+    def _from_row(row: sqlite3.Row) -> ProviderBudgetReservation:
         invalid = False
         try:
             reservation = ProviderBudgetReservation.model_validate(dict(row))
@@ -2707,7 +2706,7 @@ class SqliteUnitOfWork:
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: TracebackType | None,
-    ) -> bool:
+    ) -> Literal[False]:
         if self._connection is None:
             return False
         try:

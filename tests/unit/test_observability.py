@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
-from meeting_action_orchestrator.observability import REDACTED, JsonFormatter, sanitize
+from meeting_action_orchestrator.observability import (
+    REDACTED,
+    JsonFormatter,
+    configure_logging,
+    sanitize,
+)
 
 
 def test_sanitize_redacts_nested_sensitive_values() -> None:
@@ -71,3 +77,58 @@ def test_json_formatter_does_not_interpolate_log_arguments() -> None:
 
     assert result["message"] == "provider failed: %s"
     assert "private transcript" not in json.dumps(result)
+
+
+def test_sanitize_normalizes_structured_safe_values() -> None:
+    occurred_at = datetime(2026, 8, 7, 15, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+
+    result = sanitize(
+        {
+            "items": ("ready", 3, None),
+            "occurred_at": occurred_at,
+            "description": "x" * 501,
+            "opaque": object(),
+        }
+    )
+
+    assert result["items"] == ["ready", 3, None]
+    assert result["occurred_at"] == "2026-08-07T10:00:00+00:00"
+    assert result["description"] == f"{'x' * 497}..."
+    assert result["opaque"].startswith("<object object at ")
+
+
+def test_json_formatter_reports_exception_type_without_exception_text() -> None:
+    exception = ValueError("private transcript")
+    record = logging.LogRecord(
+        "test",
+        logging.ERROR,
+        __file__,
+        1,
+        {"unsafe": "message"},
+        (),
+        (ValueError, exception, None),
+    )
+
+    result = json.loads(JsonFormatter().format(record))
+
+    assert result["message"] == "dict"
+    assert result["exception"] == "ValueError"
+    assert "private transcript" not in json.dumps(result)
+
+
+def test_configure_logging_replaces_root_handlers_and_normalizes_level() -> None:
+    root = logging.getLogger()
+    original_handlers = root.handlers[:]
+    original_level = root.level
+    stale_handler = logging.NullHandler()
+    root.handlers[:] = [stale_handler]
+    try:
+        configure_logging("warning")
+
+        assert len(root.handlers) == 1
+        assert root.handlers[0] is not stale_handler
+        assert isinstance(root.handlers[0].formatter, JsonFormatter)
+        assert root.level == logging.WARNING
+    finally:
+        root.handlers[:] = original_handlers
+        root.setLevel(original_level)

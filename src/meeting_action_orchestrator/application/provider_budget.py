@@ -114,12 +114,12 @@ class ProviderBudgetService:
                 context.claim_token,
                 dispatch_digest,
                 request.operation_digest,
-                request.operation,
-                request.role,
-                request.model,
-                request.reserved_input_tokens,
-                request.reserved_output_tokens,
-                request.reserved_audio_duration_ms,
+                operation=request.operation,
+                role=request.role,
+                model=request.model,
+                reserved_input_tokens=request.reserved_input_tokens,
+                reserved_output_tokens=request.reserved_output_tokens,
+                reserved_audio_duration_ms=request.reserved_audio_duration_ms,
             )
             existing = _budget_read(
                 lambda: uow.provider_budget_reservations.find_by_dispatch_digest(dispatch_digest)
@@ -168,12 +168,12 @@ class ProviderBudgetService:
             context.claim_token,
             dispatch_digest,
             request.operation_digest,
-            request.operation,
-            request.role,
-            request.model,
-            request.reserved_input_tokens,
-            request.reserved_output_tokens,
-            request.reserved_audio_duration_ms,
+            operation=request.operation,
+            role=request.role,
+            model=request.model,
+            reserved_input_tokens=request.reserved_input_tokens,
+            reserved_output_tokens=request.reserved_output_tokens,
+            reserved_audio_duration_ms=request.reserved_audio_duration_ms,
         )
         with self._unit_of_work() as uow:
             job = self._require_active_job(

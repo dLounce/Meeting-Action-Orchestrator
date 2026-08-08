@@ -41,13 +41,13 @@ def test_openai_timeout_fits_within_the_processing_lease() -> None:
     ],
 )
 def test_openai_model_names_are_normalized_and_bounded(field: str) -> None:
-    settings = Settings(_env_file=None, **{field: "  model-alias  "})
+    settings = Settings.model_validate({field: "  model-alias  "})
 
     assert getattr(settings, field) == "model-alias"
 
     for invalid in ("   ", "m" * 201):
         with pytest.raises(ValueError, match="OpenAI model names"):
-            Settings(_env_file=None, **{field: invalid})
+            Settings.model_validate({field: invalid})
 
 
 def test_delivery_targets_are_disabled_until_resources_are_configured() -> None:
@@ -76,7 +76,7 @@ def test_delivery_targets_are_disabled_until_resources_are_configured() -> None:
 )
 def test_recording_maintenance_settings_are_bounded(field: str, value: int) -> None:
     with pytest.raises(ValueError, match=field):
-        Settings(_env_file=None, **{field: value})
+        Settings.model_validate({field: value})
 
 
 def test_run_budget_must_cover_all_specialist_limits() -> None:
@@ -108,7 +108,7 @@ def test_durable_output_budget_must_cover_one_specialist_run() -> None:
 )
 def test_durable_provider_budget_settings_are_bounded(field: str, value: int) -> None:
     with pytest.raises(ValueError, match=field):
-        Settings(_env_file=None, **{field: value})
+        Settings.model_validate({field: value})
 
 
 def test_provider_tracing_cannot_bypass_budgeted_transport() -> None:

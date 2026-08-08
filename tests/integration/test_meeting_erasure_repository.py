@@ -6,6 +6,7 @@ from uuid import UUID
 
 import pytest
 
+from meeting_action_orchestrator.application.errors import PersistenceIntegrityError
 from meeting_action_orchestrator.domain.enums import (
     FailureCode,
     FailureDisposition,
@@ -33,7 +34,6 @@ from meeting_action_orchestrator.infrastructure.erasure_tokens import (
 )
 from meeting_action_orchestrator.infrastructure.repositories import (
     PersistenceConflictError,
-    PersistenceIntegrityError,
     SqliteUnitOfWork,
 )
 
@@ -162,8 +162,8 @@ def test_erasure_records_replay_after_maintenance_key_cutover(tmp_path: Path) ->
         meeting_token,
         job.id,
         MeetingErasureOperation.REQUEST,
-        job.erased_meeting_version,
-        NOW,
+        expected_version=job.erased_meeting_version,
+        created_at=NOW,
     )
     tombstone = MeetingErasureTombstone.create(job.id, meeting_token, ingest_token, NOW)
     with SqliteUnitOfWork(database) as uow:
@@ -215,8 +215,8 @@ def test_same_request_key_under_two_rotation_keys_fails_as_integrity_error(
                     scoped.meeting_token(UUID(int=number)),
                     job.id,
                     MeetingErasureOperation.REQUEST,
-                    job.erased_meeting_version,
-                    NOW,
+                    expected_version=job.erased_meeting_version,
+                    created_at=NOW,
                 )
             )
         uow.commit()

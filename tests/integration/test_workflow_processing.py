@@ -61,7 +61,9 @@ from meeting_action_orchestrator.domain.enums import (
 )
 from meeting_action_orchestrator.domain.models import (
     ConnectorTarget,
+    Meeting,
     ProcessingJob,
+    Transcript,
     WorkflowFailure,
 )
 from meeting_action_orchestrator.domain.workflow_events import (
@@ -912,8 +914,12 @@ async def test_ambiguous_artifact_commit_finishes_as_success(
     worker = create_worker(service, database, clock, "worker-a")
     complete = service._complete_transcription
 
-    def commit_then_raise(*arguments: object) -> object:
-        complete(*arguments)
+    def commit_then_raise(
+        target_meeting_id: UUID,
+        transcript: Transcript,
+        job: ProcessingJob,
+    ) -> Meeting:
+        complete(target_meeting_id, transcript, job)
         raise sqlite3.OperationalError("commit outcome unavailable")
 
     monkeypatch.setattr(service, "_complete_transcription", commit_then_raise)
@@ -942,8 +948,14 @@ async def test_persisted_failure_wins_when_failure_commit_reports_unknown(
     worker = create_worker(service, database, clock, "worker-a")
     fail_stage = service._fail_stage
 
-    def commit_then_raise(*arguments: object, **keywords: object) -> None:
-        fail_stage(*arguments, **keywords)
+    def commit_then_raise(
+        target_meeting_id: UUID,
+        target: MeetingStatus,
+        failure: WorkflowFailure,
+        *,
+        job: ProcessingJob,
+    ) -> None:
+        fail_stage(target_meeting_id, target, failure, job=job)
         raise sqlite3.OperationalError("commit outcome unavailable")
 
     monkeypatch.setattr(service, "_fail_stage", commit_then_raise)

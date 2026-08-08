@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from os import PathLike
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -639,16 +641,33 @@ def test_database_connect_closes_connection_when_pragma_verification_fails(
     connections: list[TrackingConnection] = []
     original_connect = sqlite3.connect
 
-    def connect(*args: object, **kwargs: object) -> TrackingConnection:
-        kwargs["factory"] = TrackingConnection
-        connection = original_connect(*args, **kwargs)
+    def connect(
+        database: str | bytes | PathLike[str] | PathLike[bytes],
+        *,
+        timeout: float = 5.0,
+        detect_types: int = 0,
+        isolation_level: Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None = None,
+        check_same_thread: bool = True,
+        cached_statements: int = 128,
+        uri: bool = False,
+    ) -> TrackingConnection:
+        connection = original_connect(
+            database,
+            timeout=timeout,
+            detect_types=detect_types,
+            isolation_level=isolation_level,
+            check_same_thread=check_same_thread,
+            factory=TrackingConnection,
+            cached_statements=cached_statements,
+            uri=uri,
+        )
         connections.append(connection)
         return connection
 
     def reject(_connection: sqlite3.Connection) -> None:
         raise RuntimeError("pragma mismatch")
 
-    monkeypatch.setattr(database_module.sqlite3, "connect", connect)
+    monkeypatch.setattr(sqlite3, "connect", connect)
     monkeypatch.setattr(database_module, "_verify_connection_pragmas", reject)
     database = Database(tmp_path / "application.sqlite3")
 

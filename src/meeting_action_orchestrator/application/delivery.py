@@ -147,12 +147,23 @@ class DeliveryReceiptRepository(Protocol):
 
 
 class DeliveryUnitOfWork(Protocol):
-    meetings: DeliveryMeetingRepository
-    approvals: DeliveryApprovalRepository
-    recaps: DeliveryRecapRepository
-    write_intents: DeliveryIntentRepository
-    write_receipts: DeliveryReceiptRepository
-    workflow_events: WorkflowEventSink
+    @property
+    def meetings(self) -> DeliveryMeetingRepository: ...
+
+    @property
+    def approvals(self) -> DeliveryApprovalRepository: ...
+
+    @property
+    def recaps(self) -> DeliveryRecapRepository: ...
+
+    @property
+    def write_intents(self) -> DeliveryIntentRepository: ...
+
+    @property
+    def write_receipts(self) -> DeliveryReceiptRepository: ...
+
+    @property
+    def workflow_events(self) -> WorkflowEventSink: ...
 
     def __enter__(self) -> DeliveryUnitOfWork: ...
 

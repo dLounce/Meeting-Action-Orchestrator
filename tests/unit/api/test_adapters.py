@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, cast
 from uuid import UUID
 
 import pytest
@@ -41,6 +41,8 @@ from meeting_action_orchestrator.domain.models import (
     RecapArtifact,
     ReviewRevision,
     Transcript,
+    WriteIntent,
+    WriteReceipt,
 )
 from tests.unit.api.test_app import (
     ACTION_ID,
@@ -52,6 +54,7 @@ from tests.unit.api.test_app import (
     recap,
     review,
     transcript,
+    unknown_write_intent,
 )
 
 NOW = datetime(2026, 8, 7, 10, 0, tzinfo=timezone.utc)
@@ -244,16 +247,19 @@ class ApprovalRepository:
 
 
 class IntentRepository:
-    def __init__(self, values: tuple[object, ...] = ()) -> None:
+    def __init__(self, values: tuple[WriteIntent, ...] = ()) -> None:
         self.values = values
 
-    def list_for_approval(self, _approval_id: UUID) -> tuple[object, ...]:
+    def list_for_approval(self, _approval_id: UUID) -> tuple[WriteIntent, ...]:
         return self.values
 
 
 class ReceiptRepository:
-    def for_intent(self, _intent_id: UUID) -> None:
-        return None
+    def __init__(self, values: dict[UUID, WriteReceipt] | None = None) -> None:
+        self.values = values or {}
+
+    def for_intent(self, intent_id: UUID) -> WriteReceipt | None:
+        return self.values.get(intent_id)
 
 
 class ProcessingRepository:
@@ -283,6 +289,8 @@ class QueryUnitOfWork:
         recap_artifact: RecapArtifact | None = None,
         processing_jobs: tuple[ProcessingJob, ...] = (),
         meeting_page: tuple[Meeting, ...] = (),
+        write_intents: tuple[WriteIntent, ...] = (),
+        write_receipts: dict[UUID, WriteReceipt] | None = None,
     ) -> None:
         self.meetings = ItemRepository(current_meeting, meeting_page)
         self.transcripts = ItemRepository(current_transcript)
@@ -290,13 +298,13 @@ class QueryUnitOfWork:
         self.approvals = ApprovalRepository(approval)
         self.recaps = RecapRepository(recap_artifact)
         self.processing_jobs = ProcessingRepository(processing_jobs)
-        self.write_intents = IntentRepository()
-        self.write_receipts = ReceiptRepository()
+        self.write_intents = IntentRepository(write_intents)
+        self.write_receipts = ReceiptRepository(write_receipts)
 
     def __enter__(self) -> QueryUnitOfWork:
         return self
 
-    def __exit__(self, *_args: object) -> bool:
+    def __exit__(self, *_args: object) -> Literal[False]:
         return False
 
 
@@ -462,6 +470,114 @@ async def test_query_facade_rejects_cross_meeting_records() -> None:
         await transcript_query.get_transcript(MEETING_ID)
     with pytest.raises(OperationConflictError, match="does not belong"):
         await delivery_query.get_delivery(MEETING_ID)
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+async def test_query_facade_rejects_unbounded_meeting_pages(limit: int) -> None:
+    uow = QueryUnitOfWork(meeting())
+    query = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: uow))
+
+    with pytest.raises(ValueError, match="between one and 100"):
+        await query.list_meetings(status=None, cursor=None, limit=limit)
+
+
+async def test_query_facade_rejects_missing_and_mismatched_current_records() -> None:
+    current = current_review_meeting()
+    no_pointer = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: QueryUnitOfWork(meeting())))
+    missing = UnitOfWorkQueryFacade(cast(UnitOfWorkFactory, lambda: QueryUnitOfWork(current)))
+    wrong_review = review().model_copy(update={"meeting_id": OTHER_MEETING_ID})
+    mismatched = UnitOfWorkQueryFacade(
+        cast(
+            UnitOfWorkFactory,
+            lambda: QueryUnitOfWork(current, current_review=wrong_review),
+        )
+    )
+
+    with pytest.raises(ResourceNotFoundError, match="Transcript"):
+        await no_pointer.get_transcript(MEETING_ID)
+    with pytest.raises(ResourceNotFoundError, match="Review"):
+        await no_pointer.get_review(MEETING_ID)
+    with pytest.raises(ResourceNotFoundError, match="Transcript"):
+        await missing.get_transcript(MEETING_ID)
+    with pytest.raises(ResourceNotFoundError, match="Review"):
+        await missing.get_review(MEETING_ID)
+    with pytest.raises(OperationConflictError, match="review does not belong"):
+        await mismatched.get_review(MEETING_ID)
+
+
+async def test_query_facade_rejects_missing_approval_and_cross_bound_delivery_records() -> None:
+    no_approval = UnitOfWorkQueryFacade(
+        cast(UnitOfWorkFactory, lambda: QueryUnitOfWork(approved_meeting()))
+    )
+    intent = unknown_write_intent()
+    wrong_intent = intent.model_copy(update={"meeting_id": OTHER_MEETING_ID})
+    intent_query = UnitOfWorkQueryFacade(
+        cast(
+            UnitOfWorkFactory,
+            lambda: QueryUnitOfWork(
+                approved_meeting(),
+                approval=approval(),
+                write_intents=(wrong_intent,),
+            ),
+        )
+    )
+    unrelated_id = UUID("a0000000-0000-4000-8000-000000000099")
+    wrong_receipt = WriteReceipt(
+        id=UUID("b0000000-0000-4000-8000-000000000001"),
+        intent_id=unrelated_id,
+        idempotency_key=intent.idempotency_key,
+        payload_digest=intent.payload_digest,
+        provider="trusted-mcp",
+        external_id="remote-one",
+        recorded_at=NOW,
+    )
+    receipt_query = UnitOfWorkQueryFacade(
+        cast(
+            UnitOfWorkFactory,
+            lambda: QueryUnitOfWork(
+                approved_meeting(),
+                approval=approval(),
+                write_intents=(intent,),
+                write_receipts={intent.id: wrong_receipt},
+            ),
+        )
+    )
+
+    with pytest.raises(ResourceNotFoundError, match="Recap"):
+        await no_approval.get_recap(MEETING_ID)
+    with pytest.raises(OperationConflictError, match="write intent does not belong"):
+        await intent_query.get_delivery(MEETING_ID)
+    with pytest.raises(OperationConflictError, match="write receipt does not belong"):
+        await receipt_query.get_delivery(MEETING_ID)
+
+
+async def test_query_facade_validates_receipts_bound_to_loaded_intents() -> None:
+    intent = unknown_write_intent()
+    receipt = WriteReceipt(
+        id=UUID("b0000000-0000-4000-8000-000000000002"),
+        intent_id=intent.id,
+        idempotency_key=intent.idempotency_key,
+        payload_digest=intent.payload_digest,
+        provider="trusted-mcp",
+        external_id="remote-two",
+        recorded_at=NOW,
+    )
+    query = UnitOfWorkQueryFacade(
+        cast(
+            UnitOfWorkFactory,
+            lambda: QueryUnitOfWork(
+                approved_meeting(),
+                approval=approval(),
+                write_intents=(intent,),
+                write_receipts={intent.id: receipt},
+            ),
+        )
+    )
+
+    result = await query.get_delivery(MEETING_ID)
+
+    assert result.intents == (intent,)
+    assert result.receipts == (receipt,)
 
 
 class FakeDeliveryController:

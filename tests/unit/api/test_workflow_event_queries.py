@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID
 
 import pytest
@@ -104,7 +104,7 @@ class QueryUnitOfWork:
         self.entries += 1
         return self
 
-    def __exit__(self, *_args: object) -> bool:
+    def __exit__(self, *_args: object) -> Literal[False]:
         assert self.active
         self.active = False
         self.exits += 1

@@ -5,6 +5,7 @@ import hashlib
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NoReturn
 from uuid import UUID
 
 import pytest
@@ -154,7 +155,7 @@ def test_retry_after_link_resumes_from_both_paths(
             raise OSError(errno.EBUSY, "private operating system message", str(path))
         real_unlink(path)
 
-    monkeypatch.setattr(recording_quarantine.os, "unlink", busy_unlink)
+    monkeypatch.setattr(os, "unlink", busy_unlink)
     executor = LocalRecordingQuarantine(root)
 
     with pytest.raises(RetryableRecordingCleanupError) as captured:
@@ -166,7 +167,7 @@ def test_retry_after_link_resumes_from_both_paths(
     assert "private operating system message" not in str(captured.value)
     assert str(source) not in str(captured.value)
 
-    monkeypatch.setattr(recording_quarantine.os, "unlink", real_unlink)
+    monkeypatch.setattr(os, "unlink", real_unlink)
     executor.execute(job)
 
     assert not source.exists()
@@ -201,14 +202,17 @@ def test_post_link_source_swap_is_detected_before_removal(
     def swapping_link(
         source_path: os.PathLike[str] | str,
         target_path: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
-        real_link(source_path, target_path, *args, **kwargs)
+        if follow_symlinks:
+            real_link(source_path, target_path)
+        else:
+            real_link(source_path, target_path, follow_symlinks=False)
         real_unlink(source_path)
         Path(source_path).write_bytes(CONTENT)
 
-    monkeypatch.setattr(recording_quarantine.os, "link", swapping_link)
+    monkeypatch.setattr(os, "link", swapping_link)
 
     with pytest.raises(RecordingIdentityMismatchError):
         LocalRecordingQuarantine(root).execute(job)
@@ -230,16 +234,16 @@ def test_plain_link_fallback_keeps_identity_guards(
     def fallback_link(
         source_path: os.PathLike[str] | str,
         target_path: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
-        if kwargs:
+        if not follow_symlinks:
             raise TypeError("follow_symlinks is unavailable")
         real_link(source_path, target_path)
 
-    monkeypatch.setattr(recording_quarantine.os, "O_NOFOLLOW", 0)
-    monkeypatch.setattr(recording_quarantine.os, "O_DIRECTORY", 0)
-    monkeypatch.setattr(recording_quarantine.os, "link", fallback_link)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0)
+    monkeypatch.setattr(os, "O_DIRECTORY", 0)
+    monkeypatch.setattr(os, "link", fallback_link)
 
     LocalRecordingQuarantine(root).execute(job)
 
@@ -260,16 +264,16 @@ def test_plain_link_fallback_detects_post_link_source_swap(
     def fallback_swapping_link(
         source_path: os.PathLike[str] | str,
         target_path: os.PathLike[str] | str,
-        *args: object,
-        **kwargs: object,
+        *,
+        follow_symlinks: bool = True,
     ) -> None:
-        if kwargs:
+        if not follow_symlinks:
             raise TypeError("follow_symlinks is unavailable")
         real_link(source_path, target_path)
         real_unlink(source_path)
         Path(source_path).write_bytes(CONTENT)
 
-    monkeypatch.setattr(recording_quarantine.os, "link", fallback_swapping_link)
+    monkeypatch.setattr(os, "link", fallback_swapping_link)
 
     with pytest.raises(RecordingIdentityMismatchError):
         LocalRecordingQuarantine(root).execute(job)
@@ -287,10 +291,16 @@ def test_unsupported_plain_link_is_a_permanent_capability_failure(
     job = cleanup_job()
     source = write_source(root, job)
 
-    def unsupported_link(*args: object, **kwargs: object) -> None:
+    def unsupported_link(
+        _source_path: os.PathLike[str] | str,
+        _target_path: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del follow_symlinks
         raise TypeError("hard links are unavailable")
 
-    monkeypatch.setattr(recording_quarantine.os, "link", unsupported_link)
+    monkeypatch.setattr(os, "link", unsupported_link)
 
     with pytest.raises(PermanentRecordingCleanupError):
         LocalRecordingQuarantine(root).execute(job)
@@ -321,10 +331,16 @@ def test_operational_link_errors_are_retryable_and_private(
     job = cleanup_job()
     source = write_source(root, job)
 
-    def failing_link(*args: object, **kwargs: object) -> None:
+    def failing_link(
+        _source_path: os.PathLike[str] | str,
+        _target_path: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del follow_symlinks
         raise OSError(error_number, "private operating system message", str(source))
 
-    monkeypatch.setattr(recording_quarantine.os, "link", failing_link)
+    monkeypatch.setattr(os, "link", failing_link)
 
     with pytest.raises(RetryableRecordingCleanupError) as captured:
         LocalRecordingQuarantine(root).execute(job)
@@ -342,7 +358,13 @@ def test_windows_sharing_violation_is_retryable(
     job = cleanup_job()
     source = write_source(root, job)
 
-    def failing_link(*args: object, **kwargs: object) -> None:
+    def failing_link(
+        _source_path: os.PathLike[str] | str,
+        _target_path: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del follow_symlinks
         error = WindowsSharingViolationError(
             errno.EINVAL,
             "private operating system message",
@@ -351,7 +373,7 @@ def test_windows_sharing_violation_is_retryable(
         error.winerror = 32
         raise error
 
-    monkeypatch.setattr(recording_quarantine.os, "link", failing_link)
+    monkeypatch.setattr(os, "link", failing_link)
 
     with pytest.raises(RetryableRecordingCleanupError):
         LocalRecordingQuarantine(root).execute(job)
@@ -435,7 +457,7 @@ def test_identify_rejects_path_swap_after_hash(
             path.write_bytes(CONTENT)
         return chunk
 
-    monkeypatch.setattr(recording_quarantine.os, "read", swapping_read)
+    monkeypatch.setattr(os, "read", swapping_read)
 
     assert scanner.identify(candidate) is None
     assert path.read_bytes() == CONTENT
@@ -455,10 +477,16 @@ def test_healthcheck_fails_when_hard_links_cross_devices(
 ) -> None:
     root = tmp_path / "uploads"
 
-    def cross_device_link(*args: object, **kwargs: object) -> None:
+    def cross_device_link(
+        _source_path: os.PathLike[str] | str,
+        _target_path: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del follow_symlinks
         raise OSError(errno.EXDEV, "private operating system message")
 
-    monkeypatch.setattr(recording_quarantine.os, "link", cross_device_link)
+    monkeypatch.setattr(os, "link", cross_device_link)
 
     assert LocalRecordingQuarantine(root).healthcheck() is False
 
@@ -486,10 +514,10 @@ def test_posix_mode_retention_fails_readiness(
     root.mkdir(mode=0o755)
     root.chmod(0o755)
 
-    def retain_mode(*_args: object) -> None:
+    def retain_mode(_descriptor: int, _mode: int) -> None:
         return None
 
-    monkeypatch.setattr(recording_quarantine.os, "fchmod", retain_mode)
+    monkeypatch.setattr(os, "fchmod", retain_mode)
 
     assert LocalRecordingQuarantine(root).healthcheck() is False
 
@@ -502,8 +530,312 @@ def test_windows_fchmod_absence_uses_best_effort_fallback(
     job = cleanup_job()
     source = write_source(root, job)
     monkeypatch.setattr(recording_quarantine, "_IS_WINDOWS", True)
-    monkeypatch.delattr(recording_quarantine.os, "fchmod")
+    monkeypatch.delattr(os, "fchmod")
 
     LocalRecordingQuarantine(root).execute(job)
 
     assert not source.exists()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"storage_key": "../recording.wav"},
+        {"expected_sha256": "A" * 64},
+        {"expected_sha256": "f" * 63},
+        {"expected_size_bytes": -1},
+    ],
+)
+def test_cleanup_rejects_invalid_persisted_identity_before_filesystem_access(
+    tmp_path: Path,
+    updates: dict[str, object],
+) -> None:
+    job = cleanup_job().model_copy(update=updates)
+    root = tmp_path / "uploads"
+
+    with pytest.raises(PermanentRecordingCleanupError):
+        LocalRecordingQuarantine(root).execute(job)
+
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (NOW.replace(tzinfo=None), timedelta(hours=1), 1, None, "UTC offset"),
+        (NOW, timedelta(0), 1, None, "grace period"),
+        (NOW, timedelta(hours=1), 0, None, "limit"),
+        (NOW, timedelta(hours=1), 1001, None, "limit"),
+        (NOW, timedelta(hours=1), 1, "../recording.wav", None),
+    ],
+)
+def test_scanner_validates_bounds_before_accessing_storage(
+    tmp_path: Path,
+    case: tuple[datetime, timedelta, int, str | None, str | None],
+) -> None:
+    now, grace_period, limit, after_storage_key, message = case
+    root = tmp_path / "uploads"
+
+    with pytest.raises((ValueError, PermanentRecordingCleanupError), match=message):
+        LocalRecordingQuarantine(root).scan_stale_candidates(
+            now=now,
+            grace_period=grace_period,
+            limit=limit,
+            after_storage_key=after_storage_key,
+        )
+
+    assert not root.exists()
+
+
+def test_cleanup_bounds_continuous_identity_races(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "uploads"
+    job = cleanup_job()
+    write_source(root, job)
+    executor = LocalRecordingQuarantine(root)
+    calls = 0
+
+    def always_changed(_path: Path, _digest: str, _size_bytes: int) -> None:
+        nonlocal calls
+        calls += 1
+        raise recording_quarantine._StateChangedError
+
+    monkeypatch.setattr(executor, "_verify_if_present", always_changed)
+
+    with pytest.raises(RetryableRecordingCleanupError):
+        executor.execute(job)
+
+    assert calls == recording_quarantine._MAX_STATE_REEVALUATIONS
+
+
+def test_scanner_translates_directory_read_failure_without_leaking_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-uploads"
+    executor = LocalRecordingQuarantine(root)
+    executor.healthcheck()
+
+    def failed_scandir(_path: os.PathLike[str] | str) -> NoReturn:
+        raise OSError(errno.EIO, "private operating system message", str(root))
+
+    monkeypatch.setattr(os, "scandir", failed_scandir)
+
+    with pytest.raises(RetryableRecordingCleanupError) as captured:
+        executor.scan_stale_candidates(now=NOW, grace_period=timedelta(hours=1), limit=10)
+
+    assert "private operating system message" not in str(captured.value)
+    assert str(root) not in str(captured.value)
+
+
+def test_identify_returns_none_when_candidate_changed_before_open(tmp_path: Path) -> None:
+    root = tmp_path / "uploads"
+    key = storage_key("9")
+    path = root / key
+    root.mkdir()
+    path.write_bytes(CONTENT)
+    old_timestamp = (NOW - timedelta(hours=2)).timestamp()
+    os.utime(path, (old_timestamp, old_timestamp))
+    scanner = LocalRecordingQuarantine(root)
+    candidate = scanner.scan_stale_candidates(
+        now=NOW,
+        grace_period=timedelta(hours=1),
+        limit=1,
+    )[0]
+
+    path.write_bytes(b"replacement recording")
+
+    assert scanner.identify(candidate) is None
+
+
+def test_identify_treats_nofollow_open_race_as_a_changed_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "uploads"
+    key = storage_key("a")
+    path = root / key
+    root.mkdir()
+    path.write_bytes(CONTENT)
+    old_timestamp = (NOW - timedelta(hours=2)).timestamp()
+    os.utime(path, (old_timestamp, old_timestamp))
+    scanner = LocalRecordingQuarantine(root)
+    candidate = scanner.scan_stale_candidates(
+        now=NOW,
+        grace_period=timedelta(hours=1),
+        limit=1,
+    )[0]
+    real_open = os.open
+
+    def looping_open(
+        opened_path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(opened_path) == path:
+            raise OSError(getattr(errno, "ELOOP", errno.ENOENT), "path changed")
+        return real_open(opened_path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", looping_open)
+
+    assert scanner.identify(candidate) is None
+
+
+def test_healthcheck_removes_created_probe_after_durability_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "uploads"
+
+    def failed_sync(_descriptor: int) -> None:
+        raise OSError(errno.EIO, "private operating system message")
+
+    monkeypatch.setattr(os, "fsync", failed_sync)
+
+    assert LocalRecordingQuarantine(root).healthcheck() is False
+    assert [path for path in root.rglob("*") if path.name.startswith(".health-")] == []
+
+
+def test_healthcheck_fails_conservatively_when_probe_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "uploads"
+    executor = LocalRecordingQuarantine(root)
+    real_write = executor._write_health_probe
+
+    def disappearing_probe(path: Path) -> None:
+        real_write(path)
+        path.unlink()
+
+    monkeypatch.setattr(executor, "_write_health_probe", disappearing_probe)
+
+    assert executor.healthcheck() is False
+
+
+@pytest.mark.parametrize("symlink_behavior", ["no-nofollow", "unsupported", "permission"])
+def test_healthcheck_supports_platforms_without_symlink_probe_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlink_behavior: str,
+) -> None:
+    root = tmp_path / "uploads"
+    if symlink_behavior == "no-nofollow":
+        monkeypatch.setattr(os, "O_NOFOLLOW", 0)
+    else:
+
+        def unavailable_symlink(
+            _source: os.PathLike[str] | str,
+            _target: os.PathLike[str] | str,
+            *,
+            target_is_directory: bool = False,
+            dir_fd: int | None = None,
+        ) -> None:
+            del target_is_directory, dir_fd
+            if symlink_behavior == "unsupported":
+                raise NotImplementedError
+            raise OSError(errno.EACCES, "permission unavailable")
+
+        monkeypatch.setattr(os, "symlink", unavailable_symlink)
+
+    assert LocalRecordingQuarantine(root).healthcheck() is True
+
+
+def test_cleanup_recovers_when_source_disappears_during_verified_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "uploads"
+    job = cleanup_job()
+    source = write_source(root, job)
+    real_unlink = os.unlink
+    injected = False
+
+    def disappearing_unlink(path: os.PathLike[str] | str) -> None:
+        nonlocal injected
+        if Path(path) == source and not injected:
+            injected = True
+            real_unlink(path)
+            raise FileNotFoundError(errno.ENOENT, "already removed", str(path))
+        real_unlink(path)
+
+    monkeypatch.setattr(os, "unlink", disappearing_unlink)
+
+    LocalRecordingQuarantine(root).execute(job)
+
+    assert injected
+    assert not source.exists()
+    assert not (root / ".quarantine" / job.storage_key).exists()
+
+
+def test_cleanup_uses_windows_path_permission_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "uploads"
+    job = cleanup_job()
+    source = write_source(root, job)
+    real_open = os.open
+    failed_directories: set[Path] = set()
+
+    def fallback_open(
+        path: os.PathLike[str] | str,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        resolved = Path(path)
+        if flags & getattr(os, "O_DIRECTORY", 0) and resolved not in failed_directories:
+            failed_directories.add(resolved)
+            raise OSError(errno.EACCES, "descriptor restriction unavailable")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def unavailable_chmod(
+        _path: os.PathLike[str] | str,
+        _mode: int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del dir_fd, follow_symlinks
+        raise OSError(errno.EACCES, "path restriction unavailable")
+
+    monkeypatch.setattr(recording_quarantine, "_IS_WINDOWS", True)
+    monkeypatch.setattr(os, "open", fallback_open)
+    monkeypatch.setattr(os, "chmod", unavailable_chmod)
+
+    LocalRecordingQuarantine(root).execute(job)
+
+    assert failed_directories == {root, root / ".quarantine"}
+    assert not source.exists()
+
+
+def test_unknown_link_error_is_retryable_and_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-uploads"
+    job = cleanup_job()
+    source = write_source(root, job)
+
+    def failed_link(
+        _source: os.PathLike[str] | str,
+        _target: os.PathLike[str] | str,
+        *,
+        follow_symlinks: bool = True,
+    ) -> None:
+        del follow_symlinks
+        raise OSError(errno.EINVAL, "private operating system message", str(source))
+
+    monkeypatch.setattr(os, "link", failed_link)
+
+    with pytest.raises(RetryableRecordingCleanupError) as captured:
+        LocalRecordingQuarantine(root).execute(job)
+
+    assert "private operating system message" not in str(captured.value)
+    assert str(root) not in str(captured.value)

@@ -10,7 +10,10 @@ from uuid import UUID
 import pytest
 
 import meeting_action_orchestrator.application.workflow as workflow_module
-from meeting_action_orchestrator.application.errors import OperationConflictError
+from meeting_action_orchestrator.application.errors import (
+    OperationConflictError,
+    PersistenceIntegrityError,
+)
 from meeting_action_orchestrator.application.meeting_erasure import (
     ErasureKeyRegistry,
     MeetingErasureService,
@@ -26,10 +29,7 @@ from meeting_action_orchestrator.domain.models import (
 )
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.erasure_tokens import ErasureTokenKeyring
-from meeting_action_orchestrator.infrastructure.repositories import (
-    PersistenceIntegrityError,
-    SqliteUnitOfWork,
-)
+from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOfWork
 from tests.integration.test_workflow import (
     NOW,
     FakeRecordingStore,
@@ -65,15 +65,16 @@ class PauseFirstUnitOfWork(SqliteUnitOfWork):
         cls.pause_next = True
 
     def __enter__(self) -> PauseFirstUnitOfWork:
-        unit_of_work = super().__enter__()
-        with self.state_lock:
-            pause = self.pause_next
-            self.pause_next = False
+        super().__enter__()
+        unit_of_work_type = type(self)
+        with unit_of_work_type.state_lock:
+            pause = unit_of_work_type.pause_next
+            unit_of_work_type.pause_next = False
         if pause:
-            self.entered.set()
-            if not self.release.wait(timeout=5):
+            unit_of_work_type.entered.set()
+            if not unit_of_work_type.release.wait(timeout=5):
                 raise TimeoutError("ingest transaction release timed out")
-        return unit_of_work
+        return self
 
 
 class AttemptSignalingUnitOfWork(SqliteUnitOfWork):
@@ -83,7 +84,8 @@ class AttemptSignalingUnitOfWork(SqliteUnitOfWork):
 
     def __enter__(self) -> AttemptSignalingUnitOfWork:
         self._attempted.set()
-        return super().__enter__()
+        super().__enter__()
+        return self
 
 
 def command() -> IngestMeeting:

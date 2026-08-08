@@ -155,7 +155,7 @@ _ToolResult = Annotated[
     _ReceiptResult | _NotFoundResult | _FailureResult,
     Field(discriminator="outcome"),
 ]
-_TOOL_RESULT_ADAPTER = TypeAdapter(_ToolResult)
+_TOOL_RESULT_ADAPTER: TypeAdapter[_ToolResult] = TypeAdapter(_ToolResult)
 
 
 class _LookupRequest(_StrictModel):
@@ -507,6 +507,8 @@ def _retryable_code(value: str | None) -> FailureCode:
         "timeout": FailureCode.PROVIDER_TIMEOUT,
         "unavailable": FailureCode.PROVIDER_UNAVAILABLE,
     }
+    if value is None:
+        return FailureCode.PROVIDER_UNAVAILABLE
     return codes.get(value, FailureCode.PROVIDER_UNAVAILABLE)
 
 
@@ -518,6 +520,8 @@ def _permanent_code(value: str | None) -> FailureCode:
         "invalid_request": FailureCode.INVALID_INPUT,
         "idempotency_conflict": FailureCode.IDEMPOTENCY_CONFLICT,
     }
+    if value is None:
+        return FailureCode.CONNECTOR_REJECTED
     return codes.get(value, FailureCode.CONNECTOR_REJECTED)
 
 

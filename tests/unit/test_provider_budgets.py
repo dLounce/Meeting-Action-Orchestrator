@@ -1,4 +1,6 @@
+from collections.abc import MutableMapping
 from operator import setitem
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -6,6 +8,7 @@ from pydantic import ValidationError
 
 from meeting_action_orchestrator.application.ports import TranscriptionRunContext
 from meeting_action_orchestrator.domain.enums import (
+    ProcessingStage,
     ProviderCallRole,
     ProviderOperation,
     ProviderUsageKind,
@@ -13,6 +16,7 @@ from meeting_action_orchestrator.domain.enums import (
 from meeting_action_orchestrator.domain.provider_budget import (
     DEFAULT_PROVIDER_BUDGET_LIMITS,
     PROVIDER_BUDGET_COUNTER_MAX,
+    ProviderBudgetLimits,
     ProviderBudgetReservationRequest,
     ProviderDispatchContext,
     ProviderUsage,
@@ -33,7 +37,10 @@ def dispatch() -> ProviderDispatchContext:
 def test_default_budget_mapping_is_immutable() -> None:
     with pytest.raises(TypeError):
         setitem(
-            DEFAULT_PROVIDER_BUDGET_LIMITS,
+            cast(
+                MutableMapping[ProcessingStage, ProviderBudgetLimits],
+                DEFAULT_PROVIDER_BUDGET_LIMITS,
+            ),
             next(iter(DEFAULT_PROVIDER_BUDGET_LIMITS)),
             next(iter(DEFAULT_PROVIDER_BUDGET_LIMITS.values())),
         )

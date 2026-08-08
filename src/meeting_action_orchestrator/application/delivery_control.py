@@ -129,12 +129,23 @@ class ControlDeliveryOperationRepository(Protocol):
 
 
 class ControlUnitOfWork(Protocol):
-    meetings: ControlMeetingRepository
-    approvals: ControlApprovalRepository
-    write_intents: ControlIntentRepository
-    write_receipts: ControlReceiptRepository
-    delivery_operations: ControlDeliveryOperationRepository
-    workflow_events: WorkflowEventSink
+    @property
+    def meetings(self) -> ControlMeetingRepository: ...
+
+    @property
+    def approvals(self) -> ControlApprovalRepository: ...
+
+    @property
+    def write_intents(self) -> ControlIntentRepository: ...
+
+    @property
+    def write_receipts(self) -> ControlReceiptRepository: ...
+
+    @property
+    def delivery_operations(self) -> ControlDeliveryOperationRepository: ...
+
+    @property
+    def workflow_events(self) -> WorkflowEventSink: ...
 
     def __enter__(self) -> ControlUnitOfWork: ...
 

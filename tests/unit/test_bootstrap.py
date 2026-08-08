@@ -219,7 +219,6 @@ class DisconnectingDeliveryRunner(FakeDeliveryRunner):
 def settings(root: Path, **updates: object) -> Settings:
     encoded_key = base64.urlsafe_b64encode(b"e" * 32).decode("ascii").rstrip("=")
     values = {
-        "_env_file": None,
         "database_path": root / "runtime.sqlite3",
         "upload_directory": root / "uploads",
         "api_bearer_token": "a" * 32,
@@ -228,7 +227,11 @@ def settings(root: Path, **updates: object) -> Settings:
         "erasure_hmac_keys": json.dumps({"current": encoded_key}),
         "worker_poll_interval_seconds": 0.01,
     }
-    return Settings(**(values | updates))
+    return Settings.model_validate(values | updates)
+
+
+def delivery_is_ready(runtime: RuntimeSupervisor) -> bool:
+    return runtime.delivery_ready
 
 
 def test_delivery_lease_covers_connector_timeout_and_session_cleanup(tmp_path: Path) -> None:
@@ -307,8 +310,10 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
         await asyncio.wait_for(cleanup.called.wait(), timeout=1)
         await asyncio.wait_for(discovery.called.wait(), timeout=1)
         await asyncio.wait_for(erasure.called.wait(), timeout=1)
-        assert runtime.started
-        assert runtime.delivery_ready
+        started_while_running = runtime.started
+        assert started_while_running
+        ready_while_running = delivery_is_ready(runtime)
+        assert ready_while_running
 
     assert database.migrations == 1
     assert processing.calls[:2] == [
@@ -321,8 +326,10 @@ async def test_supervisor_migrates_runs_workers_and_closes_mcp() -> None:
     assert erasure.limits == [5]
     assert key_registry.registrations == 1
     assert mcp.events == ["start", "close"]
-    assert not runtime.started
-    assert not runtime.delivery_ready
+    started_after_close = runtime.started
+    assert not started_after_close
+    ready_after_close = delivery_is_ready(runtime)
+    assert not ready_after_close
 
 
 async def test_application_lifespan_is_offline_when_delivery_is_disabled(
@@ -376,7 +383,7 @@ async def test_connector_outage_does_not_block_processing_startup() -> None:
         await asyncio.wait_for(processing.called.wait(), timeout=1)
         await asyncio.wait_for(delivery.called.wait(), timeout=1)
         assert runtime.started
-        assert runtime.delivery_ready
+        assert delivery_is_ready(runtime)
 
     assert mcp.events == ["start", "start", "close"]
 
@@ -409,16 +416,16 @@ async def test_connector_readiness_tracks_disconnection_and_recovery() -> None:
     async with runtime.lifespan(FastAPI()):
         await asyncio.wait_for(delivery.disconnected.wait(), timeout=1)
         await asyncio.wait_for(mcp.reconnect_started.wait(), timeout=1)
-        assert not runtime.delivery_ready
+        assert not delivery_is_ready(runtime)
         assert not (await readiness.check()).ready
         assert delivery.limits == [1]
         mcp.allow_reconnect.set()
         await asyncio.wait_for(delivery.called.wait(), timeout=1)
         for _ in range(100):
-            if runtime.delivery_ready and len(delivery.limits) > 1:
+            if delivery_is_ready(runtime) and len(delivery.limits) > 1:
                 break
             await asyncio.sleep(0.001)
-        assert runtime.delivery_ready
+        assert delivery_is_ready(runtime)
         assert (await readiness.check()).ready
         assert delivery.limits[:2] == [1, 1]
 

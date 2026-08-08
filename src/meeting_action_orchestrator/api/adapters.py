@@ -364,10 +364,10 @@ class UnitOfWorkQueryFacade:
                 raise OperationConflictError("A write intent does not belong to the meeting")
         indexed = {intent.id: intent for intent in intents}
         for receipt in receipts:
-            intent = indexed.get(receipt.intent_id)
-            if intent is None:
+            receipt_intent = indexed.get(receipt.intent_id)
+            if receipt_intent is None:
                 raise OperationConflictError("A write receipt does not belong to the meeting")
-            validate_write_receipt(intent, receipt)
+            validate_write_receipt(receipt_intent, receipt)
         return DeliveryResult(meeting=meeting, intents=intents, receipts=receipts)
 
     def _list_workflow_events(

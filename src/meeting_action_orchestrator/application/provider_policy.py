@@ -165,11 +165,11 @@ def _header_values(headers: object, name: str) -> tuple[object, ...] | None:
     get_list = getattr(headers, "get_list", None)
     if callable(get_list):
         try:
-            values = get_list(name)
+            listed_values = get_list(name)
         except Exception:
             return None
-        if isinstance(values, (list, tuple)):
-            return tuple(values)
+        if isinstance(listed_values, (list, tuple)):
+            return tuple(listed_values)
         return None
     if isinstance(headers, Mapping):
         values: list[object] = []

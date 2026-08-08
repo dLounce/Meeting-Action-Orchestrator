@@ -334,6 +334,26 @@ class AmbiguousCommitFactory:
         return SqliteUnitOfWork(self._database)
 
 
+class RejectingCommitUnitOfWork(SqliteUnitOfWork):
+    def commit(self) -> None:
+        raise RuntimeError("persistence unavailable")
+
+
+class RejectingCommitFactory:
+    def __init__(self, database: Database, *, reject_reconciliation: bool = False) -> None:
+        self._database = database
+        self._reject_reconciliation = reject_reconciliation
+        self.calls = 0
+
+    def __call__(self) -> SqliteUnitOfWork:
+        self.calls += 1
+        if self.calls == 1:
+            return RejectingCommitUnitOfWork(self._database)
+        if self._reject_reconciliation:
+            raise RuntimeError("reconciliation unavailable")
+        return SqliteUnitOfWork(self._database)
+
+
 async def test_ambiguous_reservation_and_settlement_commits_reconcile(
     tmp_path: Path,
     inline_budget_threads: None,
@@ -368,6 +388,194 @@ async def test_ambiguous_reservation_and_settlement_commits_reconcile(
     with SqliteUnitOfWork(database) as uow:
         assert len(uow.provider_budget_reservations.list_for_job(job.id)) == 1
         assert uow.provider_budget_settlements.get(reservation.id) == settlement
+
+
+async def test_precommit_failures_are_not_mistaken_for_durable_budget_records(
+    tmp_path: Path,
+    inline_budget_threads: None,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = MutableClock()
+    job = schedule_and_claim(database, clock)
+    reserve_factory = RejectingCommitFactory(database)
+    reserve_service = ProviderBudgetService(unit_of_work=reserve_factory, clock=clock)
+
+    with pytest.raises(RuntimeError, match="persistence unavailable"):
+        await reserve_service.reserve(dispatch(job), response_request("not-committed"))
+    assert reserve_factory.calls == 2
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.provider_budget_reservations.list_for_job(job.id) == ()
+
+    reservation = service(database, clock)._reserve(
+        dispatch(job), response_request("settlement-not-committed")
+    )
+    settle_factory = RejectingCommitFactory(database)
+    settle_service = ProviderBudgetService(unit_of_work=settle_factory, clock=clock)
+    with pytest.raises(RuntimeError, match="persistence unavailable"):
+        await settle_service.settle(
+            reservation.id,
+            outcome=ProviderSettlementOutcome.FAILED,
+            usage=ProviderUsage(kind=ProviderUsageKind.NONE),
+        )
+    assert settle_factory.calls == 2
+    with SqliteUnitOfWork(database, immediate=False) as uow:
+        assert uow.provider_budget_settlements.get(reservation.id) is None
+
+
+async def test_reconciliation_failure_preserves_the_original_persistence_error(
+    tmp_path: Path,
+    inline_budget_threads: None,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = MutableClock()
+    job = schedule_and_claim(database, clock)
+    reserve_service = ProviderBudgetService(
+        unit_of_work=RejectingCommitFactory(database, reject_reconciliation=True),
+        clock=clock,
+    )
+
+    with pytest.raises(RuntimeError, match="persistence unavailable") as reserve_error:
+        await reserve_service.reserve(dispatch(job), response_request("double-failure"))
+    assert reserve_error.value.__cause__ is None
+
+    reservation = service(database, clock)._reserve(
+        dispatch(job), response_request("double-settlement-failure")
+    )
+    settle_service = ProviderBudgetService(
+        unit_of_work=RejectingCommitFactory(database, reject_reconciliation=True),
+        clock=clock,
+    )
+    with pytest.raises(RuntimeError, match="persistence unavailable") as settle_error:
+        await settle_service.settle(
+            reservation.id,
+            outcome=ProviderSettlementOutcome.FAILED,
+            usage=ProviderUsage(kind=ProviderUsageKind.NONE),
+        )
+    assert settle_error.value.__cause__ is None
+
+
+def test_budget_service_fails_closed_for_missing_account_and_stage_mismatch(
+    tmp_path: Path,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = MutableClock()
+    with SqliteUnitOfWork(database) as uow:
+        uow.processing_jobs.add(
+            ProcessingJob(
+                id=JOB_ID,
+                meeting_id=MEETING_ID,
+                stage=ProcessingStage.EXTRACTION,
+                max_attempts=2,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        claimed = uow.processing_jobs.claim_due(
+            ProcessingStage.EXTRACTION,
+            "budget-worker",
+            NOW,
+            NOW + timedelta(minutes=5),
+            1,
+        )[0]
+        uow.commit()
+
+    controller = service(database, clock)
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._reserve(dispatch(claimed), response_request("missing-account"))
+
+    second_database = create_database(tmp_path / "stage.sqlite3")
+    second_job = schedule_and_claim(second_database, clock)
+    transcription_request = ProviderBudgetReservationRequest(
+        dispatch_key="wrong-stage",
+        operation_digest="e" * 64,
+        operation=ProviderOperation.TRANSCRIPTION_CREATE,
+        role=ProviderCallRole.TRANSCRIPTION,
+        model="transcribe-test",
+        reserved_audio_duration_ms=1_000,
+    )
+    with pytest.raises(ProviderBudgetIntegrityError):
+        service(second_database, clock)._reserve(dispatch(second_job), transcription_request)
+
+
+def test_budget_reconciliation_rejects_conflicts_and_missing_records(
+    tmp_path: Path,
+) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = MutableClock()
+    job = schedule_and_claim(database, clock)
+    controller = service(database, clock)
+    request = response_request("reconcile-conflict")
+    reservation = controller._reserve(dispatch(job), request)
+
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._reconcile_reservation(
+            dispatch(job),
+            response_request("reconcile-conflict", digest="c" * 64),
+        )
+    missing_id = UUID("40000000-0000-4000-8000-000000000099")
+    assert (
+        controller._reconcile_settlement(
+            missing_id,
+            outcome=ProviderSettlementOutcome.FAILED,
+            usage=ProviderUsage(kind=ProviderUsageKind.NONE),
+        )
+        is None
+    )
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._settle(
+            missing_id,
+            outcome=ProviderSettlementOutcome.FAILED,
+            usage=ProviderUsage(kind=ProviderUsageKind.NONE),
+        )
+
+    controller._settle(
+        reservation.id,
+        outcome=ProviderSettlementOutcome.FAILED,
+        usage=ProviderUsage(kind=ProviderUsageKind.NONE),
+    )
+    token_usage = ProviderUsage(
+        kind=ProviderUsageKind.TOKENS,
+        input_tokens=1,
+        output_tokens=1,
+    )
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._settle(
+            reservation.id,
+            outcome=ProviderSettlementOutcome.SUCCEEDED,
+            usage=token_usage,
+        )
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._reconcile_settlement(
+            reservation.id,
+            outcome=ProviderSettlementOutcome.SUCCEEDED,
+            usage=token_usage,
+        )
+
+
+def test_settlement_usage_must_match_outcome_and_operation(tmp_path: Path) -> None:
+    database = create_database(tmp_path / "application.sqlite3")
+    clock = MutableClock()
+    job = schedule_and_claim(database, clock)
+    controller = service(database, clock)
+    reservation = controller._reserve(dispatch(job), response_request("usage-shape"))
+    tokens = ProviderUsage(
+        kind=ProviderUsageKind.TOKENS,
+        input_tokens=1,
+        output_tokens=1,
+    )
+
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._settle(
+            reservation.id,
+            outcome=ProviderSettlementOutcome.ABANDONED,
+            usage=tokens,
+        )
+    with pytest.raises(ProviderBudgetIntegrityError):
+        controller._settle(
+            reservation.id,
+            outcome=ProviderSettlementOutcome.SUCCEEDED,
+            usage=ProviderUsage(kind=ProviderUsageKind.DURATION, audio_duration_ms=1),
+        )
 
 
 async def test_corrupt_reservation_is_detached_as_budget_integrity_failure(
@@ -665,12 +873,12 @@ def reservation_for(
         job.claim_token,
         dispatch_digest,
         operation_digest,
-        ProviderOperation.RESPONSES_CREATE,
-        ProviderCallRole.EXTRACT,
-        "gpt-test",
-        1,
-        output_tokens,
-        0,
+        operation=ProviderOperation.RESPONSES_CREATE,
+        role=ProviderCallRole.EXTRACT,
+        model="gpt-test",
+        reserved_input_tokens=1,
+        reserved_output_tokens=output_tokens,
+        reserved_audio_duration_ms=0,
     )
     return ProviderBudgetReservation(
         id=uuid4(),

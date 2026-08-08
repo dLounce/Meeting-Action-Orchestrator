@@ -40,9 +40,10 @@ def binding(
 
 def test_meeting_operation_binding_is_immutable_and_fingerprint_bound() -> None:
     operation = binding()
+    actor_field = "actor_id"
 
     with pytest.raises(ValidationError):
-        operation.actor_id = "another-owner"
+        setattr(operation, actor_field, "another-owner")
     with pytest.raises(ValidationError, match="fingerprint does not match"):
         binding(fingerprint="f" * 64)
 

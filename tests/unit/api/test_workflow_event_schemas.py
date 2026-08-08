@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import UUID
 
-from meeting_action_orchestrator.api.workflow_event_schemas import WorkflowEventResponse
+from meeting_action_orchestrator.api.workflow_event_schemas import (
+    ProcessingAttemptEventMetadata,
+    WorkflowEventResponse,
+)
 from meeting_action_orchestrator.domain.enums import (
     AudioMediaType,
     MeetingStatus,
@@ -169,6 +172,7 @@ def test_processing_projection_preserves_an_unavailable_input_digest() -> None:
         )
     )
 
+    assert isinstance(response.safe_metadata, ProcessingAttemptEventMetadata)
     assert response.safe_metadata.input_digest is None
     assert '"input_digest":null' in response.model_dump_json()
 

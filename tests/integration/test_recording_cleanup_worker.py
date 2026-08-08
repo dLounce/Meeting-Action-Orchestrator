@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Set
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, get_ident
@@ -25,10 +26,17 @@ from meeting_action_orchestrator.application.recording_cleanup import (
 )
 from meeting_action_orchestrator.domain.enums import (
     AudioMediaType,
+    FailureCode,
+    FailureDisposition,
     RecordingCleanupReason,
     RecordingCleanupStatus,
 )
-from meeting_action_orchestrator.domain.models import AudioAsset, RecordingCleanupJob
+from meeting_action_orchestrator.domain.errors import RecordingCleanupConflictError
+from meeting_action_orchestrator.domain.models import (
+    AudioAsset,
+    RecordingCleanupJob,
+    WorkflowFailure,
+)
 from meeting_action_orchestrator.infrastructure.database import Database
 from meeting_action_orchestrator.infrastructure.repositories import SqliteUnitOfWork
 
@@ -420,8 +428,15 @@ async def test_cleanup_worker_renews_lease_during_storage_work(tmp_path: Path) -
     running = asyncio.create_task(worker.run_once(1))
     assert await asyncio.to_thread(executor.started.wait, 1)
     clock.current = NOW + timedelta(seconds=20)
-    await asyncio.sleep(0.02)
-    renewed = get_cleanup(database)
+
+    async def wait_for_renewal() -> RecordingCleanupJob:
+        while True:
+            renewed = get_cleanup(database)
+            if renewed.lease_expires_at == NOW + timedelta(seconds=50):
+                return renewed
+            await asyncio.sleep(0.001)
+
+    renewed = await asyncio.wait_for(wait_for_renewal(), timeout=1)
     clock.current = NOW + timedelta(seconds=35)
     executor.release.set()
     results = await asyncio.wait_for(running, timeout=1)
@@ -779,3 +794,178 @@ async def test_orphan_discovery_rejects_invalid_identity_and_scanner_order(
         await discoverer.run_once(2)
 
     assert rejected == OrphanDiscoveryBatch(scanned=1, rejected=1)
+
+
+def test_stale_candidate_rejects_unsafe_file_descriptors() -> None:
+    value = candidate(FIRST_KEY, 1)
+
+    invalid_values: tuple[tuple[str, Callable[[], object]], ...] = (
+        ("storage key", lambda: replace(value, storage_key="../recording.wav")),
+        ("size cannot be negative", lambda: replace(value, size_bytes=-1)),
+        ("UTC offset", lambda: replace(value, modified_at=NOW.replace(tzinfo=None))),
+        ("stat identity", lambda: replace(value, stat_device=-1)),
+        ("stat identity", lambda: replace(value, stat_inode=-1)),
+        ("stat identity", lambda: replace(value, stat_modified_ns=-1)),
+        ("stat identity", lambda: replace(value, stat_changed_ns=-1)),
+    )
+
+    for message, build in invalid_values:
+        with pytest.raises(ValueError, match=message):
+            build()
+
+
+def test_recording_identity_rejects_unverifiable_descriptors() -> None:
+    value = identity(FIRST_KEY)
+
+    invalid_values: tuple[tuple[str, Callable[[], object]], ...] = (
+        ("storage key", lambda: replace(value, storage_key="recording.wav")),
+        ("lowercase SHA-256", lambda: replace(value, sha256="A" * 64)),
+        ("lowercase SHA-256", lambda: replace(value, sha256="a" * 63)),
+        ("size cannot be negative", lambda: replace(value, size_bytes=-1)),
+    )
+
+    for message, build in invalid_values:
+        with pytest.raises(ValueError, match=message):
+            build()
+
+
+async def test_cleanup_worker_stops_heartbeat_after_lease_loss(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    worker = cleanup_worker(
+        database,
+        FakeExecutor(),
+        MutableClock(),
+        heartbeat_interval=timedelta(milliseconds=1),
+    )
+
+    await asyncio.wait_for(worker._heartbeat(JOB_ID), timeout=0.1)
+
+
+def test_cleanup_worker_rejects_publication_after_lease_expiry(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    add_cleanup(database, cleanup_job())
+    clock = MutableClock()
+    worker = cleanup_worker(database, FakeExecutor(), clock)
+    claimed = worker._claim(1)[0]
+    clock.current = (claimed.lease_expires_at or NOW) + timedelta(microseconds=1)
+    retryable = WorkflowFailure(
+        code=FailureCode.INTERNAL,
+        disposition=FailureDisposition.RETRYABLE,
+        safe_message="Recording cleanup could not finish",
+        occurred_at=clock.current,
+    )
+
+    assert worker._renew_lease(claimed.id) is None
+    assert worker._finish_failure(claimed, retryable) is None
+    assert get_cleanup(database).status is RecordingCleanupStatus.RUNNING
+
+
+def test_orphan_discoverer_validates_grace_period(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    scheduler = RecordingCleanupScheduler(
+        unit_of_work=lambda: SqliteUnitOfWork(database),
+        clock=MutableClock(),
+    )
+
+    for grace_period in (timedelta(minutes=4), timedelta(days=7, seconds=1)):
+        with pytest.raises(ValueError, match="between five minutes and seven days"):
+            RecordingOrphanDiscoverer(
+                unit_of_work=lambda: SqliteUnitOfWork(database, immediate=False),
+                scheduler=scheduler,
+                scanner=FakeScanner((), {}),
+                active_recordings=ActiveRecordings(),
+                clock=MutableClock(),
+                grace_period=grace_period,
+            )
+
+
+async def test_orphan_discoverer_enforces_batch_bounds(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+    discoverer = RecordingOrphanDiscoverer(
+        unit_of_work=lambda: SqliteUnitOfWork(database, immediate=False),
+        scheduler=RecordingCleanupScheduler(
+            unit_of_work=lambda: SqliteUnitOfWork(database),
+            clock=MutableClock(),
+        ),
+        scanner=FakeScanner((), {}),
+        active_recordings=ActiveRecordings(),
+        clock=MutableClock(),
+        grace_period=timedelta(days=1),
+    )
+
+    assert await discoverer.run_once(0) == OrphanDiscoveryBatch()
+    with pytest.raises(ValueError, match="cannot exceed 1000"):
+        await discoverer.run_once(1_001)
+
+
+async def test_orphan_discoverer_rejects_conflicting_cleanup_identity(
+    tmp_path: Path,
+) -> None:
+    database = migrated_database(tmp_path)
+
+    class ConflictingScheduler(RecordingCleanupScheduler):
+        def schedule_if_unreferenced(
+            self,
+            *,
+            storage_key: str,
+            expected_sha256: str,
+            expected_size_bytes: int,
+            reason: RecordingCleanupReason,
+        ) -> RecordingCleanupJob | None:
+            del expected_sha256, expected_size_bytes, reason
+            raise RecordingCleanupConflictError(storage_key)
+
+    scanner = FakeScanner(
+        (candidate(FIRST_KEY, 1),),
+        {FIRST_KEY: identity(FIRST_KEY)},
+    )
+    discoverer = RecordingOrphanDiscoverer(
+        unit_of_work=lambda: SqliteUnitOfWork(database, immediate=False),
+        scheduler=ConflictingScheduler(
+            unit_of_work=lambda: SqliteUnitOfWork(database),
+            clock=MutableClock(),
+        ),
+        scanner=scanner,
+        active_recordings=ActiveRecordings(),
+        clock=MutableClock(),
+        grace_period=timedelta(days=1),
+    )
+
+    assert await discoverer.run_once(1) == OrphanDiscoveryBatch(scanned=1, rejected=1)
+
+
+async def test_orphan_discoverer_rejects_nonadvancing_page(tmp_path: Path) -> None:
+    database = migrated_database(tmp_path)
+
+    class NonAdvancingScanner(FakeScanner):
+        def scan_stale_candidates(
+            self,
+            *,
+            now: datetime,
+            grace_period: timedelta,
+            limit: int,
+            after_storage_key: str | None = None,
+            active_temporary_keys: Set[str] = frozenset(),
+        ) -> tuple[StaleRecordingCandidate, ...]:
+            del now, grace_period, after_storage_key, active_temporary_keys
+            return self.candidates[:limit]
+
+    scanner = NonAdvancingScanner(
+        (candidate(FIRST_KEY, 1),),
+        {FIRST_KEY: identity(FIRST_KEY)},
+    )
+    discoverer = RecordingOrphanDiscoverer(
+        unit_of_work=lambda: SqliteUnitOfWork(database, immediate=False),
+        scheduler=RecordingCleanupScheduler(
+            unit_of_work=lambda: SqliteUnitOfWork(database),
+            clock=MutableClock(),
+        ),
+        scanner=scanner,
+        active_recordings=ActiveRecordings(),
+        clock=MutableClock(),
+        grace_period=timedelta(days=1),
+    )
+
+    await discoverer.run_once(1)
+    with pytest.raises(ValueError, match="did not advance"):
+        await discoverer.run_once(1)

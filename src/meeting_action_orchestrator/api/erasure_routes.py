@@ -71,6 +71,7 @@ def _require_single_control_headers(request: Request) -> None:
 )
 async def erase_meeting(
     meeting_id: UUID,
+    *,
     request: Request,
     response: Response,
     dependencies: ApiDependenciesValue,
@@ -137,6 +138,7 @@ async def get_meeting_erasure(
 )
 async def retry_meeting_erasure(
     erasure_job_id: UUID,
+    *,
     request: Request,
     response: Response,
     dependencies: ApiDependenciesValue,

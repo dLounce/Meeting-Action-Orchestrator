@@ -368,11 +368,11 @@ class OpenAITranscriber:
                 http_client=http_client,
             )
         if client is None:
-            http_client = self._http_client
+            owned_http_client = self._http_client
             self._http_client = None
-            if http_client is not None:
+            if owned_http_client is not None:
                 with suppress(Exception):
-                    asyncio.get_running_loop().create_task(http_client.aclose())
+                    asyncio.get_running_loop().create_task(owned_http_client.aclose())
             raise OpenAITranscriptionConfigurationError
         self._client = client
         self._owns_client = True
